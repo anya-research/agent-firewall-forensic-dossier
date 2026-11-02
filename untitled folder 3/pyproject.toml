@@ -1,0 +1,109 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snagline"
+version = "0.1.1.dev0"
+description = "Lightweight, dependency-free real-time failure detection for AI agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "SNAGLINE contributors" }]
+keywords = ["agents", "llm", "observability", "monitoring", "fail-open"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = []  # core: zero required dependencies, non-negotiable
+
+[project.optional-dependencies]
+# Framework adapters that actually ship in this release:
+langchain  = ["langchain-core>=0.2"]
+langgraph  = ["langgraph>=0.2"]
+autogen    = ["autogen-agentchat>=0.4"]
+crewai     = ["crewai>=0.30"]
+# SDKs used by the bundled demos (real agent harnesses):
+openai     = ["openai>=1.0"]
+anthropic  = ["anthropic>=0.30"]
+# CONTINUUM bridge (issue #79): the adapter/sink are duck-typed and never
+# import continuum, so an in-process or vendored CONTINUUM works without this;
+# the extra just names the real distribution (continuum-agent) for pip users.
+continuum  = ["continuum-agent"]
+# Optional extras (not required for the core fail-open detector):
+ml         = ["numpy>=1.24", "scikit-learn>=1.3"]   # ESN ensemble (issue #80)
+drift      = ["sentence-transformers>=2.2"]          # semantic goal-drift (issue #81)
+# Dev extra for local development: pins match .github/workflows/ci.yml
+dev        = ["pytest", "pytest-cov==7.1.0", "ruff==0.17.1", "mypy"]
+# Slack and PagerDuty sinks ship in the core and use only the stdlib, so they
+# need no extra dependency; the `all` extra pulls in the framework/SDK extras.
+all        = ["snagline[langchain,langgraph,autogen,crewai,openai,anthropic,ml,drift,continuum]"]
+
+[project.scripts]
+snagline = "snagline.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Cyrax321/SNAGLINE"
+Repository = "https://github.com/Cyrax321/SNAGLINE"
+Documentation = "https://github.com/Cyrax321/SNAGLINE#readme"
+Issues = "https://github.com/Cyrax321/SNAGLINE/issues"
+Changelog = "https://github.com/Cyrax321/SNAGLINE/blob/master/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# --- Lint / format (issue #11) -------------------------------------------------
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests intentionally use loose typing and dummy implementations.
+"tests/*" = ["B", "C4", "SIM"]
+# ML-extra tests import snagline.ml after the conditional numpy skip (issue #80).
+"tests/test_ml_esn_ensemble.py" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# --- Static typing (issue #11) -------------------------------------------------
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = false
+warn_redundant_casts = false
+ignore_missing_imports = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+
+# --- Coverage (issue #11) ------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=snagline --cov-fail-under=80"
+
+[tool.coverage.run]
+source = ["src/snagline"]
+omit = ["src/snagline/ml/*"]  # optional ml extra: exercised by the dedicated ml CI leg
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

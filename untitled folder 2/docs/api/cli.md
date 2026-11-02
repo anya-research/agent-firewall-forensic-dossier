@@ -1,0 +1,321 @@
+# CLI
+
+The `continuum` command is the command-line surface, also usable in scripts. Exit
+codes are a safety contract: only a verified-safe run exits `0`, so
+`continuum resume "$RUN" && ./start-agent.sh` cannot launch onto stale state.
+
+Typing bare `continuum` at an interactive terminal opens the full-screen
+dashboard on its landing splash (issue #782); piped or non-terminal output,
+`--json`, and platforms without curses print the help text instead, so scripts
+that run `continuum` blind never find a curses screen where they expected
+usage text.
+
+```bash
+continuum <command> [args]                    # storage defaults to ./continuum.db
+continuum --db <url-or-path> <command>        # storage URL or path (default: continuum.db)
+continuum --json <command>                    # machine-readable output
+```
+
+## Commands
+
+| Command | Purpose |
+|---------|---------|
+| `init` | Initialize storage for a new database. |
+| `runs` | List runs and their status. |
+| `start <run_id> --goal <text>` | Create a run with a goal. Mutates storage. |
+| `inspect <run_id>` | Show a run's goal, progress, and metadata. |
+| `status <run_id>` | Show run status. |
+| `history <run_id>` | List checkpoints for a run. |
+| `events <run_id>` | Dump the raw event log for a run. |
+| `diff <run_id> <from_version> <to_version>` | Compare the environment/state between two versions. |
+| `validate <run_id>` | Check state against the current environment. |
+| `resume [run_id]` | Assess and describe how the run may resume. Omit `run_id` to resume the most recently active run. Prints the run's `goal` so you know what to continue. |
+| `confirm <run_id>` | Confirm a human-approved recovery step. |
+| `complete <run_id>` | Close a run as done. Mutates storage. |
+| `budget <run_id>` | Retry-budget usage per action type. |
+| `tree <run_id> [--limit <n>]` | Show a parent run and its children. `--limit` shows only the newest `n` children. |
+| `fork <run_id> --reason <text>` | Approve a divergent continuation as a child run. Mutates storage. |
+| `compact <run_id>` | Archive the pre-anchor log prefix. Mutates storage. |
+| `conformance --url <endpoint> [--token <tok>] [--confirm-token <tok>]` | Run wire protocol conformance test suite against HTTP endpoint. |
+| `checkpoint <run_id>` | Force a state checkpoint. |
+| `observe` | Record one observed tool completion. Mutates storage. |
+| `gateway` | Run the enforcing HTTP proxy for registered upstreams. Mutates storage. |
+| `briefing [--run-id <id>] [--raw-summary]` | Session-start context, curated by provenance: verified contract facts and system-derived lessons before agent-authored summaries, stale items quarantined with reasons. Read-only; `--raw-summary` is the diagnostic path to the verbatim agent summary (#742). |
+| `gate` | Decide whether a tool call may proceed (pre-tool-use hook). Read-only. |
+| `hooks` | Manage host-side observation hooks. |
+| `daemon` | Run CONTINUUM as a background gateway daemon. Mutates storage if detached. |
+| `mcp install` | Register the MCP server with a host, baking resolved absolute paths (issue #834). Mutates host config. |
+| `mcp remove` | Remove the registration `mcp install` wrote. Mutates host config. |
+| `mcp doctor` | Diagnose why a host cannot connect to the MCP server. Read-only. |
+| `agents` | Render the instruction files each coding IDE reads, from one hashed source. Refuses to overwrite a file it did not write. |
+| `doctor` | Report, per IDE, whether CONTINUUM is wired up, current and authorized. Read-only. |
+| `verify <run_id>` | Re-audit the event chain for tampering. |
+| `reconcile <run_id>` | Settle uncertain actions with registered probes. Mutates storage. |
+| `actions <run_id>` | List recorded side effects and flag uncertain outcomes. |
+| `show-contract <run_id>` | Print the recovery contract for the run. |
+| `replay <run_id>` | Replay events and verify the stored state version. |
+| `benchmark [--total <n>]` | Run the CONTINUUM-Bench harness (default: 200 documents per run). |
+| `attest-keygen` | Generate an Ed25519 signer key pair (PEM files). |
+| `attest <run_id>` | Sign a run's event chain into an attestation document. |
+| `attest-verify <run_id> --attest <file>` | Verify a signed attestation against the live chain. |
+| `lineage-issue <run_id> --key <file> --purpose <text>` | Issue a portable lineage token delegating a run's provenance. Read-only. |
+| `lineage-verify [<run_id>] --token <file>` | Verify a lineage token; exits 0 only when VALID. Read-only. |
+| `serve` | Run the Tier 0 newline-delimited JSON sidecar (no MCP dependency). |
+| `dashboard` | Serve the dashboard (presentation over run data). Listens on port 8000 by default (`--port`). |
+| `tui [--refresh <seconds>]` | Full-screen terminal dashboard: monitor and control runs, read-only until an action is confirmed (`q` quits). |
+| `export-evidence` | Export evidence as content-addressed JSON lines. Read-only. |
+| `forget` | Enumerate and tombstone memory records for a tenant. Mutates unless --dry-run. See [memory governance](../guides/memory_governance.md). |
+| `health` | Advisory prefix-trust health check. Read-only. |
+| `impact` | Show downstream impact of an evidence item. Read-only. |
+| `merge` | Merge into a run at an anchor. Mutates storage. |
+| `policy-review [run_id]` | Advisory per-action-type report over recovery history (attempts, human gates, compaction survival, reconciliation outcomes). Read-only. See [policy learning](../research/policy_learning.md). |
+| `precompact` | Checkpoint before context compaction (PreCompact hook). Mutates the run. |
+| `provenance` | Show provenance DAG. Read-only. |
+| `report --trajectory <run_id>` | Distil claims, uncertain side effects, scar rate and stall sites from the archive and the active log, and audit the stored reports. Read-only. |
+| `record-plan` | Record a structured plan upsert. Mutates storage. |
+| `restore` | Restore a run to an anchor checkpoint. Mutates storage. |
+| `rewind` | Rewind workspace and projection to a checkpoint. |
+| `watch` | Watch a run for liveness breach, optionally notify via webhook. See [liveness watch](../guides/liveness-watch.md). |
+| `notify-test [run_id]` | POST a test notification to every endpoint in the webhook registry. Verifies wiring without a real blockage. See [webhooks](../guides/webhooks.md). |
+
+## Examples
+
+```bash
+# Is it safe to continue?
+continuum resume run_42
+
+# What changed since the last checkpoint?
+continuum diff run_42 1 2
+
+# Prove the chain is untampered, then capture a signed attestation
+continuum verify run_42
+continuum attest run_42 --key signer.pem --out run_42.attest.json
+continuum attest-verify run_42 --attest run_42.attest.json
+
+# Same data, machine-readable: --json works before or after the command
+continuum --json runs | jq '.runs[] | {run_id, status}'
+continuum --json resume run_42 | jq '{safe, mode}'
+
+# Just the newest few children of a wide family
+continuum tree run_42 --limit 5
+```
+
+`tree --limit <n>` truncates the printed child list to the newest `n` children
+and says how many it hid, so a short tree is never mistaken for a small family.
+The truncation is display-only: the family safety roll-up behind `resume` still
+reads every child, so hiding one cannot turn a blocked family into a safe one.
+With `--json`, `children_total` and `children_hidden` report the full count
+alongside the truncated `children` list. A `--limit` below `1` is refused rather
+than clamped (issue #321).
+
+`--db` (storage URL or path, default `continuum.db`) is a global flag and goes
+before the command: `continuum --db other.db runs`. `--json` (machine-readable
+output) is also global but is accepted on either side, so `continuum --json
+runs` and `continuum runs --json` are equivalent, and it now appears in every
+`continuum <command> --help` so scripting-friendly output is discoverable
+per command (issue #328). Most commands emit JSON with it, and
+`continuum <command> --help` lists that command's own flags. Colour is
+TTY-aware and respects `NO_COLOR`; piped output is byte-identical to uncoloured
+output.
+
+`resume --json` and `validate --json` include a `constraint_pins` block
+with per-pin status (`present`, `absent`, `unverifiable`), grace deadline, and
+flagged set. Flagged pins render prominently in human text as `[!!]` lines
+coloured on TTY and plain when piped, byte-identical modulo colour (issue #419).
+
+The authority-probe flow (`--authority`, verdicts, unblocking) is walked through
+in `docs/guides/authority-probes.md`.
+
+`reconcile <run_id>` reads its probe registry from `.continuum/reconcilers.json`
+unless `--config <path>` names another file, and each command probe's `timeout`
+is in seconds and optional:
+
+```json
+{
+  "probes": {
+    "send_invoice": {"command": "check-outbox", "timeout": 30},
+    "charge_card": {"command": "check-ledger"}
+  }
+}
+```
+
+`charge_card` gets the default of 10 seconds. A `timeout` that is not a positive
+number is refused rather than clamped, and the `probes` wrapper is required: a
+file that maps action types at the top level registers nothing, so `reconcile`
+reports every uncertain action as having no probe rather than saying the registry
+was wrong (issue #322).
+
+### What a command probe must print
+
+The probe receives the full `Action` record as JSON on stdin (a probe that needs
+no context can ignore it) and answers on its **last stdout line**, in exactly one
+of these forms:
+
+```text
+occurred=true      # the effect happened; the action is settled completed
+occurred=false     # the effect did not happen; the action is settled failed
+occurred=unknown   # could not tell; the action stays pending
+```
+
+A JSON object or a bare JSON boolean also works -- `{"occurred": true}`,
+`{"occurred": null}`, a bare `true` or `false`. The exit code must be 0, or the
+run is an error rather than a verdict and settles nothing. Case is ignored, and
+only the last non-empty line is read, so a probe may print diagnostics above its
+verdict.
+
+The separator is `=`, not `:`. A probe that prints `occurred:false` has not
+answered false: it has answered nothing, because that line is not one of the
+forms above, and the action stays pending. This is the shape a shell `echo` and
+most config formats suggest, so `reconcile` names the colon when it sees one
+rather than reporting generic unparseable output:
+
+```text
+send_invoice: probe printed 'occurred:false'; the verdict uses ':' where a
+probe prints '=' -- print occurred=false rather than 'occurred:false'. A
+probe's last stdout line must be occurred=true, occurred=false or
+occurred=unknown (a JSON object like {"occurred": true} also works)
+```
+
+A probe may also be one of the built-in evidence types, selected by `type`
+(issue #268). A spec with no `type` is a command probe, so an existing registry
+keeps working unchanged:
+
+```json
+{
+  "probes": {
+    "write_report": {"type": "artifact_check", "path_key": "path"},
+    "tool.call": {"type": "otel_span", "identity": ["path"]}
+  }
+}
+```
+
+`artifact_check` settles a path-scoped action from the filesystem (existence plus
+a SHA-256 digest); `otel_span` settles it from a tool-call span already recorded
+in the run's observations, and the settlement event cites the span and trace ids.
+Each type's required keys are enforced and unknown keys are refused, so a typo'd
+spec fails loudly instead of registering a probe that settles nothing. The two
+types and the contradiction check are walked through in
+`docs/guides/evidence-reconciliation.md`.
+
+`--strict` escalates any action a probe could not settle to `REQUIRES_REVIEW`
+rather than leaving it pending, and a contradiction between the ledger and the
+filesystem makes the command exit 20 with the finding named.
+
+## hooks
+
+`continuum hooks install` writes host-side observation hooks into agent
+settings files (for example `.claude/settings.json`, `.gemini/settings.json`,
+`.codex/hooks.json`, or `.qwen/settings.json`).
+
+Supported clients (`CLIENT_PROFILES` in `src/continuum/clienthooks.py`):
+
+| Profile | Settings file | Events | Write matcher | Any matcher |
+|:--|:--|:--|:--|:--|
+| `claude-code` | `.claude/settings.json` | `SessionStart`, `PostToolUse`, `PreToolUse`, `PreCompact` | `Write|Edit|MultiEdit|NotebookEdit` | `*` |
+| `gemini` | `.gemini/settings.json` | `SessionStart`, `AfterTool`, `BeforeTool` | `write_file|replace` | `.*` |
+| `codex` | `.codex/hooks.json` | `SessionStart`, `PostToolUse`, `PreToolUse` | `^Bash$|^shell$` | `^Bash$|^shell$` |
+| `qwen-code` | `.qwen/settings.json` | `SessionStart`, `PostToolUse`, `PreToolUse`, `PreCompact` | `write_file|edit` | `*` |
+
+By default, `hooks install` configures up to three entries (depending on the
+client profile; event names and matchers below are Claude Code's, see the
+per-client notes for Gemini and Codex):
+
+- **`PostToolUse` (`observe`)**: intercepts file modifications (matching
+  `Write|Edit|MultiEdit|NotebookEdit` on Claude Code) and runs
+  `continuum observe` to record file writes as `TOOL_COMPLETED` events with
+  path, size, and sha256 hash. Gemini uses the `AfterTool` event with the
+  `write_file|replace` matcher, and Codex observes shell calls only
+  (`^Bash$|^shell$`).
+- **`SessionStart` (`briefing`)**: runs `continuum briefing` to inject the active
+  run id, goal, progress, and recovery next steps at session start or resume.
+  For a ready-made out-of-band alternative that prints `continuum --json resume`
+  (no model turn), see [`scripts/session_start_resume.sh`](../../scripts/session_start_resume.sh).
+- **`PreCompact` (`precompact`)**: runs `continuum precompact` to seal a
+  checkpoint before context compaction discards unverified transcript state
+  (configured by default on clients with a compaction event, such as Claude Code).
+
+When `--with-gate` is passed, an additional entry is installed:
+
+- **`PreToolUse` (`gate`)**: intercepts tool calls and runs `continuum gate`
+  to deny unregistered or unclaimed side effects before they fire. The matcher
+  is client specific: `*` on Claude Code, `.*` on Gemini (`BeforeTool`), and
+  `^Bash$|^shell$` on Codex, which only sees shell calls.
+
+### Flags
+
+- **`--db <path>`**: bakes a specific database path into each hook command (for
+  example `continuum --db /abs/path.db observe`), ensuring hook processes running
+  from the project root resolve the intended database without ambiguity.
+- **`--with-gate`**: installs the `PreToolUse` gate hook in addition to the default
+  hooks.
+- **`--no-precompact`**: skips installing the `PreCompact` checkpoint hook, and
+  removes one if an earlier install wrote it.
+- **`--settings <path>`**: writes to a custom settings file path instead of the
+  default location determined by the client profile.
+
+The installed commands are baked in at install time and take one of two shapes:
+
+- **`continuum` on PATH**: an absolute path to the resolved executable, for
+  example `/usr/local/bin/continuum observe`.
+- **Editable / interpreter-only installs**: `/path/to/python -m continuum.cli observe`
+  when no `continuum` executable is found on PATH.
+
+To inspect what was installed, view the target settings file:
+
+```bash
+continuum hooks install claude-code --db /tmp/test.db --with-gate
+cat .claude/settings.json
+```
+
+If the command paths become stale after moving a virtualenv or interpreter,
+re-running `continuum hooks install` updates the baked command paths while preserving
+existing targets.
+
+To remove all installed CONTINUUM hooks from a client settings file:
+
+```bash
+continuum hooks remove claude-code
+```
+
+## mcp
+
+`continuum mcp install` registers the MCP server with a host (Claude Code today,
+`HOST_PROFILES` in `src/continuum/mcp/install.py` holds the per-host data) so it
+connects no matter how the host was launched. The registration bakes values
+resolved at install time, because a committed file cannot express
+"`.venv/bin/continuum-mcp` on POSIX, `.venv\Scripts\continuum-mcp.exe` on
+Windows", and a bare command name is resolved by the host's own `CreateProcess`
+against *its* PATH, which is how a healthy install surfaces as
+`CONNECTION_CLOSED` (issue #834, see [the MCP docs](mcp.md)).
+
+What gets baked:
+
+- **Command**: the console script installed beside this interpreter (absolute
+  path), else the first `continuum-mcp` on PATH, else
+  `/path/to/python -u -m continuum.mcp`. The fallback is what makes venv and
+  editable installs work on Windows with zero PATH assumptions.
+- **`--db`**: an absolute database path (default: `./continuum.db` under the
+  project root, resolved), because the host's spawn cwd is neither documented
+  nor guaranteed to be the project root.
+- **`env`**: names the host's client in the mutating-tools allowlist, so the
+  registration exposes all thirteen tools rather than the three read-only ones.
+
+Before writing anything, the `mcp` SDK extra is verified by spawning a probe
+subprocess; when it is missing, install prints
+`pip install "continuum-agent[mcp]"` and exits non-zero without touching the
+config file.
+
+```bash
+continuum mcp install                        # local scope: ~/.claude.json, this project
+continuum mcp install --scope project        # the shared .mcp.json in the project root
+continuum mcp install --db /abs/path.db      # bake a specific database, stored absolute
+continuum mcp remove                         # take the registration back out
+```
+
+Install is idempotent: re-running it updates the entry in place (a moved
+virtualenv is repointed) and never duplicates. Remove deletes only entries
+this command wrote: the committed `.mcp.json` registration and anything
+hand-registered survive untouched. Both take `--settings <path>` to act on a
+file other than the default for the scope.
+
+

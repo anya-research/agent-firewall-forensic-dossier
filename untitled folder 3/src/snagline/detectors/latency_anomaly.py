@@ -1,0 +1,542 @@
+"""Latency / CUSUM anomaly detector (tier-1, deterministic, O(1) amortized).
+
+Stdlib-only. Per ``(episode_id, tool_name)`` it learns a baseline mean/variance
+via Welford's algorithm during a short warm-up, *freezes* that baseline, and
+then feeds standardized deviations into a CUSUM-with-alarms statistic::
+
+    cusum = max(0, cusum + (x - mu0) / sigma0 - k);  alarm when cusum > h
+
+The baseline is frozen at the end of warm-up (it is NOT updated with later
+samples). This is deliberate: updating the baseline with the anomalies lets a
+sustained shift be "learned away" so the alert stops, which is exactly the
+failure mode the old implementation had. With a frozen mu0/sigma0, a sustained
+regression keeps the CUSUM elevated (and therefore keeps alerting) until latency
+actually returns to the baseline.
+
+A non-zero reference sigma0 is required: a perfectly stable baseline has sample
+std 0, which would make every deviation infinite (and force a div-by-zero guard
+that never fires). We therefore floor sigma0 at ``max(std, abs_floor,
+rel_floor * |mu0|)`` so that even a constant baseline has a meaningful deviation
+scale. This makes a single large spike alarm immediately instead of requiring
+several sustained spikes. Only ``latency_ms`` and ``tool_name`` are read -- no
+content (project.md §1.4).
+
+Calibrated start (issue #101): passing a fitted ``BaselineProfile`` replaces
+the live warm-up for tools it describes well enough (``latency_count >=
+min_samples``): the CUSUM starts frozen at the profile's healthy mean and
+floored spread instead of learning from early live samples. The gate is on
+``latency_count``, the latency-bearing subset, because the seeded statistics
+are computed from it alone -- a profile fitted from a stream whose adapter
+reported no timings has no latency statistics to seed from (issue #348).
+Episodes shorter than the warm-up are therefore monitorable from their first
+step, with no new knobs: k/h stay as configured.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import threading
+from typing import Any
+
+from snagline.baseline import BaselineProfile, ToolBaseline
+from snagline.config import Config
+from snagline.events import StepEvent
+from snagline.risk import FailureRisk
+
+logger = logging.getLogger("snagline")
+
+
+class _WelfordCUSUM:
+    """Online mean/variance (Welford) during warm-up, then a frozen CUSUM."""
+
+    def __init__(
+        self,
+        k: float,
+        h: float,
+        sigma_floor_abs: float = 1.0,
+        sigma_floor_rel: float = 0.05,
+    ) -> None:
+        self.k = k
+        self.h = h
+        self.sigma_floor_abs = sigma_floor_abs
+        self.sigma_floor_rel = sigma_floor_rel
+        self.n = 0
+        self.mean = 0.0
+        self._m2 = 0.0
+        self.cusum = 0.0
+        self.mu0: float | None = None
+        self.sigma0: float = 0.0
+        self.frozen = False
+        # Periodic baseline re-fit state (issue #92). Inert unless the owning
+        # detector sets ``refit_every > 0``: after every ``refit_every`` scored
+        # samples a fresh Welford learner accumulates in parallel (the frozen
+        # baseline keeps scoring the whole time, so coverage never pauses);
+        # when the learner completes, its stats are compared against the
+        # frozen baseline and adopted.
+        self.refit_every = 0
+        self.since_refit = 0
+        self.learner_n = 0
+        self.learner_mean = 0.0
+        self._learner_m2 = 0.0
+        self.pending_drift = False
+        self.pending_shift = 0.0
+        self.pending_old_mu = 0.0
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        k: float,
+        h: float,
+        raw: dict[str, Any],
+        sigma_floor_abs: float = 1.0,
+        sigma_floor_rel: float = 0.05,
+    ) -> _WelfordCUSUM:
+        """Rebuild one state from a persisted snapshot, validating every field.
+
+        ``dump_state`` copies the Welford/CUSUM counters out as-is, and a
+        snapshot is only JSON: a hand edit, a partially overwritten file, or a
+        version skew can hand back a field that is *present* but not a number.
+        A plain assignment accepts it, and the state then poisons the detector
+        instead of being rejected -- the next sample makes ``learn_only``'s
+        ``self.n += 1`` raise ``TypeError`` where the count came back as a
+        string, and that raise escapes ``observe`` into the host agent's step,
+        on every event from that episode until the state is reset (issue #424).
+        Coerce each field to its real type so a structurally complete but
+        semantically broken entry is rejected *here*, where
+        ``Monitor.restore_dict`` catches it and the detector keeps its live
+        state (issue #417), rather than midway through the next episode.
+
+        ``mu0`` is the one field that may legitimately be ``None``: a state
+        captured mid warm-up has no baseline yet, because ``freeze`` is what
+        sets it.
+        """
+        s = cls(k, h, sigma_floor_abs, sigma_floor_rel)
+        s.n = int(raw["n"])
+        s.mean = float(raw["mean"])
+        s._m2 = float(raw["m2"])
+        s.cusum = float(raw["cusum"])
+        mu0 = raw["mu0"]
+        s.mu0 = None if mu0 is None else float(mu0)
+        s.sigma0 = float(raw["sigma0"])
+        s.frozen = bool(raw["frozen"])
+        return s
+
+    def learn_only(self, x: float) -> None:
+        """Welford update of the running baseline statistics (no CUSUM)."""
+        self.n += 1
+        delta = x - self.mean
+        self.mean += delta / self.n
+        delta2 = x - self.mean
+        self._m2 += delta * delta2
+
+    def freeze(self) -> None:
+        """Snapshot the baseline mean/variance as the fixed CUSUM target."""
+        var = self._m2 / (self.n - 1) if self.n >= 2 else 0.0
+        std = math.sqrt(max(0.0, var))
+        self.mu0 = self.mean
+        self.sigma0 = self._floored_sigma(self.mean, std)
+        self.frozen = True
+
+    def seed(self, mean: float, std: float) -> None:
+        """Start from an externally fitted healthy baseline (no warm-up).
+
+        Used by auto-calibration (issue #101): the profile's healthy mean and
+        spread become the fixed CUSUM target immediately.
+        """
+        self.mu0 = mean
+        self.sigma0 = self._floored_sigma(mean, std)
+        self.frozen = True
+
+    def apply_core_state(self, raw: dict[str, Any]) -> None:
+        """Restore the seven core counters from a snapshot, coerced (issue #424).
+
+        ``dump_state`` copies these off a live object and a snapshot is only
+        JSON, so a hand edit, a torn write, or a schema change between two
+        versions can hand back an entry whose keys are all *present* but whose
+        values are not numbers. Such an entry is structurally complete -- it
+        clears every guard and is published -- and the failure then moves out
+        of restore and into the next event: ``int("x") + 1`` raises inside
+        ``learn_only``, ``Monitor.ingest`` swallows it fail-open, and the
+        corrupted state stays put so *every* later event from that episode
+        raises the same error and scores nothing for the rest of its life.
+
+        Coercing to the real type rejects a structurally-complete-but-broken
+        entry here, where the caller's containment already handles it, instead
+        of accepting it and detonating on the next ``observe``.
+        """
+        self.n = int(raw["n"])
+        self.mean = float(raw["mean"])
+        self._m2 = float(raw["m2"])
+        self.cusum = float(raw["cusum"])
+        # mu0 is the one field that may legitimately be None: a state
+        # snapshotted mid warm-up has no baseline yet (freeze() sets it).
+        mu0 = raw["mu0"]
+        self.mu0 = None if mu0 is None else float(mu0)
+        self.sigma0 = float(raw["sigma0"])
+        self.frozen = bool(raw["frozen"])
+
+    def _floored_sigma(self, mean: float, std: float) -> float:
+        """Reference spread: observed std floored per the configured floors."""
+        if mean != 0.0:
+            spread = max(std, self.sigma_floor_abs, self.sigma_floor_rel * abs(mean))
+        else:
+            # A zero mean scales the relative floor to 0 too, so only the
+            # absolute floor can keep the spread positive here.
+            spread = max(std, self.sigma_floor_abs)
+        if spread <= 0.0:
+            # Degenerate but reachable: a constant baseline whose floors are
+            # both disabled or scaled to 0 by a zero mean. Config rejects the
+            # both-zero case (#351); this guard is defense in depth for a
+            # detector built directly, and keeps sigma0 a usable denominator
+            # instead of letting update() divide by zero and deaden the
+            # detector for the run via the fail-open path.
+            return 1e-9
+        return spread
+
+    def update(self, x: float) -> bool:
+        """Advance the CUSUM against the frozen baseline. Returns True if it alarms."""
+        assert self.mu0 is not None
+        self.cusum = max(0.0, self.cusum + (x - self.mu0) / self.sigma0 - self.k)
+        return self.cusum > self.h
+
+    def learn_candidate(self, x: float) -> None:
+        """Feed one sample into the parallel re-fit learner (issue #92)."""
+        self.learner_n += 1
+        delta = x - self.learner_mean
+        self.learner_mean += delta / self.learner_n
+        delta2 = x - self.learner_mean
+        self._learner_m2 += delta * delta2
+
+    def adopt_candidate(self) -> float:
+        """Adopt the learner's stats as the new frozen baseline (issue #92).
+
+        Floors the candidate spread exactly like ``freeze``/``seed``, zeroes
+        the CUSUM accumulator (stale accumulation must not leak across a
+        baseline change) and restarts the refit interval. Returns the OLD
+        baseline mean so callers can report the shift.
+        """
+        assert self.mu0 is not None
+        old_mu = self.mu0
+        var = self._learner_m2 / (self.learner_n - 1) if self.learner_n >= 2 else 0.0
+        std = math.sqrt(max(0.0, var))
+        new_mean = self.learner_mean
+        self.mu0 = new_mean
+        self.sigma0 = self._floored_sigma(new_mean, std)
+        self.cusum = 0.0
+        self.since_refit = 0
+        self.learner_n = 0
+        self.learner_mean = 0.0
+        self._learner_m2 = 0.0
+        return old_mu
+
+
+class LatencyAnomalyDetector:
+    name = "latency_anomaly"
+
+    def __init__(
+        self,
+        k: float | None = None,
+        h: float | None = None,
+        min_samples: int | None = None,
+        sigma_floor_abs: float | None = None,
+        sigma_floor_rel: float | None = None,
+        baseline: BaselineProfile | None = None,
+        config: Config | None = None,
+    ) -> None:
+        cfg = config or Config()
+        self.k = k if k is not None else cfg.cusum_k
+        self.h = h if h is not None else cfg.cusum_h
+        self.min_samples = (
+            min_samples if min_samples is not None else cfg.cusum_min_samples
+        )
+        self.sigma_floor_abs = (
+            sigma_floor_abs
+            if sigma_floor_abs is not None
+            else cfg.cusum_sigma_floor_abs
+        )
+        self.sigma_floor_rel = (
+            sigma_floor_rel
+            if sigma_floor_rel is not None
+            else cfg.cusum_sigma_floor_rel
+        )
+        # Healthy reference for calibrated starts (issue #101). Aggregate
+        # per-tool stats only; no content is retained or consulted.
+        self._baseline = baseline
+        self._states: dict[tuple[str, str], _WelfordCUSUM] = {}
+        # ``_states`` is keyed by (episode_id, tool_name), so unlike every
+        # other detector it is not partitioned by episode: the Monitor's
+        # per-episode lock cannot keep reset()/dump_state() from walking the
+        # dict while an ingest for a *different* episode meets a new tool and
+        # inserts into it (issue #229). This lock guards only the operations
+        # that change or walk the key set -- first-sight insert, reset,
+        # dump_state, load_state -- so the per-step ``state.update(...)``,
+        # which mutates an existing _WelfordCUSUM and adds no key, stays
+        # lock-free and O(1) amortized per event.
+        self._states_lock = threading.Lock()
+        # Periodic baseline re-fit (issue #92); 0 disables (the default).
+        self.refit_every = cfg.cusum_refit_every
+        # Mirrors Config._validated_cusum_slack (issue #421): direct construction
+        # with explicit kwargs skips the Config check, hence the duplicate guard
+        # here. A negative slack adds |k| to the accumulator every scored step
+        # regardless of the data, so the alarm becomes a function of step count
+        # alone and storms healthy traffic (measured: 20 risks in 30 steps on a
+        # perfectly constant 100 ms latency). ``0`` is fine -- no slack.
+        if self.k < 0:
+            raise ValueError(
+                f"k must be >= 0; got {self.k!r}. The slack is subtracted from "
+                "the CUSUM accumulator each scored step, so a negative value "
+                "adds |k| unconditionally and alarms on healthy traffic"
+            )
+
+    def observe(self, event: StepEvent) -> FailureRisk | None:
+        if event.latency_ms is None:
+            return None
+        # A non-finite or negative latency is not evidence about the tool: a
+        # NaN propagates through warm-up into mu0, and CPython's
+        # ``max(0.0, NaN)`` returns ``0.0``, so ``cusum > h`` is False forever
+        # -- the detector goes dark with no crash and no log line for fail-open
+        # to catch (issue #350). Inf is the mirror image: cusum becomes Inf and
+        # the detector alarms on every step. Drop the sample like a missing
+        # one, so warm-up is not satisfied by garbage either.
+        latency = event.latency_ms
+        if not math.isfinite(latency) or latency < 0:
+            logger.debug(
+                "snagline: latency_anomaly ignoring unusable latency_ms %r", latency
+            )
+            return None
+        # Only leaf tool calls carry a meaningful per-tool latency. A planning
+        # chain (``plan_step``) or other aggregate step reports the duration of
+        # a whole reasoning turn, not a single tool -- counting it would flag
+        # every nested LangChain/LangGraph run as a latency anomaly (issue #10).
+        if event.action_type != "tool_call":
+            return None
+        key = (event.episode_id, event.tool_name or "default")
+        state = self._states.get(key)
+        if state is None:
+            state = _WelfordCUSUM(
+                self.k, self.h, self.sigma_floor_abs, self.sigma_floor_rel
+            )
+            state.refit_every = self.refit_every
+            # Calibrated start (issue #101): when a healthy profile describes
+            # this tool well enough, skip warm-up and freeze onto its stats.
+            # "Well enough" means enough *timed* samples: the seed freezes
+            # onto mean_latency/std_latency, which are moments over
+            # latency_count only. Gating on count instead admits a tool the
+            # profile observed often but never timed (auto-calibration, issue
+            # #101, produces exactly that shape), seeding mu0 = 0 and a bare
+            # sigma floor, so the first ordinary call alarms critical (issue
+            # #539). Tools below the bar keep learn-then-freeze.
+            seeded: ToolBaseline | None = None
+            if self._baseline is not None:
+                candidate = self._baseline.tools.get(key[1])
+                # Gate on latency_count, not count: the stats being seeded
+                # (mean_latency / std_latency) are computed from the
+                # latency-bearing subset only. A profile fitted from a stream
+                # whose adapter reported no timings legitimately has
+                # count=100, latency_count=0, mean_latency=0.0 (issue #101
+                # supports exactly that stream), and seeding from it freezes
+                # onto a zero baseline. _floored_sigma keeps the reference
+                # spread finite -- the absolute floor, 1 ms by default -- so a
+                # real call measures as a large but finite multiple of it and
+                # crosses the CUSUM threshold on the first step, paging
+                # critical on step 0 of every episode (issue #348).
+                if (
+                    candidate is not None
+                    and candidate.latency_count >= self.min_samples
+                ):
+                    seeded = candidate
+            if seeded is not None:
+                state.seed(seeded.mean_latency, seeded.std_latency)
+            # Only the key-set mutation needs the lock (issue #229); building
+            # the state above is pure. A concurrent first-sight of the same key
+            # would otherwise be lost, so keep whichever entry landed first.
+            with self._states_lock:
+                state = self._states.setdefault(key, state)
+
+        if not state.frozen:
+            state.learn_only(event.latency_ms)
+            if state.n >= self.min_samples:
+                state.freeze()
+            return None
+
+        alarm = state.update(event.latency_ms)
+        # Snapshot the alarm-time accumulator and baseline *before* the
+        # re-fit advances: a coincident adoption resets cusum to zero and
+        # replaces mu0, so scoring the alarm after _advance_refit reads the
+        # already-reset state -- a flat 0.6 score and a self-contradictory
+        # "300ms deviates from baseline (mean 300ms)" detail (issue #244).
+        alarm_cusum = state.cusum
+        alarm_mu0 = state.mu0
+        drift_risk: FailureRisk | None = None
+        if self.refit_every > 0:
+            shifted, old_mu, shift = self._advance_refit(state, event.latency_ms)
+            if shifted:
+                if alarm:
+                    # This step's CUSUM alarm owns the single-risk return
+                    # slot; hold the shift for the next quiet step.
+                    state.pending_drift = True
+                    state.pending_old_mu = old_mu
+                    state.pending_shift = shift
+                else:
+                    assert state.mu0 is not None
+                    state.pending_drift = False
+                    drift_risk = FailureRisk(
+                        event.episode_id,
+                        event.step_id,
+                        0.8,
+                        "latency_anomaly",
+                        f"latency baseline shifted {old_mu:.0f}ms -> "
+                        f"{state.mu0:.0f}ms ({shift:.0f}ms move, a sustained "
+                        f"shift past the CUSUM's k-sigma sensitivity); baseline "
+                        f"re-fitted",
+                        event.timestamp,
+                    )
+        if alarm:
+            assert alarm_mu0 is not None
+            score = min(1.0, 0.6 + 0.1 * max(0.0, alarm_cusum / self.h - 1.0))
+            return FailureRisk(
+                event.episode_id,
+                event.step_id,
+                score,
+                "latency_anomaly",
+                f"latency {event.latency_ms:.0f}ms deviates from baseline "
+                f"(mean {alarm_mu0:.0f}ms)",
+                event.timestamp,
+            )
+        return drift_risk
+
+    def _advance_refit(
+        self, state: _WelfordCUSUM, x: float
+    ) -> tuple[bool, float, float]:
+        """Advance periodic baseline re-fit bookkeeping (issue #92).
+
+        Returns ``(shifted, old_mu, shift)``: ``shifted`` is True when the
+        frozen baseline itself moved *upward* past the CUSUM's sustained-shift
+        sensitivity (``k * sigma0``) -- the point beyond which a sustained shift
+        accumulates a CUSUM alarm -- so "baseline drifted" is exactly as hard to
+        claim as a sustained deviation actually is. A downward move (latency
+        improved) is never a CUSUM alarm and stays silent. Reporting at the
+        single-step ``h * sigma`` bar instead left a band ``(k*sigma, h*sigma]``
+        where a sustained regression the CUSUM was alarming on got adopted
+        silently (issue #482). The candidate baseline is adopted either way once measured
+        -- keeping a stale baseline would fight reality -- and the CUSUM
+        accumulator restarts from zero against the new reference.
+
+        Coverage never pauses: the frozen baseline keeps scoring every sample
+        while the parallel Welford learner accumulates.
+        """
+        if not state.frozen or state.refit_every <= 0:
+            return False, 0.0, 0.0
+        # A shift detected earlier (its emission was deferred because a CUSUM
+        # alarm held the risk slot) surfaces on the first quiet step.
+        if state.pending_drift and state.learner_n == 0:
+            return True, state.pending_old_mu, state.pending_shift
+        state.since_refit += 1
+        if state.learner_n > 0 or state.since_refit >= state.refit_every:
+            state.learn_candidate(x)
+            if state.learner_n >= self.min_samples:
+                assert state.mu0 is not None
+                old_mu = state.mu0
+                # Signed, not abs: this CUSUM is one-sided (upper), so it only
+                # ever alarms on an *upward* shift. A downward move (latency
+                # improved) is never a regression the CUSUM was alarming on, so
+                # it must stay silent rather than surface a "baseline shifted"
+                # risk for an improvement (issue #482 follow-up).
+                shift = state.learner_mean - old_mu
+                # The CUSUM alarms on a *sustained* upward shift once its
+                # accumulated standardized deviation crosses h, which happens
+                # for any shift whose per-step deviation beats the slack:
+                # shift/sigma0 > k, i.e. shift > k*sigma0. The old bar
+                # (h*sigma0) is the bar for a *single* step deviating -- an
+                # order of magnitude stricter -- so a sustained regression in
+                # the band (k*sigma0, h*sigma0] got adopted (mu0 moved, cusum
+                # zeroed) yet emitted nothing, silently learning away a
+                # regression the CUSUM was actively alarming on. Reporting at
+                # the CUSUM's real sustained-shift sensitivity keeps "baseline
+                # drifted" as hard to claim as a sustained deviation actually
+                # is (issue #482).
+                bar = self.k * state.sigma0
+                state.adopt_candidate()
+                if shift > bar:
+                    state.pending_old_mu = old_mu
+                    state.pending_shift = shift
+                    state.pending_drift = True
+                    return True, old_mu, shift
+        return False, 0.0, 0.0
+
+    def reset(self, episode_id: str) -> None:
+        with self._states_lock:
+            for key in [k for k in self._states if k[0] == episode_id]:
+                self._states.pop(key, None)
+
+    @staticmethod
+    def _state_to_dict(s: _WelfordCUSUM) -> dict[str, Any]:
+        return {
+            "n": s.n,
+            "mean": s.mean,
+            "m2": s._m2,
+            "cusum": s.cusum,
+            "mu0": s.mu0,
+            "sigma0": s.sigma0,
+            "frozen": s.frozen,
+            # Periodic re-fit state (issue #92); written only when active so
+            # default-config snapshots stay byte-identical to pre-#92 ones.
+            **(
+                {
+                    "refit_every": s.refit_every,
+                    "since_refit": s.since_refit,
+                    "learner_n": s.learner_n,
+                    "learner_mean": s.learner_mean,
+                    "learner_m2": s._learner_m2,
+                    # A shift held because a CUSUM alarm owned the risk slot
+                    # (see _advance_refit): without these the deferral is
+                    # silently dropped across a restart, and a baseline shift
+                    # the live detector would have reported never surfaces.
+                    "pending_drift": s.pending_drift,
+                    "pending_old_mu": s.pending_old_mu,
+                    "pending_shift": s.pending_shift,
+                }
+                if s.refit_every > 0
+                else {}
+            ),
+        }
+
+    @classmethod
+    def _state_from_dict(cls, s: _WelfordCUSUM, raw: dict[str, Any]) -> None:
+        s.apply_core_state(raw)
+        # Tolerant .get(): pre-#92 snapshots carry no re-fit fields, and a
+        # detector configured without refits must accept one written with
+        # them (the knob is read from the live config, not the snapshot).
+        s.refit_every = int(raw.get("refit_every", 0) or 0)
+        s.since_refit = int(raw.get("since_refit", 0) or 0)
+        s.learner_n = int(raw.get("learner_n", 0) or 0)
+        s.learner_mean = float(raw.get("learner_mean", 0.0))
+        s._learner_m2 = float(raw.get("learner_m2", 0.0))
+        s.pending_drift = bool(raw.get("pending_drift", False))
+        s.pending_old_mu = float(raw.get("pending_old_mu", 0.0))
+        s.pending_shift = float(raw.get("pending_shift", 0.0))
+
+    def dump_state(self) -> dict[str, Any]:
+        # Keys are (episode_id, tool_name) tuples; JSON dict keys must be
+        # strings, so serialize as [key-pair, state] entries.
+        with self._states_lock:
+            items = sorted(self._states.items())
+        return {
+            "states": [[[ep, tool], self._state_to_dict(s)] for (ep, tool), s in items]
+        }
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        restored: dict[tuple[str, str], _WelfordCUSUM] = {}
+        for key_pair, raw in state.get("states", []):
+            ep, tool = key_pair[0], key_pair[1]
+            s = _WelfordCUSUM.from_snapshot(
+                self.k, self.h, raw, self.sigma_floor_abs, self.sigma_floor_rel
+            )
+            self._state_from_dict(s, raw)
+            # The live config owns the refit cadence; the snapshot only
+            # carries accumulated bookkeeping.
+            s.refit_every = self.refit_every
+            restored[(ep, tool)] = s
+        with self._states_lock:
+            self._states = restored

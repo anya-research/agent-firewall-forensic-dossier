@@ -1,0 +1,42 @@
+name: Auto Assign
+
+on:
+  pull_request:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+
+jobs:
+  assign:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Assign PR to owner
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // For fork PRs the pull_request event runs with a read-only token and
+            // addAssignees returns 403. Catch it so the check stays green — the
+            // pull_request_target run (same PR) will do the real assignment with
+            // write scope. This keeps the (pull_request) check from ever failing.
+            try {
+              await github.rest.issues.addAssignees({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                assignees: ['Cyrax321'],
+              });
+              console.log('Assigned Cyrax321 to PR #' + context.payload.pull_request.number);
+            } catch (e) {
+              const msg = e.message || String(e);
+              if (e.status === 403 || msg.includes('Resource not accessible')) {
+                console.log('Assign skipped (expected for fork pull_request event): ' + msg);
+                return;
+              }
+              console.log('Assign failed non-fatal: ' + msg);
+              // Do not throw — keep the check green for the PR. The
+              // pull_request_target run will retry with proper permissions.
+              return;
+            }

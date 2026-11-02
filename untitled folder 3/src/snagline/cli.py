@@ -1,0 +1,1717 @@
+"""Command-line interface for SNAGLINE (project.md §9).
+
+Implements ``snagline replay``, ``snagline bench``, ``snagline watch`` (live
+stdin or file-follow mode), ``snagline serve`` (the stdlib sidecar HTTP
+server), ``snagline hook`` (the universal command-hook bridge for
+external agent processes: Claude Code, OpenClaw, Hermes, anything that can
+run a shell command), and ``snagline baseline`` (fit or retrain a persisted
+healthy per-tool baseline from a recorded trajectory; the result feeds
+``GoalDriftDetector`` and the latency detectors' calibrated baselines).
+``baseline`` is zero-dependency core -- the optional ``ml`` extra only adds
+the numpy/scikit-learn ESN ensemble used by the ml-ensemble detector, not
+this command.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import math
+import os
+import ssl
+import sys
+import time
+import urllib.request
+from collections.abc import Callable, Iterator
+from contextlib import suppress
+from pathlib import Path
+
+from snagline import __version__
+from snagline._input import _BadInputFile, _DecodeGuardedFile, open_input
+from snagline.baseline import BaselineProfile, ToolBaseline
+from snagline.config import Config
+from snagline.events import StepEvent
+from snagline.monitor import Monitor
+from snagline.risk import FailureRisk
+from snagline.sinks.base import (
+    _MAX_SINK_RESPONSE_BYTES,
+    AlertSink,
+    bounded_post,
+    redacted_destination,
+)
+
+# Scaled benchmark-leg knobs, mirrored from
+# ``benchmarks.overhead_benchmark`` (which is not importable from an installed
+# wheel, hence the fallback below). The effective window is
+# ``base * ceil(n / scale_steps)`` capped at ``max_window``, and each detector
+# has its own base (loop 12, cascade 10), so the slower-growing one sets the
+# floor. scale_steps is small enough that every leg saturates at its cap well
+# inside the run: with 250 and n=200_000, each max_window is reached by ~60k
+# steps, so the remaining blocks measure *sustained* O(window) cost rather
+# than the growth phase -- which is the only thing this leg exists to catch.
+_BENCH_SCALED_STEPS = 250
+_BENCH_SCALED_MAX_WINDOWS = (512, 2048)
+
+
+class _CountingSink:
+    """Internal sink used by the CLI to report how many risks fired."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.risks: list[FailureRisk] = []
+
+    def emit(self, risk: FailureRisk) -> None:
+        self.count += 1
+        self.risks.append(risk)
+
+
+def _open_input(path: str) -> _DecodeGuardedFile:
+    """Open a named input file, or fail naming it (issues #428, #595).
+
+    Thin re-export over :func:`snagline._input.open_input` so the CLI's existing
+    call sites read as one local helper; see that module for why a decode
+    failure needs its own guard.
+    """
+    return open_input(path)
+
+
+def replay(path: str, monitor: Monitor | None = None) -> int:
+    """Replay a JSONL trajectory file through ``monitor`` (live offline analysis).
+
+    Each line must be a JSON object with the ``StepEvent`` fields. Returns the
+    number of steps replayed, or ``-1`` when the file itself cannot be read or
+    decoded -- a bad input file is a usage error, not a crash, so ``replay``
+    reports it on stderr and returns the sentinel rather than propagating
+    (issue #595). The CLI maps both shapes to exit 2. With the default monitor
+    this also prints any ``FailureRisk`` to stderr via the console sink.
+    """
+    if monitor is None:
+        monitor = Monitor.default()
+
+    steps = 0
+    skipped = 0
+    # Track every episode touched so we can clear per-episode detector state
+    # (loop windows, cascade counters, CUSUM baselines) when replay ends.
+    # Without this, reusing the same monitor across replay() calls leaks state
+    # from one trajectory into the next (issue #18).
+    episodes: set = set()
+    try:
+        with _open_input(path) as fh:
+            for lineno, line in enumerate(fh, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    event = StepEvent(**obj)
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    # Fail-soft on the input side too: a malformed trajectory line
+                    # must never crash the whole replay (issue #5).
+                    print(
+                        f"snagline replay: skipping malformed line {lineno}: {exc}",
+                        file=sys.stderr,
+                    )
+                    skipped += 1
+                    continue
+                episodes.add(event.episode_id)
+                monitor.ingest(event)
+                steps += 1
+    except _BadInputFile as exc:
+        print(f"snagline replay: {exc}", file=sys.stderr)
+        return -1
+    # Tear down per-episode state so a later replay() on the same monitor starts
+    # clean (fail-open: a teardown error must not abort the summary).
+    for episode_id in episodes:
+        # Fail-open: a teardown error must not abort the summary.
+        with suppress(Exception):  # pragma: no cover - defensive
+            monitor.end_episode(episode_id)
+    if skipped:
+        print(f"snagline replay: skipped {skipped} malformed line(s)", file=sys.stderr)
+    return steps
+
+
+def _build_config(args: argparse.Namespace) -> Config:
+    """Resolve the effective Config from --config and SNAGLINE_* env vars."""
+    path = getattr(args, "config", None)
+    return Config.resolve(path=path)
+
+
+def _resolve_config_or_usage(args: argparse.Namespace, prog: str) -> Config | None:
+    """Resolve the config, converting a bad config into exit 2 (issues #353,
+    #596).
+
+    Every ranged or closed-set knob is range-checked in ``Config`` itself, so
+    a bad ``SNAGLINE_*`` value, config-file field, or flag surfaces here as a
+    ``ValueError`` -- before any command has printed a banner or started a
+    server. Reporting it as a usage error (message on stderr, exit 2) matches
+    how the parser rejects an unknown flag; letting it escape printed a
+    traceback and claimed a server was starting first. Returns ``None`` and
+    prints the message when the config is unusable.
+
+    A missing or unreadable ``--config`` path is an ``OSError`` from
+    ``Config.load_file``, not a ``ValueError``, so it needs the same catch or
+    it tracebacks on every subcommand while the file itself is never named in a
+    diagnostic the operator can act on (issue #596).
+    """
+    try:
+        return _build_config(args)
+    except (ValueError, OSError) as exc:
+        print(f"snagline {prog}: {exc}", file=sys.stderr)
+        return None
+
+
+def _maybe_dedup(sinks: list[AlertSink], cooldown_seconds: float) -> list[AlertSink]:
+    """Wrap each sink in a cooldown ``DedupSink`` when ``cooldown_seconds`` > 0.
+
+    Suppresses alert storms (issue #4) so a repeating failure pages once per
+    cooldown window instead of on every step.
+    """
+    if not cooldown_seconds or cooldown_seconds <= 0:
+        # Documented disable: a non-positive cooldown means no wrapper.
+        return sinks
+    if not math.isfinite(cooldown_seconds):
+        # inf makes the suppression test always true, so the first alert per
+        # key silences every repeat forever -- the indefinite silence the
+        # module docstring says this wrapper must never produce -- and the
+        # sweep guard can never fire either, so the cooldown table grows
+        # without bound. nan disables the sink outright. Both are operator
+        # errors, not a cooldown (issue #432).
+        print(
+            f"snagline: --cooldown-seconds must be a finite number (got "
+            f"{cooldown_seconds}); pass 0 to disable the cooldown",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    from snagline.sinks.dedup import DedupSink
+
+    return [DedupSink(s, cooldown_seconds=cooldown_seconds) for s in sinks]
+
+
+def _console_sinks(cfg: Config, min_severity: str | None = None) -> list[AlertSink]:
+    """Console escalation plus LoggingSink when ``log_format == "json"``.
+
+    Issue #99 settled composition as emission "alongside console"; issue #119
+    wires the knob end to end so ``SNAGLINE_LOG_FORMAT=json`` makes risks
+    machine-readable with zero code changes, everywhere the console sink is
+    the default choice. Explicit non-console ``--sink`` selections replace the
+    console pair entirely and stay untouched.
+
+    ``min_severity`` filters both members of the pair exactly like the
+    webhook/slack/pagerduty sinks, so ``--min-severity`` is honoured on the
+    default sink instead of being silently ignored (issue #248 wired only the
+    three explicit sinks).
+    """
+    from snagline.sinks.console import ConsoleSink
+
+    pair: list[AlertSink] = [ConsoleSink(min_severity=min_severity)]
+    if cfg.log_format == "json":
+        from snagline.sinks.logging_sink import LoggingSink
+
+        pair.append(LoggingSink(min_severity=min_severity))
+    return pair
+
+
+def _build_sinks(args: argparse.Namespace, cfg: Config) -> list[AlertSink]:
+    """Resolve the escalation sinks from --sink / --slack-url / --pagerduty-key.
+
+    Unknown/invalid combinations fail closed with a clear stderr message and a
+    non-zero exit code (this is configuration error, not a monitoring fault).
+    """
+    sinks: list[AlertSink] = []
+    if args.sink == "webhook":
+        if not args.webhook_url:
+            print(
+                "snagline: --webhook-url is required with --sink webhook",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        from snagline.sinks.webhook import WebhookSink
+
+        sinks.append(WebhookSink(args.webhook_url, min_severity=args.min_severity))
+    elif args.sink == "slack":
+        if not args.slack_url:
+            print(
+                "snagline: --slack-url is required with --sink slack", file=sys.stderr
+            )
+            raise SystemExit(2)
+        from snagline.sinks.slack import SlackSink
+
+        sinks.append(SlackSink(args.slack_url, min_severity=args.min_severity))
+    elif args.sink == "pagerduty":
+        if not args.pagerduty_key:
+            print(
+                "snagline: --pagerduty-key is required with --sink pagerduty",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        from snagline.sinks.pagerduty import PagerDutySink
+
+        sinks.append(
+            PagerDutySink(
+                args.pagerduty_key,
+                source=args.pagerduty_source,
+                min_severity=args.min_severity,
+            )
+        )
+    else:
+        sinks.extend(_console_sinks(cfg, args.min_severity))
+    return _maybe_dedup(sinks, args.cooldown_seconds)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="snagline",
+        description="Real-time failure detection for AI agents.",
+    )
+    # The version comes from the installed distribution metadata (with a
+    # fallback for editable/metadata-less installs) rather than a hardcoded
+    # literal, so --help and --version can never drift from pyproject.toml
+    # (issue #452).
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"snagline {__version__}",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # 12-factor configuration applies across all subcommands: a config file
+    # and/or SNAGLINE_* environment variables tune the detectors (P0).
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to a JSON/TOML config file. Environment variables "
+        "(SNAGLINE_*) override it. See docs/ATTACH_ANY_SYSTEM.md.",
+    )
+
+    p_replay = sub.add_parser(
+        "replay", help="Replay a JSONL trajectory through the detectors (offline)."
+    )
+    p_replay.add_argument("trajectory", help="Path to a .jsonl trajectory file.")
+    p_replay.add_argument(
+        "--quiet", action="store_true", help="Suppress the per-risk console output."
+    )
+    p_replay.add_argument(
+        "--summary", action="store_true", help="Print a trailing summary line."
+    )
+
+    sub.add_parser(
+        "bench",
+        help="Time the per-step path (build a StepEvent + ingest it) and print us/step.",
+    )
+
+    p_watch = sub.add_parser(
+        "watch",
+        help="Live mode: read StepEvent JSON lines from stdin, ingest each as it arrives.",
+    )
+    p_watch.add_argument(
+        "--file",
+        default=None,
+        help="Read StepEvent JSON lines from this file instead of stdin.",
+    )
+    p_watch.add_argument(
+        "--follow",
+        action="store_true",
+        help="With --file: keep reading as the file grows (tail -f).",
+    )
+    p_watch.add_argument(
+        "--episode-id",
+        default=None,
+        help="Episode id to attribute events to [default: each event's own "
+        "episode_id; a synthesized id otherwise].",
+    )
+    p_watch.add_argument(
+        "--sink",
+        choices=["console", "webhook", "slack", "pagerduty"],
+        default="console",
+        help="Escalation sink [default: console].",
+    )
+    p_watch.add_argument(
+        "--webhook-url",
+        default=None,
+        help="Webhook endpoint (required with --sink webhook).",
+    )
+    p_watch.add_argument(
+        "--slack-url",
+        default=None,
+        help="Slack incoming webhook URL (required with --sink slack).",
+    )
+    p_watch.add_argument(
+        "--pagerduty-key",
+        default=None,
+        help="PagerDuty Events API routing key (required with --sink pagerduty).",
+    )
+    p_watch.add_argument(
+        "--pagerduty-source",
+        default="snagline",
+        help="PagerDuty event source label [default: snagline].",
+    )
+    p_watch.add_argument(
+        "--min-severity",
+        default=None,
+        choices=("info", "warning", "critical"),
+        help="Only escalate risks at or above this severity "
+        "(info|warning|critical). Optional.",
+    )
+    p_watch.add_argument(
+        "--cooldown-seconds",
+        type=float,
+        default=0.0,
+        help="Suppress repeated alerts of the same key for this many seconds "
+        "(issue #4). 0 disables (default).",
+    )
+    p_watch.add_argument(
+        "--heartbeat",
+        metavar="PATH",
+        default=None,
+        help="Touch this file's mtime on every ingest (and on every idle "
+        "follow-poll) so an external supervisor can alert when it goes stale; "
+        "silence becomes detectable outside the event stream (issue #92).",
+    )
+
+    p_serve = sub.add_parser(
+        "serve",
+        help="Run the sidecar HTTP server (POST /events, GET /health) for non-Python agents.",
+    )
+    p_serve.add_argument(
+        "--host", default="127.0.0.1", help="Bind address [default: 127.0.0.1]."
+    )
+    p_serve.add_argument("--port", type=int, default=8787, help="Port [default: 8787].")
+    p_serve.add_argument(
+        "--auth-token",
+        default=None,
+        help="Shared secret required on every request except GET /health "
+        "(Authorization: Bearer <token> or X-Snagline-Token). Falls back to "
+        "$SNAGLINE_SERVE_AUTH_TOKEN, which keeps the secret out of argv. "
+        "Unset means all endpoints are open.",
+    )
+    p_serve.add_argument(
+        "--certfile",
+        default=None,
+        help="PEM certificate enabling stdlib TLS on the sidecar listener "
+        "(issue #120); requires --keyfile unless the file bundles its key. "
+        "Omit for plain HTTP.",
+    )
+    p_serve.add_argument(
+        "--keyfile",
+        default=None,
+        help="PEM private key matching --certfile.",
+    )
+    p_serve.add_argument(
+        "--client-ca",
+        default=None,
+        help="PEM CA bundle that client certificates must chain to "
+        "(issue #145); requires --certfile and enables mutual TLS. "
+        "When given the sidecar requests a client certificate on every "
+        "handshake and rejects untrusted or missing ones.",
+    )
+    p_serve.add_argument(
+        "--max-body-bytes",
+        type=int,
+        default=1_000_000,
+        help="Reject POST bodies larger than this with 413 [default: 1000000]. "
+        "Must be positive: there is no unlimited value, and 0 rejects every "
+        "POST (issue #394) -- unlike --episode-ttl-seconds, 0 does not mean "
+        "off. Raise the cap if a payload is being turned away.",
+    )
+    p_serve.add_argument(
+        "--read-timeout",
+        type=float,
+        default=None,
+        help="Socket read timeout in seconds for sidecar connections "
+        "(issue #130); stalled senders are closed after this. Falls back "
+        "to $SNAGLINE_SERVER_READ_TIMEOUT or Config.server_read_timeout "
+        "[default: 30]. Documented next to --max-body-bytes.",
+    )
+    p_serve.add_argument(
+        "--episode-ttl-seconds",
+        type=float,
+        default=None,
+        help="Expire ids from snagline_episodes_active not seen for this many seconds "
+        "(issue #173); 0 disables. Falls back to $SNAGLINE_EPISODE_TTL_SECONDS or "
+        "Config.episode_ttl_seconds [default: disabled]. Wall-clock TTL value but "
+        "monotonic expiry; replay traffic will resurrect stale ids.",
+    )
+    p_serve.add_argument(
+        "--max-risks",
+        type=int,
+        default=1000,
+        help="How many risks received on POST /risks to retain for GET /risks "
+        "[default: 1000].",
+    )
+    p_serve.add_argument(
+        "--sink",
+        choices=["console", "webhook", "slack", "pagerduty"],
+        default="console",
+        help="Escalation sink [default: console].",
+    )
+    p_serve.add_argument(
+        "--webhook-url",
+        default=None,
+        help="Webhook endpoint (required with --sink webhook).",
+    )
+    p_serve.add_argument(
+        "--slack-url",
+        default=None,
+        help="Slack incoming webhook URL (required with --sink slack).",
+    )
+    p_serve.add_argument(
+        "--pagerduty-key",
+        default=None,
+        help="PagerDuty Events API routing key (required with --sink pagerduty).",
+    )
+    p_serve.add_argument(
+        "--pagerduty-source",
+        default="snagline",
+        help="PagerDuty event source label [default: snagline].",
+    )
+    p_serve.add_argument(
+        "--min-severity",
+        default=None,
+        choices=("info", "warning", "critical"),
+        help="Only escalate risks at or above this severity "
+        "(info|warning|critical). Optional.",
+    )
+    p_serve.add_argument(
+        "--cooldown-seconds",
+        type=float,
+        default=0.0,
+        help="Suppress repeated alerts of the same key for this many seconds "
+        "(issue #4). 0 disables (default).",
+    )
+    p_serve.add_argument(
+        "--halt-forward",
+        default=None,
+        help="Enable the halt_webhook enforcement policy (issue #93): risks "
+        "with score >= --min-severity-for-halt are POSTed to this URL and the "
+        'response {"action": "continue"|"pause", "reason": ...} is surfaced '
+        "as the sidecar monitor's last_directive. Timeout or error fails open "
+        "to continue. Hold this endpoint tight: it controls pause decisions.",
+    )
+    p_serve.add_argument(
+        "--halt-timeout",
+        type=float,
+        default=None,
+        help="Halt webhook round-trip budget in seconds [default: 0.25].",
+    )
+    p_serve.add_argument(
+        "--min-severity-for-halt",
+        type=float,
+        default=None,
+        help="Minimum risk score that pays the halt-webhook cost [default: 0.8].",
+    )
+
+    p_hook = sub.add_parser(
+        "hook",
+        help="Universal hook bridge: map a native hook payload from stdin and forward it.",
+    )
+    p_hook.add_argument(
+        "--url",
+        default=None,
+        help="Forward to a snagline sidecar (POST /events with a canonical StepEvent).",
+    )
+    p_hook.add_argument(
+        "--out",
+        default=None,
+        help="Append the mapped StepEvent as a JSON line to this file (for snagline watch).",
+    )
+    p_hook.add_argument(
+        "--timeout",
+        type=float,
+        default=1.0,
+        help="HTTP timeout when --url is used [s].",
+    )
+
+    # Fits a per-tool healthy-run profile from a trajectory and persists it as
+    # JSON. Dependency-free (stdlib only); model-based baselines can build on
+    # the same persisted profile later.
+    sp = sub.add_parser(
+        "baseline",
+        help="Fit a healthy-run baseline (per-tool latency/error profile) from a trajectory.",
+    )
+    sp.add_argument(
+        "trajectory",
+        metavar="trajectory|retrain",
+        help="Path to a .jsonl trajectory of a healthy run, or the literal "
+        "keyword 'retrain' to refit from the newest JSONL window and bump "
+        "the BaselineStore version atomically (issue #102; see docs/RETRAIN_CADENCE.md).",
+    )
+    sp.add_argument(
+        "--jsonl",
+        default=None,
+        help="With 'retrain': refit from exactly this JSONL window file "
+        "(overrides --windows-dir).",
+    )
+    sp.add_argument(
+        "--windows-dir",
+        default=None,
+        help="With 'retrain': directory of rotated window .jsonl files; the "
+        "newest by modification time is used.",
+    )
+    sp.add_argument(
+        "--max-age",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="With 'retrain': warn on stderr when the currently active stored "
+        "baseline is older than this many seconds (staleness guard for the "
+        "host-side cadence).",
+    )
+    sp.add_argument(
+        "--output",
+        default="baseline.json",
+        help="Where to write the fitted baseline JSON [default: baseline.json].",
+    )
+    sp.add_argument(
+        "--store-dir",
+        default=None,
+        help="If set, store the baseline in a versioned BaselineStore at this "
+        "root (per --tenant/--deployment) instead of a single --output file.",
+    )
+    sp.add_argument(
+        "--tenant",
+        default="default",
+        help="Tenant scope for the BaselineStore [default: default].",
+    )
+    sp.add_argument(
+        "--deployment",
+        default="default",
+        help="Deployment scope for the BaselineStore [default: default].",
+    )
+    sp.add_argument(
+        "--list-versions",
+        action="store_true",
+        help="List stored versions and exit 0 without fitting, writing, or "
+        "retraining (read-only; requires --store-dir, works on both the fit "
+        "and 'retrain' forms).",
+    )
+    sp.add_argument(
+        "--max-versions",
+        type=int,
+        default=None,
+        help="With --store-dir: cap retained versions (oldest pruned).",
+    )
+    sp.add_argument(
+        "--semantic",
+        action="store_true",
+        help="Also fit a semantic embedding centroid (requires pip install "
+        "snagline[drift]; streams the trajectory fail-soft and "
+        "persists via save_baseline).",
+    )
+    sp.add_argument(
+        "--semantic-model",
+        default="all-MiniLM-L6-v2",
+        help="Sentence-transformers model for --semantic [default: %(default)s].",
+    )
+
+    p_eval = sub.add_parser(
+        "eval",
+        help="Evaluate a proposed tool request against security policies (offline).",
+    )
+    p_eval.add_argument("--tool", required=True, help="Tool name to evaluate (e.g. 'Bash', 'Read').")
+    p_eval.add_argument("--action", default="unknown", help="Action type (e.g. 'execute', 'read').")
+    p_eval.add_argument("--resource", default=None, help="Resource target (command string, path, url).")
+    p_eval.add_argument("--policy", default=None, help="Path to a security policy YAML/JSON file.")
+    p_eval.add_argument("--json", action="store_true", help="Print machine-readable JSON output.")
+
+    p_val = sub.add_parser(
+        "validate-policy",
+        help="Validate a security policy file schema.",
+    )
+    p_val.add_argument("policy_file", help="Path to the security policy file to validate.")
+
+    return parser
+
+
+def _iter_lines(
+    path: str | None,
+    follow: bool,
+    on_wait: Callable[[], None] | None = None,
+) -> Iterator[str]:
+    """Yield lines from stdin, or from a file; with ``follow``, tail like -f.
+
+    ``on_wait`` (issue #92) fires on every empty follow-poll so a heartbeat
+    can keep proving liveness while the watched file is silent. Failures are
+    the callback's own problem; this loop never inspects them.
+
+    A partial line -- one whose newline has not been flushed yet -- is held in
+    a buffer and yielded only once the newline arrives (issue #508): an
+    external producer (a Node/Go stream, a rotated log, a pipe with a large
+    kernel buffer) can land a flush boundary mid-line, and ``readline`` would
+    otherwise hand back the two halves as two separate, unparseable lines. At
+    EOF in non-follow mode a final unterminated line is still flushed so no
+    trailing event is dropped.
+    """
+    if path is None:
+        yield from sys.stdin
+        return
+    with _open_input(path) as fh:
+        buffer = ""
+        while True:
+            chunk = fh.readline()
+            if chunk:
+                # readline returns at most one line, so a newline can only be
+                # the last character; accumulate fragments until it shows up.
+                buffer += chunk
+                if buffer.endswith("\n"):
+                    yield buffer
+                    buffer = ""
+            elif follow:
+                if on_wait is not None:
+                    on_wait()
+                time.sleep(0.2)
+            else:
+                # EOF, no more writes coming: a held final line (no trailing
+                # newline) is still a complete record -- yield it.
+                if buffer:
+                    yield buffer
+                return
+
+
+def _cmd_watch(args: argparse.Namespace) -> int:
+    # Resolve the effective config once (config file -> SNAGLINE_* env) so
+    # log_format and every other knob layer identically across subcommands.
+    cfg = _resolve_config_or_usage(args, "watch")
+    if cfg is None:
+        return 2
+    try:
+        sinks = _build_sinks(args, cfg)
+    except SystemExit as exc:
+        return int(exc.code or 2)
+    monitor = Monitor.default(
+        config=cfg,
+        # _build_sinks is the single DedupSink choke point (issue #152):
+        # re-wrapping here composed DedupSink(DedupSink(inner)) and made watch
+        # diverge from serve, which passes _build_sinks through untouched.
+        sinks=sinks,
+    )
+    # External liveness evidence (issue #92): touched per ingest and on every
+    # idle follow-poll so silence becomes externally detectable. Construction
+    # cannot fail; touch failures inside log once and never raise (fail-open).
+    heartbeat = None
+    if args.heartbeat:
+        from snagline.sinks.heartbeat import HeartbeatSink
+
+        heartbeat = HeartbeatSink(args.heartbeat)
+        heartbeat.touch()  # evidence of life from startup
+    episode = args.episode_id or (args.file or "stdin")
+    steps = 0
+    # Finalize every episode actually ingested, not the filename (issue
+    # #225): end_episode must be asked about the ids the events carried or
+    # finalize-based detectors (silent_abort) can never fire in watch. A
+    # set, like replay, so a multi-episode file/follow session finalizes
+    # each one exactly once.
+    episodes: set = set()
+    try:
+        with suppress(KeyboardInterrupt):
+            for line in _iter_lines(
+                args.file,
+                args.follow,
+                on_wait=heartbeat.touch if heartbeat is not None else None,
+            ):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    event = StepEvent(**obj)
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    print(
+                        f"snagline watch: skipping malformed line: {exc}",
+                        file=sys.stderr,
+                    )
+                    continue
+                if args.episode_id is not None:
+                    # The flag documents attribution ("Episode id to attribute
+                    # events to"), but for years it only named the zero-events
+                    # fallback id at teardown -- the parsed event's own id was
+                    # ingested instead, so an operator scoping a multi-tenant
+                    # stream to one episode silently got per-event attribution
+                    # and nothing warned them (issue #354). Override at parse
+                    # time so ingest and the teardown set see one id;
+                    # StepEvent is frozen, hence replace.
+                    event = dataclasses.replace(event, episode_id=args.episode_id)
+                monitor.ingest(event)
+                episodes.add(event.episode_id)
+                steps += 1
+                if heartbeat is not None:
+                    heartbeat.touch()
+    except _BadInputFile as exc:
+        # A named input file that cannot be opened is a usage error, not a
+        # crash: the teardown still runs, and the operator gets one line
+        # naming the path instead of a traceback (issue #428).
+        print(f"snagline watch: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        # Fail-open teardown (issue #225): finalize every episode that was
+        # actually ingested; ``episode`` (the override, the filename or
+        # "stdin") is still finalized so the zero-events case -- and any
+        # operator override -- keeps today's behaviour. Finalize-based
+        # detectors see the right ids; an id already in the set is harmless
+        # (end_episode is idempotent for unknown ids).
+        for episode_id in episodes | {episode}:
+            with suppress(Exception):
+                monitor.end_episode(episode_id)
+    print(f"snagline watch: ingested {steps} step(s)", file=sys.stderr)
+    return 0
+
+
+# Required positional fields and complete field set for StepEvent (issue #620).
+# Mirrors the 13 fields round-tripped losslessly by _event_to_json below.
+_REQUIRED_EVENT_FIELDS: frozenset[str] = frozenset(
+    f.name
+    for f in dataclasses.fields(StepEvent)
+    if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING
+)
+_ALL_EVENT_FIELDS: frozenset[str] = frozenset(
+    f.name for f in dataclasses.fields(StepEvent)
+)
+
+
+def _cmd_hook(args: argparse.Namespace) -> int:
+    """Universal command-hook bridge (fail-open: ALWAYS exits 0).
+
+    Reads one hook payload from stdin. Claude Code payloads (detected by
+    ``hook_event_name``) are mapped to a canonical StepEvent; a payload that
+    is already a StepEvent is passed through as-is. The event is then POSTed
+    to ``--url`` and/or appended to ``--out``; with neither, it is ingested
+    into a local default Monitor. Malformed input and network failures are
+    logged to stderr and swallowed - a hook must never break the host agent.
+    """
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a JSON object")
+        if "hook_event_name" in payload and not isinstance(
+            payload["hook_event_name"], str
+        ):
+            raise ValueError(
+                f"hook_event_name must be a string, got {type(payload['hook_event_name']).__name__}"
+            )
+        from snagline.adapters.claude_code import (
+            is_claude_code_payload,
+            payload_to_event,
+        )
+
+        if is_claude_code_payload(payload):
+            event = payload_to_event(payload, tracker=None)
+        else:
+            try:
+                event = StepEvent(**payload)  # already canonical
+            except TypeError as exc:
+                missing = _REQUIRED_EVENT_FIELDS - set(payload)
+                unknown = set(payload) - _ALL_EVENT_FIELDS
+                if missing:
+                    raise ValueError(
+                        f"missing StepEvent fields: {sorted(missing)}"
+                    ) from exc
+                if unknown:
+                    raise ValueError(
+                        f"unknown StepEvent fields: {sorted(unknown)}"
+                    ) from exc
+                raise ValueError(str(exc)) from exc
+    except Exception as exc:
+        print(f"snagline hook: ignoring malformed payload: {exc}", file=sys.stderr)
+        return 0  # fail-open: never fail the host's hook invocation
+
+    if event is None:  # unmapped lifecycle event (e.g. SessionStart)
+        return 0
+
+    if args.out:
+        try:
+            with open(args.out, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(_event_to_json(event)) + "\n")
+        except OSError as exc:
+            print(f"snagline hook: cannot append to {args.out}: {exc}", file=sys.stderr)
+
+    if args.url:
+        try:
+            req = urllib.request.Request(
+                args.url,
+                data=json.dumps(_event_to_json(event)).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            bounded_post(req, args.timeout, _MAX_SINK_RESPONSE_BYTES)
+        except Exception as exc:
+            # The URL can carry basic auth (``user:pass@host``), and a failed
+            # forward is when an operator reads this line (issue #390).
+            print(
+                f"snagline hook: forward to {redacted_destination(args.url)} failed: "
+                f"{exc}",
+                file=sys.stderr,
+            )
+
+    if not args.url and not args.out:
+        # Fail-open by construction; Monitor.default() is also fail-open.
+        with suppress(Exception):
+            monitor = Monitor.default(config=_build_config(args))
+            monitor.ingest(event)
+    return 0
+
+
+def _event_to_json(event: StepEvent) -> dict:
+    # All 13 StepEvent fields, so the hook bridge round-trips losslessly.
+    # ``side_effect`` and ``metadata`` were previously dropped, which made
+    # SideEffectGuardDetector and CompactionTripwireDetector structurally
+    # unreachable over `snagline hook --out/--url` (issue #226). ``metadata``
+    # is host-provided: whatever the host emits in its payload is what lands
+    # in the --out file or the POST body (documented privacy posture -- the
+    # bridge never adds content, it just stops subtracting).
+    return {
+        "step_id": event.step_id,
+        "episode_id": event.episode_id,
+        "timestamp": event.timestamp,
+        "action_type": event.action_type,
+        "action_signature": event.action_signature,
+        "tool_name": event.tool_name,
+        "latency_ms": event.latency_ms,
+        "error": event.error,
+        "error_type": event.error_type,
+        "tokens_in": event.tokens_in,
+        "tokens_out": event.tokens_out,
+        "side_effect": event.side_effect,
+        "metadata": event.metadata,
+    }
+
+
+def _newest_window(windows_dir: str) -> str | None:
+    """Return the newest ``*.jsonl`` window file in ``windows_dir``, or None.
+
+    Newest means largest modification time; ties break alphabetically so the
+    pick is deterministic. Non-recursive by design: windows are rotated into
+    one flat directory (issue #102).
+    """
+    root = Path(windows_dir)
+    candidates = [p for p in root.glob("*.jsonl") if p.is_file()]
+    if not candidates:
+        return None
+    return str(max(candidates, key=lambda p: (p.stat().st_mtime_ns, p.name)))
+
+
+def _active_baseline_age(store, tenant: str, deployment: str) -> float | None:
+    """Age in seconds of the newest stored version, or None if unknowable.
+
+    Prefers the recorded ``fitted_at`` timestamp from the latest stored
+    profile, which is robust to custom version ids. Falls back to parsing
+    version ids as wall-clock timestamps for schema-v1 files without the
+    field. Non-numeric ids are skipped fail-open; staleness is a warning aid,
+    never a hard dependency.
+    """
+    with suppress(Exception):
+        profile = store.load(tenant, deployment)
+        if profile is not None:
+            fitted = getattr(profile, "fitted_at", 0.0)
+            try:
+                fitted_f = float(fitted)
+            except (TypeError, ValueError):
+                fitted_f = 0.0
+            if fitted_f:
+                return max(0.0, time.time() - fitted_f)
+    for version_id in reversed(store.list_versions(tenant, deployment)):
+        try:
+            fitted_at = float(version_id)
+        except ValueError:
+            continue
+        return max(0.0, time.time() - fitted_at)
+    return None
+
+
+def _resolved_max_versions(args: argparse.Namespace) -> int | None:
+    """Return the validated ``--max-versions`` limit, or None on a usage error.
+
+    ``args.max_versions or 10`` treated an explicit ``0`` as "unset" and
+    silently substituted 10, while any negative value passed straight through to
+    the store, where ``_prune`` deleted every version file including the one
+    that same save had just written (issue #332). An explicit knob is now
+    range-checked: a bad value is a usage error (exit 2) rather than silent
+    data loss, and an unset one still means the store default of 10.
+    """
+    if args.max_versions is None:
+        return 10
+    if args.max_versions < 1:
+        print(
+            "snagline baseline: --max-versions must be >= 1; got "
+            f"{args.max_versions!r}",
+            file=sys.stderr,
+        )
+        return None
+    return args.max_versions
+
+
+def _tool_line(tb: ToolBaseline) -> str:
+    """Render one fitted tool's summary line for ``baseline fit`` output.
+
+    ``count`` covers every observed tool call while the latency moments are
+    computed from the ``latency_count`` subset, so a profile fitted from a
+    stream whose adapter reported no ``latency_ms`` legitimately reads
+    ``n=100 mean=0.0ms``. Printed as-is that claims a hundred samples
+    averaged zero milliseconds -- the exact misunderstanding that hides a
+    baseline the latency detectors cannot use. Divergence is shown instead.
+    """
+    timed = f" timed={tb.latency_count}" if tb.latency_count != tb.count else ""
+    if tb.latency_count >= 2:
+        lat = f"mean={tb.mean_latency:.1f}ms std={tb.std_latency:.1f}ms"
+    else:
+        lat = "mean=n/a std=n/a"
+    return f"  {tb.tool_name}: n={tb.count}{timed} {lat} errors={tb.error_count}"
+
+
+def _cmd_baseline_retrain(args: argparse.Namespace) -> int:
+    """Refit from the newest JSONL window and atomically bump the store.
+
+    Usage: ``snagline baseline retrain --store-dir ROOT [--tenant T]
+    [--deployment D] (--jsonl FILE | --windows-dir DIR) [--max-age SECONDS]
+    [--max-versions N]``. Exits 0 on success, 2 on usage errors, 3 when the
+    window cannot be resolved or read.
+    """
+    if not args.store_dir:
+        print(
+            "snagline baseline retrain: --store-dir is required (versioned store root)",
+            file=sys.stderr,
+        )
+        return 2
+    if getattr(args, "semantic", False):
+        # The retrain contract fits a structural profile only; --semantic is a
+        # fit-path option and used to be accepted here and then discarded, so
+        # an operator asking for a semantic baseline silently got a structural
+        # one (issue #429). Fail closed instead of dropping the flag.
+        print(
+            "snagline baseline retrain: --semantic is not supported on the "
+            "retrain path; fit one with "
+            "'snagline baseline <trajectory> --semantic --store-dir <root>'",
+            file=sys.stderr,
+        )
+        return 2
+    if bool(args.jsonl) == bool(args.windows_dir):
+        print(
+            "snagline baseline retrain: give exactly one of --jsonl FILE or "
+            "--windows-dir DIR",
+            file=sys.stderr,
+        )
+        return 2
+
+    from snagline.baseline_store import BaselineStore, retrain_from_jsonl
+
+    limit = _resolved_max_versions(args)
+    if limit is None:
+        return 2
+    store = BaselineStore(args.store_dir, max_versions=limit)
+
+    # Staleness guard on the previously active baseline, before it is
+    # replaced: this is the signal that the host-side cadence slipped.
+    if args.max_age is not None:
+        age = _active_baseline_age(store, args.tenant, args.deployment)
+        if age is not None and age > args.max_age:
+            print(
+                f"snagline baseline: WARNING: active baseline for "
+                f"{args.tenant}/{args.deployment} is {age / 3600.0:.1f}h old "
+                f"(max-age {args.max_age / 3600.0:.1f}h); consider tightening "
+                f"the retrain cadence",
+                file=sys.stderr,
+            )
+
+    window = args.jsonl or _newest_window(args.windows_dir)
+    if window is None:
+        print(
+            f"snagline baseline retrain: no .jsonl window files found in "
+            f"{args.windows_dir}",
+            file=sys.stderr,
+        )
+        return 3
+    try:
+        version = retrain_from_jsonl(
+            store,
+            window,
+            tenant=args.tenant,
+            deployment=args.deployment,
+            max_versions=args.max_versions,
+        )
+    except OSError as exc:
+        print(
+            f"snagline baseline retrain: cannot read {window}: {exc}", file=sys.stderr
+        )
+        return 3
+
+    profile = store.load_version(args.tenant, args.deployment, version)
+    tools = len(profile.tools) if profile is not None else 0
+    steps = profile.total_steps if profile is not None else 0
+    print(
+        f"snagline baseline retrain: stored version {version} for "
+        f"{args.tenant}/{args.deployment} from {window} "
+        f"({tools} tool(s), {steps} step(s))"
+    )
+    return 0
+
+
+def _list_stored_versions(store, tenant: str, deployment: str) -> int:
+    """Print the stored baseline versions and exit 0.
+
+    Read-only by construction: it never fits, writes a file, or bumps the
+    store, so ``--list-versions`` cannot have a write side effect. An empty
+    store still exits 0 with a plain "no stored versions" line.
+    """
+    versions = store.list_versions(tenant, deployment)
+    if not versions:
+        print(f"snagline baseline: no stored versions for {tenant}/{deployment}")
+        return 0
+    print(f"snagline baseline: versions for {tenant}/{deployment}:")
+    for v in versions:
+        print(f"  {v}")
+    return 0
+
+
+def _save_profile(profile: BaselineProfile, path: str) -> bool:
+    """Persist a fitted profile, or report an unwritable path and fail.
+
+    ``save_baseline`` opens ``path`` for writing, so a ``--output`` whose parent
+    directory does not exist raises ``FileNotFoundError`` *after* a fit that may
+    have taken minutes, and the operator saw the traceback instead of the
+    "wrote ..." line that would have told them where it went (issue #598). The
+    fit is not redone on a retry either way, so the diagnostic names the path
+    and the profile is not silently dropped. Returns False on a write failure.
+    """
+    # Imported here rather than at module scope because both callers sit behind
+    # a subcommand; the non-semantic path below imported only
+    # fit_baseline_from_jsonl, so a NameError escaped from here on exactly the
+    # path #598's diagnostic was written for.
+    from snagline.baseline import save_baseline
+
+    try:
+        save_baseline(profile, path)
+    except OSError as exc:
+        print(f"snagline baseline: cannot write {path}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def _cmd_baseline(args: argparse.Namespace) -> int:
+    """Fit a healthy-run baseline from a trajectory and persist it.
+
+    With ``--store-dir`` the baseline is stored versioned and per-tenant in a
+    ``BaselineStore``; ``--list-versions`` just lists what is already stored.
+    Otherwise it writes a single JSON file (``--output``).
+
+    The literal keyword ``retrain`` instead of a trajectory path dispatches to
+    the scheduled-retrain contract (issue #102).
+    """
+    # --list-versions is read-only wherever it is accepted: honour it before
+    # any fitting, writing, or retraining, on both the fit and retrain paths
+    # (issue #293). Without a store there is nothing to list from, so fail
+    # closed rather than silently performing the write the flag suppresses.
+    if getattr(args, "list_versions", False):
+        if not args.store_dir:
+            print(
+                "snagline baseline: --list-versions requires --store-dir",
+                file=sys.stderr,
+            )
+            return 2
+        from snagline.baseline_store import BaselineStore
+
+        # Same validation the fit/retrain path applies: this is a read, but the
+        # knob reaches the same store constructor, and ``or 10`` here let an
+        # explicit 0 silently mean 10 and a negative pass straight through
+        # (issue #332), which then tracebacks out of a read-only command
+        # instead of exiting 2 the way the fit path already does (#597).
+        limit = _resolved_max_versions(args)
+        if limit is None:
+            return 2
+        store = BaselineStore(args.store_dir, max_versions=limit)
+        return _list_stored_versions(store, args.tenant, args.deployment)
+
+    if getattr(args, "trajectory", None) == "retrain":
+        return _cmd_baseline_retrain(args)
+
+    if args.store_dir:
+        from snagline.baseline_store import (
+            BaselineStore,
+            capture_from_jsonl,
+        )
+
+        limit = _resolved_max_versions(args)
+        if limit is None:
+            return 2
+        store = BaselineStore(args.store_dir, max_versions=limit)
+        if args.list_versions:
+            versions = store.list_versions(args.tenant, args.deployment)
+            if not versions:
+                print(
+                    f"snagline baseline: no stored versions for "
+                    f"{args.tenant}/{args.deployment}"
+                )
+                return 0
+            print(f"snagline baseline: versions for {args.tenant}/{args.deployment}:")
+            for v in versions:
+                print(f"  {v}")
+            return 0
+        if getattr(args, "semantic", False):
+            semantic_model = getattr(args, "semantic_model", "all-MiniLM-L6-v2")
+            try:
+                from sentence_transformers import SentenceTransformer
+            except Exception as exc:
+                print(
+                    "snagline baseline: drift extra not installed "
+                    f"({exc}); run `pip install snagline[drift]` for semantic baseline",
+                    file=sys.stderr,
+                )
+                return 1
+            try:
+                st_model = SentenceTransformer(semantic_model)
+            except Exception as exc:
+                print(
+                    f"snagline baseline: embedding model {semantic_model!r} failed to load "
+                    f"({exc}); run `pip install snagline[drift]`",
+                    file=sys.stderr,
+                )
+                return 1
+            try:
+                from snagline.drift.goal_drift import (
+                    _event_label,
+                    fit_semantic_baseline,
+                )
+                from snagline.events import StepEvent
+            except Exception as exc:
+                print(
+                    f"snagline baseline: semantic fit unavailable ({exc}); "
+                    "run `pip install snagline[drift]`",
+                    file=sys.stderr,
+                )
+                return 1
+
+            def _embed(event):  # type: ignore[no-untyped-def]
+                vec = st_model.encode(_event_label(event), show_progress_bar=False)
+                return vec.tolist() if hasattr(vec, "tolist") else list(vec)
+
+            def _iter_events():  # type: ignore[no-untyped-def]
+                with _open_input(args.trajectory) as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            yield StepEvent(**obj)
+                        except Exception:
+                            continue
+
+            try:
+                profile = fit_semantic_baseline(
+                    _iter_events(), _embed, model=semantic_model
+                )
+                if hasattr(profile, "fitted_at"):
+                    profile.fitted_at = time.time()
+            except Exception as exc:
+                print(f"snagline baseline: semantic fit failed: {exc}", file=sys.stderr)
+                return 1
+            version = store.save(
+                profile,
+                tenant=args.tenant,
+                deployment=args.deployment,
+                max_versions=args.max_versions,
+            )
+            print(
+                f"snagline baseline: stored version {version} for "
+                f"{args.tenant}/{args.deployment} (semantic {semantic_model})"
+            )
+            return 0
+        version = capture_from_jsonl(
+            store,
+            args.trajectory,
+            tenant=args.tenant,
+            deployment=args.deployment,
+            max_versions=args.max_versions,
+        )
+        print(
+            f"snagline baseline: stored version {version} for "
+            f"{args.tenant}/{args.deployment}"
+        )
+        return 0
+
+    from snagline.baseline import fit_baseline_from_jsonl
+
+    if getattr(args, "semantic", False):
+        semantic_model = getattr(args, "semantic_model", "all-MiniLM-L6-v2")
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception as exc:
+            print(
+                "snagline baseline: drift extra not installed "
+                f"({exc}); run `pip install snagline[drift]` for semantic baseline",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            st_model = SentenceTransformer(semantic_model)
+        except Exception as exc:
+            print(
+                f"snagline baseline: embedding model {semantic_model!r} failed to load "
+                f"({exc}); run `pip install snagline[drift]`",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            from snagline.drift.goal_drift import _event_label, fit_semantic_baseline
+            from snagline.events import StepEvent
+        except Exception as exc:
+            print(
+                f"snagline baseline: semantic fit unavailable ({exc}); "
+                "run `pip install snagline[drift]`",
+                file=sys.stderr,
+            )
+            return 1
+
+        def _embed(event):  # type: ignore[no-untyped-def]
+            vec = st_model.encode(_event_label(event), show_progress_bar=False)
+            return vec.tolist() if hasattr(vec, "tolist") else list(vec)
+
+        def _iter_events():  # type: ignore[no-untyped-def]
+            with _open_input(args.trajectory) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        yield StepEvent(**obj)
+                    except Exception:
+                        continue
+
+        try:
+            profile = fit_semantic_baseline(
+                _iter_events(), _embed, model=semantic_model
+            )
+            if hasattr(profile, "fitted_at"):
+                profile.fitted_at = time.time()
+        except Exception as exc:
+            print(f"snagline baseline: semantic fit failed: {exc}", file=sys.stderr)
+            return 1
+        if not _save_profile(profile, args.output):
+            return 2
+        tools = profile.tools
+        print(
+            f"snagline baseline: fitted {len(tools)} tool(s) from {profile.total_steps} step(s) "
+            f"(semantic {semantic_model})"
+        )
+        for _name, tb in sorted(tools.items()):
+            print(_tool_line(tb))
+        print(f"snagline baseline: wrote {args.output}")
+        return 0
+
+    try:
+        profile = fit_baseline_from_jsonl(args.trajectory)
+    except OSError as exc:
+        print(
+            f"snagline baseline: cannot open {args.trajectory}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    if not _save_profile(profile, args.output):
+        return 2
+
+    tools = profile.tools
+    print(
+        f"snagline baseline: fitted {len(tools)} tool(s) from {profile.total_steps} step(s)"
+    )
+    for _name, tb in sorted(tools.items()):
+        print(_tool_line(tb))
+    print(f"snagline baseline: wrote {args.output}")
+    return 0
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from snagline.server.http_server import serve
+
+    cfg = _resolve_config_or_usage(args, "serve")
+    if cfg is None:
+        return 2
+    try:
+        # Enforcement wiring (issue #93): --halt-forward turns the resolved
+        # config into halt_webhook mode. dataclasses.replace re-runs
+        # Config.__post_init__, so an invalid value fails loudly here instead
+        # of at first ingest -- and, since the ranges are also checked in
+        # Config, before the banner below claims a server is starting.
+        if args.halt_forward:
+            cfg = dataclasses.replace(
+                cfg, policy="halt_webhook", halt_url=args.halt_forward
+            )
+        if args.halt_timeout is not None:
+            cfg = dataclasses.replace(cfg, halt_timeout_s=args.halt_timeout)
+        if args.min_severity_for_halt is not None:
+            cfg = dataclasses.replace(
+                cfg, min_severity_for_halt=args.min_severity_for_halt
+            )
+    except ValueError as exc:
+        print(f"snagline serve: {exc}", file=sys.stderr)
+        return 2
+    try:
+        sinks = _build_sinks(args, cfg)
+    except SystemExit as exc:
+        return int(exc.code or 2)
+    # Prefer the flag, fall back to the environment so the secret need not
+    # appear in argv (visible to every other process via ps).
+    auth_token = args.auth_token or os.environ.get("SNAGLINE_SERVE_AUTH_TOKEN") or None
+    # Validate TLS flag pairing before printing anything: a banner that
+    # advertises https:// and then dies in a traceback is worse than a clean
+    # refusal up front.
+    if args.keyfile and not args.certfile:
+        print(
+            "snagline serve: --keyfile requires --certfile",
+            file=sys.stderr,
+        )
+        return 2
+    if args.client_ca and not args.certfile:
+        print(
+            "snagline serve: --client-ca requires --certfile",
+            file=sys.stderr,
+        )
+        return 2
+    # Everything that can fail at bind or handshake time is validated before
+    # the banner promises a listener: a supervisor reading the banner believes
+    # the sidecar is up, so a banner followed by a traceback is worse than a
+    # clean refusal (issue #430).
+    if not 0 <= args.port <= 65535:
+        print(
+            f"snagline serve: --port must be between 0 and 65535 (got {args.port})",
+            file=sys.stderr,
+        )
+        return 2
+    for flag, candidate in (
+        ("--certfile", args.certfile),
+        ("--keyfile", args.keyfile),
+        ("--client-ca", args.client_ca),
+    ):
+        if not candidate:
+            continue
+        try:
+            with open(candidate, "rb"):
+                pass
+        except OSError as exc:
+            print(
+                f"snagline serve: cannot read {flag} {candidate}: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+    if args.certfile:
+        # Readable is not usable: a PEM that opens fine but does not parse is
+        # rejected only when the listener wraps its socket, which is *after*
+        # the banner below has advertised https:// to a supervisor. Load the
+        # chain into a throwaway context the same way _resolve_tls does so the
+        # failure is reported here, as the contract the readability check above
+        # already claims (issue #599).
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(args.certfile, args.keyfile)
+            if args.client_ca:
+                context.load_verify_locations(args.client_ca)
+        except (ssl.SSLError, OSError) as exc:
+            print(
+                f"snagline serve: cannot load TLS material: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+    if args.max_body_bytes <= 0:
+        # Unlike --episode-ttl-seconds (where 0 means "disable"), 0 here is
+        # not an "unlimited" escape hatch -- it is the one value that rejects
+        # every POST, because the cap is compared with a strict >. There is
+        # no unlimited mode; say so rather than letting the sidecar come up
+        # healthy and drop 100% of telemetry (issue #394).
+        print(
+            "snagline serve: --max-body-bytes must be a positive number of "
+            f"bytes, got {args.max_body_bytes}; there is no unlimited value "
+            "-- use a larger cap instead",
+            file=sys.stderr,
+        )
+        return 2
+    scheme = "https" if (args.certfile or args.keyfile or args.client_ca) else "http"
+    print(
+        f"snagline serve: listening on {scheme}://{args.host}:{args.port} "
+        "(POST /events, GET /health)",
+        file=sys.stderr,
+    )
+    if cfg.policy == "halt_webhook":
+        # The halt URL can carry basic auth (``user:pass@host``), and a startup
+        # banner lands in whatever the supervisor captures -- journald, a
+        # container log, a redirected stderr -- which outlives the process
+        # (issue #390).
+        print(
+            f"snagline serve: halt forwarding enabled -> "
+            f"{redacted_destination(cfg.halt_url or '')} "
+            f"(timeout {cfg.halt_timeout_s}s, min severity "
+            f"{cfg.min_severity_for_halt}); directives land on "
+            "Monitor.last_directive and are readable at GET /directive "
+            "(issues #93, #169)",
+            file=sys.stderr,
+        )
+    if not auth_token:
+        print(
+            "snagline serve: no --auth-token / $SNAGLINE_SERVE_AUTH_TOKEN set; "
+            "every endpoint is open to anyone who can reach this port",
+            file=sys.stderr,
+        )
+    with suppress(KeyboardInterrupt):
+        # TLS kwargs are forwarded only when requested: with no TLS flags the
+        # serve() call is exactly what it was before issue #120, byte-for-byte.
+        tls_kwargs = (
+            {
+                "certfile": args.certfile,
+                "keyfile": args.keyfile,
+                "client_ca": args.client_ca,
+            }
+            if (args.certfile or args.keyfile or args.client_ca)
+            else {}
+        )
+        serve(
+            Monitor.default(config=cfg, sinks=sinks),
+            host=args.host,
+            port=args.port,
+            auth_token=auth_token,
+            max_body_bytes=args.max_body_bytes,
+            max_risks=args.max_risks,
+            metrics_format=cfg.metrics_format,
+            # Flag, else the layered config (issue #240): the _resolve_*
+            # helpers in http_server re-resolve from env only, so a value
+            # that came from the --config file was silently dropped for
+            # exactly these three knobs. Passing the resolved cfg value
+            # when the flag is unset keeps one layering everywhere.
+            read_timeout=(
+                args.read_timeout
+                if args.read_timeout is not None
+                else cfg.server_read_timeout
+            ),
+            episode_ttl_seconds=(
+                args.episode_ttl_seconds
+                if args.episode_ttl_seconds is not None
+                else cfg.episode_ttl_seconds
+            ),
+            **tls_kwargs,
+        )
+    return 0
+
+
+def _inline_benchmark(
+    n: int = 200_000,
+    block: int = 2_000,
+    *,
+    scale_steps: int = _BENCH_SCALED_STEPS,
+    max_windows: tuple[int, ...] = _BENCH_SCALED_MAX_WINDOWS,
+) -> dict:
+    """Fallback benchmark used when ``benchmarks.overhead_benchmark`` is not
+    importable. ``benchmarks/`` lives at the repository root, outside the
+    ``[tool.setuptools.packages.find] where = ["src"]`` scope, so it is never
+    shipped in a wheel and this fallback is what an installed copy of
+    snagline runs; a source checkout imports the real module instead (see the
+    call site below). Mirrors the shape of
+    ``benchmarks.overhead_benchmark.run_benchmark`` -- signature
+    included -- so the CLI output is identical either way (issue #6),
+    including the scaled legs (issue #298) and the full-step headline that
+    charges StepEvent construction rather than timing ingest() alone
+    (issue #312)."""
+    import statistics
+
+    from snagline import Monitor
+    from snagline.config import Config
+    from snagline.events import StepEvent, make_signature
+
+    def build_event(i: int) -> StepEvent:
+        # The same generator both legs use, so they differ only in whether
+        # construction is charged (issue #312).
+        return StepEvent(
+            step_id=str(i),
+            episode_id="bench",
+            timestamp=__import__("time").time(),
+            action_type="tool_call",
+            action_signature=make_signature("tool_call", "tool", str(i)),
+            tool_name="tool",
+            latency_ms=100.0,
+        )
+
+    def percentiles(per_step_us: list[float]) -> tuple[float, float]:
+        ordered = sorted(per_step_us)
+        p99_idx = min(len(ordered) - 1, int(0.99 * len(ordered)))
+        return statistics.median(per_step_us), ordered[p99_idx]
+
+    def time_ingest(monitor: Monitor) -> tuple[float, float]:
+        for e in events[:block]:
+            monitor.ingest(e)
+        per_step_us: list[float] = []
+        for start in range(block, n, block):
+            chunk = events[start : start + block]
+            t0 = time.perf_counter()
+            for e in chunk:
+                monitor.ingest(e)
+            t1 = time.perf_counter()
+            per_step_us.append((t1 - t0) / len(chunk) * 1e6)
+        return percentiles(per_step_us)
+
+    def time_full_step(monitor: Monitor) -> tuple[float, float]:
+        # The headline: construction happens inside the timed region, because
+        # that is what an integrator pays per step. Timing ingest() alone on
+        # pre-built events hid the frozen-dataclass construction cost
+        # (issue #312).
+        for i in range(block):
+            monitor.ingest(build_event(i))
+        per_step_us: list[float] = []
+        for start in range(block, n, block):
+            end = min(start + block, n)
+            t0 = time.perf_counter()
+            for i in range(start, end):
+                monitor.ingest(build_event(i))
+            t1 = time.perf_counter()
+            per_step_us.append((t1 - t0) / (end - start) * 1e6)
+        return percentiles(per_step_us)
+
+    events = [build_event(i) for i in range(n)]
+    # One resolved config for every leg, matching run_benchmark(): a bare
+    # Config() pins every knob to its dataclass default while Monitor.default()
+    # resolves the SNAGLINE_* env layering, so mixing the two would compare
+    # detector setups that differ in more than scaling.
+    base_cfg = Config.resolve()
+    full_median_us, full_p99_us = time_full_step(Monitor.default(base_cfg))
+    ingest_median_us, ingest_p99_us = time_ingest(Monitor.default(base_cfg))
+    stats: dict = {
+        "n": n,
+        "blocks": len(range(block, n, block)),
+        "median_us": full_median_us,
+        "p99_us": full_p99_us,
+        "ingest_only": {
+            "median_us": ingest_median_us,
+            "p99_us": ingest_p99_us,
+        },
+        "scaled": [],
+    }
+    for cap in max_windows:
+        monitor = Monitor.default(
+            dataclasses.replace(
+                base_cfg, window_scale_steps=scale_steps, max_window=cap
+            )
+        )
+        median_us, p99_us = time_ingest(monitor)
+        stats["scaled"].append(
+            {"max_window": cap, "median_us": median_us, "p99_us": p99_us}
+        )
+    return stats
+
+
+def _cmd_bench() -> int:
+    try:
+        from benchmarks.overhead_benchmark import run_benchmark
+    except ImportError:
+        # Running from an installed package: the benchmarks module is not
+        # shipped, so fall back to an inline measurement rather than crashing.
+        run_benchmark = _inline_benchmark
+
+    stats = run_benchmark()
+    print("snagline overhead benchmark")
+    print(f"  steps measured : {stats['n']}")
+    print(f"  median        : {stats['median_us']:.2f} us/step")
+    print(f"  p99           : {stats['p99_us']:.2f} us/step")
+    split = stats.get("ingest_only")
+    if split:
+        print(
+            f"  ingest only   : median {split['median_us']:.2f} us/step, "
+            f"p99 {split['p99_us']:.2f} us/step"
+        )
+    for leg in stats.get("scaled", []):
+        print(
+            f"  scaled max_window={leg['max_window']:<5d}: "
+            f"median {leg['median_us']:.2f} us/step, "
+            f"p99 {leg['p99_us']:.2f} us/step"
+        )
+    return 0
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    from snagline.security_evaluation import evaluate_request
+
+    try:
+        res = evaluate_request(
+            tool_name=args.tool,
+            action=args.action,
+            resource=args.resource,
+            policy_path=args.policy,
+        )
+    except Exception as err:
+        print(f"snagline eval: error: {err}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        print(f"Decision: {res['decision'].upper()}")
+        print(f"Security Score: {res['security_score']:.1f}/100")
+        print(f"Reason: {res['reason']}")
+        if res.get("findings"):
+            print(f"Findings ({len(res['findings'])}):")
+            for f in res["findings"]:
+                print(f"  - [{f.get('severity', 'info')}] {f.get('rule_id')}: {f.get('reason')}")
+    return 0 if res["decision"] == "allow" else (1 if res["decision"] == "ask" else 2)
+
+
+def _cmd_validate_policy(args: argparse.Namespace) -> int:
+    from snagline.security_policy import load_security_policy
+
+    try:
+        schema = load_security_policy(args.policy_file)
+        print(f"Policy {schema.name!r} (v{schema.version}) is valid.")
+        return 0
+    except Exception as err:
+        print(f"snagline validate-policy: error: {err}", file=sys.stderr)
+        return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "eval":
+        return _cmd_eval(args)
+
+    if args.command == "validate-policy":
+        return _cmd_validate_policy(args)
+
+    if args.command == "replay":
+        counter = _CountingSink()
+        cfg = _resolve_config_or_usage(args, "replay")
+        if cfg is None:
+            return 2
+        sinks: list[AlertSink] = []
+        if not args.quiet:
+            # Same composition as Monitor.default(): console plus, for
+            # log_format="json", LoggingSink alongside it (issues #99/#119).
+            sinks.extend(_console_sinks(cfg))
+        sinks.append(counter)
+        monitor = Monitor.default(config=cfg, sinks=sinks)
+        # replay() reports a bad input file itself and returns -1 rather than
+        # propagating (issue #595); both shapes map to exit 2.
+        steps = replay(args.trajectory, monitor=monitor)
+        if steps < 0:
+            return 2
+        if args.summary:
+            print(
+                f"replayed {steps} steps; {counter.count} risk(s) emitted",
+                file=sys.stderr,
+            )
+        return 0
+
+    if args.command == "bench":
+        return _cmd_bench()
+
+    if args.command == "watch":
+        return _cmd_watch(args)
+
+    if args.command == "hook":
+        return _cmd_hook(args)
+
+    if args.command == "serve":
+        return _cmd_serve(args)
+
+    if args.command == "baseline":
+        return _cmd_baseline(args)
+
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

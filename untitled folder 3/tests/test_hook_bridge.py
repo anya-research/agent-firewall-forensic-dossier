@@ -1,0 +1,815 @@
+"""End-to-end tests for the external-process bridges:
+
+* sidecar ``POST /hooks/claude-code`` (Claude Code native ``http`` hooks)
+* ``snagline hook`` (command-hook bridge: stdin payload -> file/HTTP/local)
+* ``snagline watch --file`` (file bridge)
+
+Teardown contract (issue #69): every spawned child stops through
+``_graceful_stop``, a cross-platform ladder (graceful signal on POSIX,
+terminate() on Windows, then wait -> terminate -> kill escalation), so no
+platform orphans the watch subprocess and no ProcessLookupError escapes.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from contextlib import suppress
+
+import pytest
+
+from snagline.monitor import Monitor
+from snagline.risk import FailureRisk
+from snagline.server.http_server import make_server
+
+
+class _RecordingSink:
+    def __init__(self):
+        self.risks: list[FailureRisk] = []
+
+    def emit(self, risk: FailureRisk) -> None:
+        self.risks.append(risk)
+
+
+def _tool_payload(i: int, event: str = "PreToolUse") -> dict:
+    # tool_input stays IDENTICAL across calls (only the volatile tool_use_id
+    # differs) so the signature is stable and the loop detector can see the
+    # repetition.
+    return {
+        "session_id": "sess-e2e",
+        "hook_event_name": event,
+        "tool_name": "Bash",
+        "tool_input": {"command": "npm test"},
+        "tool_use_id": f"toolu_{i}",
+    }
+
+
+def _post(url: str, obj: dict) -> dict:
+    req = urllib.request.Request(
+        url, data=json.dumps(obj).encode(), headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read())
+
+
+_STOP_TIMEOUT_S = 10.0
+
+
+class _HookTargetServer:
+    """Minimal localhost POST target for webhook-sink teardown tests.
+
+    Raw stdlib socket accept loop on an ephemeral 127.0.0.1 port. With
+    ``respond_ok`` it reads one whole request (headers plus the declared
+    ``Content-Length``) and answers 200 like a healthy sink endpoint; in drop
+    mode it accepts and immediately closes, forcing the WebhookSink failure
+    path while still giving the test a deterministic readiness signal (the
+    first accepted connection). No sleeps needed anywhere.
+
+    Reading the *whole* request matters (issue #215): ``http.client`` writes
+    the header block and the body as two separate sends on a TCP_NODELAY
+    socket, so they arrive as two segments whenever this listener reaches
+    ``recv()`` before the second one lands. A single ``recv()`` then recorded
+    the headers alone, the ``"trigger": "loop"`` assertions below could never
+    match, and replying 200 that early reset the client mid-body.
+    """
+
+    def __init__(self, respond_ok: bool) -> None:
+        self.respond_ok = respond_ok
+        self.bodies: list[bytes] = []
+        self.accepts = 0
+        self._connected = threading.Event()
+        self.headers_read = threading.Event()
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self.port: int = self._sock.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def close(self) -> None:
+        with suppress(OSError):
+            self._sock.close()
+        self._thread.join(timeout=5)
+
+    def wait_for_connection(self, timeout: float) -> bool:
+        return self._connected.wait(timeout)
+
+    def _serve(self) -> None:
+        """Accept connections forever until ``close()`` shuts the listener down.
+
+        In ``respond_ok`` mode each connection is read to completion and then
+        answered 200; in drop mode it is read once and closed with no response.
+        Both modes always close the connection, so a failing test leaves no
+        socket behind.
+        """
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return  # listening socket closed by close()
+            self.accepts += 1
+            self._connected.set()
+            try:
+                if self.respond_ok:
+                    data = self._read_request(conn)
+                    if data:
+                        self.bodies.append(data)
+                        conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+                else:
+                    # Drop mode: reading one segment and closing with no
+                    # response IS the failure the sink must survive.
+                    conn.recv(65536)
+            except OSError:
+                pass
+            finally:
+                with suppress(OSError):
+                    conn.close()
+
+    def _read_request(self, conn: socket.socket) -> bytes:
+        """Read one complete HTTP request: headers plus ``Content-Length`` bytes.
+
+        Returns the raw request as received, so callers keep asserting over the
+        same headers-plus-body bytes they always did. A client that hangs up
+        early yields the partial request rather than blocking; reads are bounded
+        by a socket timeout so a client that never finishes cannot pin this
+        thread for the life of the test session.
+
+        ``headers_read`` is set as soon as the header terminator is consumed, so
+        a test can drive segmentation deliberately: without it, "no response
+        arrived" only means this thread had not run yet, and a single-``recv()``
+        listener that woke up late enough to get both segments at once would
+        look just as correct.
+        """
+        conn.settimeout(_STOP_TIMEOUT_S)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(65536)
+            if not chunk:
+                self.headers_read.set()
+                return buf  # hung up before finishing the header block
+            buf += chunk
+        self.headers_read.set()
+        head, _, body = buf.partition(b"\r\n\r\n")
+        length = 0
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"content-length":
+                with suppress(ValueError):
+                    length = int(value.strip())
+                break
+        while len(body) < length:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break  # short body: record what arrived, let the test say so
+            body += chunk
+        return head + b"\r\n\r\n" + body
+
+
+def _await_exit(proc: subprocess.Popen, timeout: float) -> None:
+    """Wait for exit, escalating terminate() -> kill() until reaped."""
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    # Rung 1: terminate() (SIGTERM on POSIX, TerminateProcess on Windows).
+    with suppress(Exception):
+        proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    # Rung 2: hard kill, then reap unconditionally.
+    with suppress(Exception):
+        proc.kill()
+    with suppress(Exception):
+        proc.wait(timeout=timeout)
+
+
+def _graceful_stop(proc: subprocess.Popen, timeout: float = _STOP_TIMEOUT_S) -> None:
+    """Cross-platform child teardown for issue #69.
+
+    ``Popen.send_signal(SIGINT)`` raises ValueError on Windows (only SIGTERM
+    and the CTRL_* events are supported there), which used to abort the
+    finally block in the follow-mode test and orphan the watch subprocess.
+    This ladder always ends with the child reaped, on every platform:
+
+    - graceful step: SIGINT on POSIX (identical to Ctrl-C on the CLI, so its
+      KeyboardInterrupt-suppressed summary still prints); terminate() first
+      on Windows where SIGINT does not exist;
+    - then wait(timeout) -> terminate() -> wait(timeout) -> kill().
+    """
+    if proc.poll() is None:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            proc.send_signal(signal.SIGINT)
+    _await_exit(proc, timeout)
+
+
+@pytest.fixture()
+def children():
+    """Track every Popen a test spawns; teardown asserts zero survivors."""
+    handles: list[subprocess.Popen] = []
+    yield handles
+    for proc in handles:
+        if proc.poll() is None:
+            _graceful_stop(proc, timeout=_STOP_TIMEOUT_S)
+    for proc in handles:
+        assert proc.poll() is not None, f"lingering child not reaped: {proc.args!r}"
+
+
+def test_sidecar_accepts_native_claude_code_payloads_and_fires_loop() -> None:
+    sink = _RecordingSink()
+    server = make_server(Monitor.default(sinks=[sink]), host="127.0.0.1", port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        # A pre/start + post/end pair, repeated with IDENTICAL tool_input
+        # (tool_use_id differs; the signature ignores it on purpose).
+        for i in range(4):
+            assert (
+                _post(base + "/hooks/claude-code", _tool_payload(i))["status"]
+                == "ingested"
+            )
+            assert (
+                _post(base + "/hooks/claude-code", _tool_payload(i, "PostToolUse"))[
+                    "status"
+                ]
+                == "ingested"
+            )
+        # Unmapped lifecycle events are acknowledged and ignored.
+        assert (
+            _post(base + "/hooks/claude-code", {"hook_event_name": "SessionStart"})[
+                "status"
+            ]
+            == "ignored"
+        )
+        assert any(r.trigger == "loop" for r in sink.risks)
+        assert all(r.episode_id == "sess-e2e" for r in sink.risks)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _run(args: list, stdin_text: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "snagline.cli", *args],
+        input=stdin_text,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_hook_cli_appends_canonical_event_to_file(tmp_path) -> None:
+    out = tmp_path / "events.jsonl"
+    for i in range(4):
+        r = _run(["hook", "--out", str(out)], json.dumps(_tool_payload(i)))
+        assert r.returncode == 0  # fail-open: hook ALWAYS exits 0
+    lines = [json.loads(line) for line in out.read_text().splitlines()]
+    assert len(lines) == 4
+    assert {line["episode_id"] for line in lines} == {"sess-e2e"}
+    assert {line["action_type"] for line in lines} == {"tool_call"}
+    # The appended file is valid snagline watch input and trips the detector.
+    r = _run(["watch", "--file", str(out), "--episode-id", "sess-e2e"], "")
+    assert r.returncode == 0
+    assert '"trigger": "loop"' in r.stderr
+
+
+def test_hook_cli_forwards_to_sidecar(tmp_path) -> None:
+    sink = _RecordingSink()
+    server = make_server(Monitor.default(sinks=[sink]), host="127.0.0.1", port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/events"
+    try:
+        for i in range(4):
+            r = _run(["hook", "--url", url], json.dumps(_tool_payload(i)))
+            assert r.returncode == 0
+        assert any(x.trigger == "loop" for x in sink.risks)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_hook_cli_never_fails_the_host() -> None:
+    r = _run(["hook", "--out", "/nonexistent/dir/x.jsonl"], "not json at all")
+    assert r.returncode == 0
+    r2 = _run(
+        ["hook", "--url", "http://127.0.0.1:1/nope"], json.dumps(_tool_payload(1))
+    )
+    assert r2.returncode == 0
+    r3 = _run(["hook"], json.dumps({"hook_event_name": "SessionStart"}))
+    assert r3.returncode == 0  # unmapped events are silently dropped
+
+
+def test_hook_cli_malformed_payload_diagnostics() -> None:
+    # Issue #620: missing required StepEvent fields named explicitly, not raw __init__()
+    r_missing = _run(["hook"], json.dumps({"tool_name": "T"}))
+    assert r_missing.returncode == 0
+    assert "__init__()" not in r_missing.stderr
+    assert "missing StepEvent fields:" in r_missing.stderr
+    assert "'action_signature'" in r_missing.stderr
+    assert "'action_type'" in r_missing.stderr
+    assert "'episode_id'" in r_missing.stderr
+    assert "'step_id'" in r_missing.stderr
+    assert "'timestamp'" in r_missing.stderr
+
+    # Unknown keyword argument reported as unknown field
+    canonical = _canonical_compaction("step-1")
+    canonical["unknown_foo"] = "bar"
+    r_unknown = _run(["hook"], json.dumps(canonical))
+    assert r_unknown.returncode == 0
+    assert "__init__()" not in r_unknown.stderr
+    assert "unknown StepEvent fields: ['unknown_foo']" in r_unknown.stderr
+
+    # Wrong-typed hook_event_name produces diagnostic instead of being silently dropped
+    r_wrong_type = _run(["hook"], json.dumps({"hook_event_name": 123}))
+    assert r_wrong_type.returncode == 0
+    assert "hook_event_name must be a string" in r_wrong_type.stderr
+
+    # Valid unmapped lifecycle event stays completely quiet
+    r_lifecycle = _run(["hook"], json.dumps({"hook_event_name": "SessionStart"}))
+    assert r_lifecycle.returncode == 0
+    assert r_lifecycle.stderr == ""
+
+    # Non-dict JSON payload
+    r_array = _run(["hook"], "[]")
+    assert r_array.returncode == 0
+    assert "payload must be a JSON object" in r_array.stderr
+
+
+# --- issue #226: the bridge must not drop side_effect / metadata --------------
+
+_PIN_A = "448a0c330ba83452956a4b294c1af26dc0def64cffbec53e8e6c99118655dbd1"
+
+
+def _canonical_compaction(step_id: str) -> dict:
+    """A canonical (already-StepEvent-shaped) compaction payload.
+
+    A host emitting canonical events through the command hook carries the
+    tripwire contract fields (action_type "compaction" plus pinned hashes in
+    ``metadata``). Pre-#226 the bridge dropped ``metadata`` on the way to
+    ``--out``/``--url``, so the written/forwarded event lost its pins and
+    CompactionTripwireDetector was structurally unreachable downstream.
+    """
+    from snagline.events import make_signature
+
+    return {
+        "step_id": step_id,
+        "episode_id": "ep-bridge",
+        "timestamp": 1718300100.0,
+        "action_type": "compaction",
+        "action_signature": make_signature("compaction", None),
+        "tool_name": None,
+        "metadata": {"pinned": [_PIN_A]},
+    }
+
+
+def _canonical_side_effect(step_id: str) -> dict:
+    """A canonical non-idempotent action payload (issue #88's host contract)."""
+    from snagline.events import make_signature
+
+    return {
+        "step_id": step_id,
+        "episode_id": "ep-bridge",
+        "timestamp": 1718300100.0,
+        "action_type": "tool_call",
+        "action_signature": make_signature("tool_call", "charge"),
+        "tool_name": "charge",
+        "side_effect": True,
+    }
+
+
+def test_hook_cli_round_trips_metadata_to_the_out_file(tmp_path) -> None:
+    out = tmp_path / "events.jsonl"
+    r = _run(["hook", "--out", str(out)], json.dumps(_canonical_compaction("c1")))
+    assert r.returncode == 0
+    lines = [json.loads(line) for line in out.read_text().splitlines()]
+    assert lines == [
+        {
+            "step_id": "c1",
+            "episode_id": "ep-bridge",
+            "timestamp": 1718300100.0,
+            "action_type": "compaction",
+            "action_signature": lines[0]["action_signature"],
+            "tool_name": None,
+            "latency_ms": None,
+            "error": False,
+            "error_type": None,
+            "tokens_in": None,
+            "tokens_out": None,
+            "side_effect": False,
+            "metadata": {"pinned": [_PIN_A]},
+        }
+    ]
+
+
+def test_hook_cli_round_trips_side_effect_to_the_out_file(tmp_path) -> None:
+    out = tmp_path / "events.jsonl"
+    r = _run(["hook", "--out", str(out)], json.dumps(_canonical_side_effect("s1")))
+    assert r.returncode == 0
+    [line] = [json.loads(line) for line in out.read_text().splitlines()]
+    assert line["side_effect"] is True
+
+
+def test_hook_out_file_feeds_compaction_tripwire(tmp_path) -> None:
+    """End-to-end proof (issue #226): --out output is tripwire-monitorable.
+
+    A compaction whose pin is never re-confirmed must fire governance_decay
+    when the bridge-written file is replayed with the tripwire enabled. On
+    pre-#226 cli.py the metadata never survived the write, so this replay
+    stayed silent -- the detector was unreachable over the bridge.
+    """
+    out = tmp_path / "events.jsonl"
+    from snagline.events import make_signature
+
+    for i in range(4):  # compaction + 3 quiet steps -> grace window expires
+        if i == 0:
+            payload = _canonical_compaction("c1")
+        else:
+            payload = {
+                "step_id": f"t{i}",
+                "episode_id": "ep-bridge",
+                "timestamp": 1718300100.0 + i,
+                "action_type": "tool_call",
+                "action_signature": make_signature("tool_call", f"tool-{i}"),
+                "tool_name": f"tool-{i}",
+            }
+        r = _run(["hook", "--out", str(out)], json.dumps(payload))
+        assert r.returncode == 0
+    env = {**os.environ, "SNAGLINE_COMPACTION_TRIPWIRE_ENABLED": "1"}
+    r = subprocess.run(
+        [sys.executable, "-m", "snagline.cli", "replay", str(out)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    assert r.returncode == 0
+    assert '"trigger": "governance_decay"' in r.stderr, r.stderr
+
+
+def test_hook_out_file_feeds_side_effect_guard(tmp_path) -> None:
+    """End-to-end proof (issue #226): the guard sees repeated marked actions."""
+    out = tmp_path / "events.jsonl"
+    for step in ("s1", "s2"):  # same signature, side_effect=True, twice
+        r = _run(["hook", "--out", str(out)], json.dumps(_canonical_side_effect(step)))
+        assert r.returncode == 0
+    env = {**os.environ, "SNAGLINE_SIDE_EFFECT_GUARD_ENABLED": "1"}
+    r = subprocess.run(
+        [sys.executable, "-m", "snagline.cli", "replay", str(out)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    assert r.returncode == 0
+    assert '"trigger": "side_effect_duplicate"' in r.stderr, r.stderr
+
+
+def test_hook_cli_forwards_side_effect_and_metadata_to_sidecar() -> None:
+    """--url forwarding keeps both fields (issue #226): the exact JSON the
+    bridge POSTs carries ``side_effect`` and ``metadata`` verbatim."""
+    server = _HookTargetServer(respond_ok=True)
+    server.start()
+    url = f"http://127.0.0.1:{server.port}/events"
+    try:
+        for payload in (_canonical_compaction("c1"), _canonical_side_effect("s1")):
+            r = _run(["hook", "--url", url], json.dumps(payload))
+            assert r.returncode == 0
+        deadline = time.monotonic() + 30.0
+        while len(server.bodies) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        server.close()
+    assert len(server.bodies) >= 2, server.bodies
+    sent = [json.loads(body.split(b"\r\n\r\n", 1)[1]) for body in server.bodies[:2]]
+    by_step = {obj["step_id"]: obj for obj in sent}
+    assert by_step["c1"]["metadata"] == {"pinned": [_PIN_A]}
+    assert by_step["s1"]["side_effect"] is True
+
+
+def test_watch_file_follow_sees_appended_lines(tmp_path, children) -> None:
+    path = tmp_path / "live.jsonl"
+    path.write_text(json.dumps(_base_event(0)) + "\n")
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "snagline.cli",
+            "watch",
+            "--file",
+            str(path),
+            "--follow",
+            "--episode-id",
+            "ep-follow",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    children.append(proc)
+    try:
+        time.sleep(1.0)  # let it consume the first line
+        with open(path, "a") as fh:
+            for i in range(1, 4):
+                fh.write(json.dumps(_base_event(i)) + "\n")
+                fh.flush()
+                time.sleep(0.3)
+        time.sleep(0.8)
+    finally:
+        _graceful_stop(proc, timeout=_STOP_TIMEOUT_S)
+        out, err = proc.communicate(timeout=15)
+    assert proc.poll() is not None
+    if os.name == "nt":
+        # Windows teardown is terminate()-based: SIGINT does not exist for
+        # arbitrary children (issue #69), so the CLI never reaches its
+        # KeyboardInterrupt-path summary there. Reaping is the contract and
+        # the regression tests below assert it on every platform.
+        return
+    # Reaping is the contract (issue #69); exit code 0 vs SIGTERM under
+    # heavy load is not (issue #174). The graceful ladder escalates through
+    # terminate() when the child misses the 10s window, so -SIGTERM is also
+    # a clean reap under contention.
+    assert proc.returncode in (0, -signal.SIGTERM)
+    if proc.returncode == 0:
+        assert "ingested 4 step(s)" in err
+        assert '"trigger": "loop"' in err
+
+
+def _base_event(i: int) -> dict:
+    from snagline.events import make_signature
+
+    return {
+        "step_id": str(i),
+        "episode_id": "ep-follow",
+        "timestamp": 1718300000.0 + i,
+        "action_type": "tool_call",
+        "action_signature": make_signature("tool_call", "Bash", "npm test"),
+        "tool_name": "Bash",
+    }
+
+
+_MALFORMED_MARKER = "malformed line"
+
+
+class _StderrCatcher:
+    """Drain a child's stderr on a thread without racing communicate().
+
+    Exposes the joined text plus a one-shot event that fires once a line
+    containing ``marker`` appears: a deterministic readiness signal with no
+    sleeps, so tests stop the child only after it provably finished the
+    work under test.
+    """
+
+    def __init__(self, proc: subprocess.Popen, marker: str) -> None:
+        self.lines: list[str] = []
+        self.marker_seen = threading.Event()
+        self._marker = marker
+        assert proc.stderr is not None
+        self._stream = proc.stderr
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        for line in self._stream:
+            self.lines.append(line)
+            if self._marker in line:
+                self.marker_seen.set()
+
+    @property
+    def text(self) -> str:
+        return "".join(self.lines)
+
+    def join(self, timeout: float) -> None:
+        self._thread.join(timeout=timeout)
+
+
+def _spawn_follow_watcher(
+    path, webhook_url: str, children: list[subprocess.Popen]
+) -> subprocess.Popen:
+    """Spawn ``snagline watch --follow`` against a webhook sink endpoint."""
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "snagline.cli",
+            "watch",
+            "--file",
+            str(path),
+            "--follow",
+            "--episode-id",
+            "ep-follow",
+            "--sink",
+            "webhook",
+            "--webhook-url",
+            webhook_url,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    children.append(proc)
+    return proc
+
+
+def test_watch_follow_teardown_reaps_the_child_on_a_healthy_run(
+    tmp_path, children
+) -> None:
+    """Issue #69 regression, healthy path, runs on every platform.
+
+    The follow-mode watcher dispatches its loop risk to a live localhost
+    sink endpoint. Delivery is proven deadline-based: the test polls
+    ``server.bodies`` for the expected loop-trigger payload and proceeds
+    only once the POST has landed (issue #156 -- the former readiness
+    signal, the first accepted connection, raced the actual body landing,
+    which lost intermittently on windows-latest). A malformed sentinel line
+    then proves the child finished counting all four events before
+    ``_graceful_stop`` ever runs. The child must end fully reaped: poll()
+    non-None, no ProcessLookupError, and the module-level children fixture
+    leaves zero lingering processes.
+    """
+    path = tmp_path / "healthy.jsonl"
+    path.write_text("\n".join(json.dumps(_base_event(i)) for i in range(4)) + "\n")
+    server = _HookTargetServer(respond_ok=True)
+    server.start()
+    try:
+        proc = _spawn_follow_watcher(
+            path, f"http://127.0.0.1:{server.port}/sink", children
+        )
+        catcher = _StderrCatcher(proc, _MALFORMED_MARKER)
+        # Contract under test: the loop risk is delivered END-TO-END through
+        # watch --follow to an HTTP sink. Poll for the delivered payload with
+        # a generous deadline instead of trusting connection-level readiness;
+        # teardown must not begin until delivery is observed (issue #156).
+        deadline = time.monotonic() + 30.0
+        while not any(b'"trigger": "loop"' in body for body in server.bodies):
+            if time.monotonic() >= deadline:
+                pytest.fail(
+                    "watcher never delivered the loop risk to the sink "
+                    f"endpoint within 30s; bodies={server.bodies!r}"
+                )
+            time.sleep(0.05)
+        # Sentinel: once the CLI logs this line it has already counted every
+        # seeded event and is back in the follow poll loop, so stopping it
+        # now cannot truncate the run into an exit-code race.
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("{not json at all\n")
+        assert catcher.marker_seen.wait(30), "watcher never reached the sentinel line"
+        _graceful_stop(proc, timeout=_STOP_TIMEOUT_S)
+        catcher.join(10)
+    finally:
+        server.close()
+    assert proc.poll() is not None
+    assert any(b'"trigger": "loop"' in body for body in server.bodies), server.bodies
+    if os.name != "nt":
+        # Reaping is the contract; exit code 0 vs SIGTERM under heavy load
+        # is not (issue #174). See _graceful_stop ladder.
+        assert proc.returncode in (0, -signal.SIGTERM)
+        if proc.returncode == 0:
+            assert "ingested 4 step(s)" in catcher.text
+
+
+def test_hook_target_server_records_a_body_that_arrives_in_a_second_segment() -> None:
+    """Issue #215 regression: the stub sink must read a whole request.
+
+    Drives the segmentation deliberately instead of waiting for the kernel to
+    do it: the header block goes out on its own, the stub is made to consume it
+    before the body is sent, and it must stay silent until the body lands. That
+    ordering is what makes the silence meaningful -- a single ``recv()`` that
+    happened to run after both sends would see one coalesced segment and look
+    perfectly healthy, so the test waits for ``headers_read`` rather than
+    trusting the scheduler to interleave the way it wants.
+    """
+    server = _HookTargetServer(respond_ok=True)
+    server.start()
+    body = json.dumps({"trigger": "loop", "episode_id": "ep-follow"}).encode()
+    head = (
+        b"POST /sink HTTP/1.1\r\n"
+        b"Host: 127.0.0.1\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"Connection: close\r\n\r\n"
+    )
+    client = socket.create_connection(("127.0.0.1", server.port), timeout=30)
+    try:
+        client.sendall(head)
+        # The stub has now taken the header segment on its own: whatever it does
+        # next, it did it knowing only the headers.
+        assert server.headers_read.wait(30), "stub never read the request headers"
+        # An incomplete request must not be answered: nothing may come back
+        # while the declared body is still outstanding.
+        client.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            client.recv(1024)
+        client.settimeout(30)
+        client.sendall(body)
+        assert b"200 OK" in client.recv(1024)
+    finally:
+        with suppress(OSError):
+            client.close()
+        server.close()
+    assert server.bodies, "stub recorded no request at all"
+    assert body in server.bodies[0], server.bodies
+
+
+def test_watch_follow_cleanup_reaps_the_child_when_the_sink_endpoint_is_dead(
+    tmp_path, children
+) -> None:
+    """Issue #69 regression, failure path, runs on every platform.
+
+    The endpoint accepts connections and drops them without responding, so
+    the watcher's webhook POST fails mid-run. Even then the cleanup ladder
+    must reap the child cleanly after it finishes the whole seeded file.
+    """
+    path = tmp_path / "dead-endpoint.jsonl"
+    path.write_text("\n".join(json.dumps(_base_event(i)) for i in range(4)) + "\n")
+    server = _HookTargetServer(respond_ok=False)
+    server.start()
+    try:
+        proc = _spawn_follow_watcher(
+            path, f"http://127.0.0.1:{server.port}/sink", children
+        )
+        catcher = _StderrCatcher(proc, _MALFORMED_MARKER)
+        assert server.wait_for_connection(30), (
+            "watcher never attempted a webhook POST against the dead endpoint"
+        )
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("{not json at all\n")
+        assert catcher.marker_seen.wait(30), "watcher never reached the sentinel line"
+        _graceful_stop(proc, timeout=_STOP_TIMEOUT_S)
+        catcher.join(10)
+    finally:
+        server.close()
+    assert proc.poll() is not None
+    assert server.accepts >= 1  # the failing POST genuinely happened
+    if os.name != "nt":
+        # Reaping is the contract; exit code 0 vs SIGTERM under heavy load
+        # is not (issue #174). See _graceful_stop ladder.
+        assert proc.returncode in (0, -signal.SIGTERM)
+        if proc.returncode == 0:
+            # Fail-open: the sink failure never crashes the watch loop...
+            assert "ingested 4 step(s)" in catcher.text
+            # ...it is logged and swallowed instead (guaranteed to be in the
+            # captured stream by now: logging precedes the sentinel line).
+            assert "webhook sink POST" in catcher.text
+
+
+def test_graceful_stop_tolerates_an_already_exited_child() -> None:
+    """No ProcessLookupError escapes when the child died before the stop."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    assert proc.wait(timeout=30) == 0
+    _graceful_stop(proc, timeout=_STOP_TIMEOUT_S)
+    assert proc.poll() is not None
+    assert proc.returncode == 0
+
+
+_IGNORES_SIGNALS_CHILD = (
+    "import signal, time\n"
+    "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "print('ready', flush=True)\n"
+    "time.sleep(120)\n"
+)
+
+
+def test_graceful_stop_escalates_to_kill_when_the_child_ignores_signals(
+    children,
+) -> None:
+    """A child ignoring SIGINT and SIGTERM is still torn down by kill()."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _IGNORES_SIGNALS_CHILD],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    children.append(proc)
+    ready = threading.Event()
+
+    def _wait_ready() -> None:
+        assert proc.stdout is not None
+        if proc.stdout.readline():
+            ready.set()
+
+    pump = threading.Thread(target=_wait_ready, daemon=True)
+    pump.start()
+    assert ready.wait(30), "stubborn child never signalled readiness"
+    _graceful_stop(proc, timeout=5.0)
+    assert proc.poll() is not None
+    pump.join(timeout=5)
+    with suppress(Exception):
+        if proc.stdout is not None:
+            proc.stdout.close()
+    if os.name != "nt":
+        # POSIX proof of escalation: only SIGKILL gets through the ignores.
+        assert proc.returncode == -signal.SIGKILL

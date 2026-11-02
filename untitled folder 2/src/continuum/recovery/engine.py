@@ -1,0 +1,1019 @@
+"""Deciding how, and whether, a run may resume.
+
+The engine reduces three independent signals to one decision:
+
+* validation statuses (Phase 5): is the state still true?
+* the action ledger (Phase 6): did an external effect land?
+* checkpoint integrity (Phases 3–4): is the record itself sound?
+
+The decision rule
+-----------------
+
+**The most cautious applicable signal wins.** Not the first one evaluated, not
+the most common: the most cautious. Each signal proposes a mode; the engine
+takes the maximum on a severity ordering:
+
+    RESUME < REPAIR_AND_RESUME < WAIT < REQUEST_HUMAN < ROLLBACK < ABORT
+
+Order-independence matters because these signals genuinely co-occur. A run can
+have a stale dataset *and* an uncertain side effect at once. If the engine
+returned whichever it noticed first, the same situation would recover
+differently depending on iteration order, and the unsafe answer would win
+roughly half the time. Taking the maximum makes the outcome deterministic and
+always errs toward caution.
+
+What the engine does not do
+---------------------------
+
+It does not execute repairs, mutate the run, or contact anything external. It
+reads state and returns a decision plus a contract. Keeping it free of side
+effects means a recovery decision can be computed, logged and reviewed without
+committing to it, which is what makes ``continuum validate`` safe to run
+against a live database.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from continuum.recovery.ledger import RecoveryLedger
+
+from continuum.actions.ledger import ActionLedger
+from continuum.analysis.depends import DependencyGraph as SourceDependencyGraph
+from continuum.checkpoint.manager import CheckpointManager, RestoredRun
+from continuum.environment.diff import EnvironmentDiff
+from continuum.events import EventType
+from continuum.gate import collect_consumed_authorities
+from continuum.models import (
+    Action,
+    ActionStatus,
+    EnvironmentSnapshot,
+    Origin,
+    RecoveryContract,
+    RecoveryMode,
+    RecoverySafety,
+    SemanticState,
+    StateStatus,
+)
+from continuum.plugins import Registry, ValidationRule
+from continuum.recovery.contract import build_contract
+from continuum.recovery.ledger import BudgetStatus, RecoveryLedger, resolve_scope
+from continuum.recovery.observations import collect_observations
+from continuum.recovery.planner import RepairPlan, plan_repairs
+from continuum.recovery.rules import active_rules, apply_rule_findings, run_validation_rules
+from continuum.recovery.summary import build_informed_retry
+from continuum.state.validator import StateValidator, ValidationOutcome, check_admissibility
+from continuum.storage.base import Storage
+
+__all__ = ["RecoveryEngine", "RecoveryDecision", "SEVERITY"]
+
+
+#: Ascending caution. The engine always returns the maximum proposed mode.
+SEVERITY: dict[RecoveryMode, int] = {
+    RecoveryMode.RESUME: 0,
+    RecoveryMode.REPAIR_AND_RESUME: 1,
+    RecoveryMode.REPLAN: 2,
+    RecoveryMode.WAIT: 3,
+    RecoveryMode.REQUEST_HUMAN: 4,
+    RecoveryMode.ROLLBACK: 5,
+    RecoveryMode.ABORT: 6,
+}
+
+_SAFETY_FOR_MODE: dict[RecoveryMode, RecoverySafety] = {
+    RecoveryMode.RESUME: RecoverySafety.SAFE_TO_RESUME,
+    RecoveryMode.REPAIR_AND_RESUME: RecoverySafety.REQUIRES_REPAIR,
+    RecoveryMode.REPLAN: RecoverySafety.REQUIRES_REVALIDATION,
+    RecoveryMode.WAIT: RecoverySafety.REQUIRES_REVALIDATION,
+    RecoveryMode.REQUEST_HUMAN: RecoverySafety.REQUIRES_HUMAN,
+    RecoveryMode.ROLLBACK: RecoverySafety.BLOCKED,
+    RecoveryMode.ABORT: RecoverySafety.UNSAFE,
+}
+
+
+def _collect_repeating_step(steps: list[str], risk_event: Any) -> None:
+    """Append a risk event's ``step_id`` to ``steps`` when it names one.
+
+    A risk observation may locate the problem at a plan step. Only string,
+    non-blank ids count: the feed is fail-open, so a probe that sent a missing
+    or malformed id contributes no location rather than a bogus one. In-place
+    and deduplicated, preserving first-seen order.
+    """
+    step = risk_event.payload.get("step_id")
+    if isinstance(step, str) and step.strip():
+        cleaned = step.strip()
+        if cleaned not in steps:
+            steps.append(cleaned)
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryDecision:
+    """The engine's verdict, with everything needed to justify it.
+
+    Advisory by default: this object describes the state of the run, it does
+    not control the process that asked about it (#1031). Nothing in the library
+    stops a caller from resuming after a verdict other than ``RESUME``. See
+    :meth:`permits` for the enforcement seams that do exist, none of which is
+    enabled without explicit configuration.
+    """
+
+    run_id: str
+    mode: RecoveryMode
+    contract: RecoveryContract
+    plan: RepairPlan
+    validation: ValidationOutcome
+    restored: RestoredRun
+    uncertain_actions: tuple[Action, ...] = ()
+    rationale: tuple[str, ...] = ()
+    impacted_files: frozenset[str] = frozenset()
+    tail_evidence: str | None = None
+    #: Informed-retry block (#265): a pure projection of prior recovery-path
+    #: events plus current failure signals, or None when there is no history.
+    #: Informational only; presence never changes mode or safety.
+    informed_retry: dict[str, Any] | None = None
+
+    @property
+    def state(self) -> SemanticState:
+        """State with validation statuses already applied."""
+        return self.validation.state
+
+    @property
+    def safe(self) -> bool:
+        """True only when the mode permits resuming without repair."""
+        return self.mode is RecoveryMode.RESUME
+
+    @property
+    def environment_diff(self) -> EnvironmentDiff:
+        """The environment drift the validation found."""
+        return self.validation.environment_diff
+
+    @property
+    def next_allowed_action(self) -> str | None:
+        """The single action the contract currently permits, if any."""
+        return self.contract.next_allowed_action
+
+    def permits(self, action: str) -> bool:
+        """Whether ``action`` is the one step the contract currently allows.
+
+        Advisory, not enforcing. This reports what the contract allows; it does
+        not stop a caller from proceeding. CONTINUUM computes the verdict, it
+        does not supervise the process that asked for it (#1031).
+
+        A caller can ignore a ``False`` return and act anyway, and nothing in
+        the library will intervene. If you need the verdict *enforced*, that is
+        a separate seam and none of them is on by default:
+
+        * the host gate (``continuum gate``, :mod:`continuum.gate`)
+        * the HTTP gateway (``continuum gateway``, :mod:`continuum.gateway`)
+        * the replay guard (:mod:`continuum.replayguard`)
+        * observation hooks (``continuum hooks install``,
+          :mod:`continuum.clienthooks`)
+
+        Each must be configured explicitly; a plain ``pip install
+        continuum-agent`` gets none of them. The one enforcement that does ship
+        enabled is the CLI exit code: ``continuum resume`` exits non-zero unless
+        the run is verified safe, so ``continuum resume "$RUN" && ./start.sh``
+        cannot launch onto stale state (see :mod:`continuum.cli.exitcodes`).
+        """
+        if self.mode is RecoveryMode.RESUME:
+            return True
+        # A contract that names no permitted action permits nothing. The
+        # comparison alone would answer ``permits(None) is True`` on a
+        # BLOCKED, UNSAFE or human-gated verdict, where next_allowed_action is
+        # deliberately empty, and a caller reading the action back out of the
+        # contract would get a green light for no action at all (issue #1388).
+        if self.contract.next_allowed_action is None:
+            return False
+        return action == self.contract.next_allowed_action
+
+    def render(self) -> str:
+        """Human-readable multi-line rendering of the decision and contract."""
+        lines = [
+            "CONTINUUM RECOVERY",
+            "",
+            f"Run: {self.run_id}",
+            f"Checkpoint: v{self.contract.checkpoint_version}",
+            "",
+            "State validation:",
+        ]
+        for entry in self.validation.report.statuses:
+            mark = "[ok]" if entry.status is StateStatus.VALID else "[!!]"
+            label = entry.component.value.replace("_", " ")
+            identifier = f" {entry.component_id}" if entry.component_id else ""
+            detail = f" - {entry.detail}" if entry.detail else ""
+            rule = f" [rule:{entry.rule}]" if entry.rule else ""
+            lines.append(f"  {mark} {label}{identifier}{detail}{rule}")
+
+        if self.uncertain_actions:
+            lines.append("")
+            lines.append("Action ledger:")
+            for action in self.uncertain_actions:
+                lines.append(
+                    f"  [!!] {action.action_type}: outcome unknown (id {action.action_id[:14]})"
+                )
+        elif self.restored.from_checkpoint:
+            lines.append("")
+            lines.append("Action ledger:  [ok] no uncertain side effects")
+
+        lines += ["", f"Recovery decision: {self.mode.value.upper()}"]
+        for reason in self.rationale:
+            lines.append(f"  because {reason}")
+        # The risk observations that produced this verdict, alongside the prose
+        # rationale, so a reader can cite the event that triggered it (issue
+        # #1424). Absent when the decision came from drift or the ledger alone.
+        if self.contract.triggering_risks:
+            lines.append("Triggering risks:")
+            lines += [f"  {risk_id}" for risk_id in self.contract.triggering_risks]
+
+        if self.plan:
+            lines += ["", "Repairs required:", self.plan.render()]
+
+        permitted = self.next_allowed_action or (
+            "continue"
+            if self.mode is RecoveryMode.RESUME
+            else "none (settle the repairs above first)"
+        )
+        lines += ["", f"Next permitted action: {permitted}"]
+        return "\n".join(lines)
+
+
+class RecoveryEngine:
+    """Computes how a run may resume. Read-only."""
+
+    def __init__(
+        self,
+        storage: Storage,
+        *,
+        validator: StateValidator | None = None,
+        strict_unknown: bool = True,
+        validation_rules: Iterable[ValidationRule] | None = None,
+        registry: Registry | None = None,
+        ledger: RecoveryLedger | None = None,
+        dependency_budgets: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Build an engine.
+
+        ``validation_rules`` are domain staleness rules (issue #761) run after
+        built-in validation, merged most-cautious-wins. A rule may raise a
+        component's status, never lower it. None by default: an engine with no
+        rules behaves exactly as before, and nothing is auto-discovered.
+
+        ``registry`` is the registry-backed spelling of the same thing: every
+        service in it satisfying the :class:`~continuum.plugins.ValidationRule`
+        protocol is treated as a rule. Rules from both sources add together.
+        Registration stays explicit either way; CONTINUUM never loads a rule
+        from a path or an entry point.
+        """
+        self.storage = storage
+        self.validator = validator or StateValidator(strict_unknown=strict_unknown)
+        self.strict_unknown = strict_unknown
+        self.ledger = ledger
+        self.dependency_budgets = dependency_budgets
+        self._manager = CheckpointManager(storage)
+        self._validation_rules: tuple[object, ...] = tuple(validation_rules or ())
+        if registry is not None:
+            registered = tuple(
+                service
+                for service in registry.all_matching(ValidationRule)
+                if isinstance(service, ValidationRule)
+            )
+            self._validation_rules = (*self._validation_rules, *registered)
+        # Optional (issue #744): a recovery ledger to read the attempt budget
+        # from. Absent it, contracts carry no budget line and every decision is
+        # byte-identical to before. Present, it is only ever read here: spending
+        # the allowance is the caller's job (a resume attempt), not the
+        # assessment's, so assess stays free of side effects.
+        self._ledger = ledger
+
+    def assess(
+        self,
+        run_id: str,
+        *,
+        current_environment: EnvironmentSnapshot | None = None,
+        expected_model: str | None = None,
+        replay: bool = True,
+        scope: Iterable[str] | None = None,
+        source_graph: SourceDependencyGraph | None = None,
+        validation_rules: Iterable[ValidationRule] | None = None,
+        ledger: RecoveryLedger | None = None,
+        dependency_budgets: Mapping[str, Any] | None = None,
+    ) -> RecoveryDecision:
+        """Decide how ``run_id`` may resume, without changing anything.
+
+        When ``scope`` names specific dependency resources, validation and the
+        resulting repair plan are confined to those resources' derivation
+        subtree; the rest of the state is left exactly as it was. The issued
+        contract records the scope so the localization is auditable.
+
+        Scoping also applies to the action ledger. An uncertain side effect
+        explicitly tagged via ``dep_scope`` to a dependency outside the scope
+        cannot have invalidated the part being resumed, so it does not block
+        this decision. Untagged actions stay blocking: they could have touched
+        anything, which is the conservative reading.
+
+        Passing ``source_graph`` (the source-level graph from
+        :mod:`continuum.analysis`) records on the returned decision every file
+        whose imports belong to a scoped dependency.
+
+        ``validation_rules`` are domain staleness rules (issue #761) run over
+        the projected state in addition to any the engine was constructed with.
+        Rules are read-only: they receive the state and the current environment
+        and nothing else, so they can neither mutate storage, emit events, nor
+        change this repair plan. Their findings are namespaced by rule name and
+        sealed into the contract. A rule can only add caution; a crashing,
+        duplicate-named or malformed rule reports a ``validation_rule`` entry
+        asking for review instead of being ignored. Rules are not filtered by
+        ``scope``: a domain rule that knows a decision is unauthorized is not
+        made wrong by the caller asking about one dependency.
+        """
+        # Degrade, not raise (issue #383): the engine's whole job is to answer
+        # "where does this run stand", and a poisoned log is precisely the run
+        # that needs an answer. An unprojectable tail yields the last-good
+        # prefix marked INVALID; _decide turns that into request_human rather
+        # than letting it pass for a complete state.
+        restored = self._manager.restore(run_id, replay=replay, on_unprojectable="degrade")
+        checkpoint_environment = restored.checkpoint.environment if restored.checkpoint else None
+        checkpoint_version = restored.checkpoint.version if restored.checkpoint else 0
+
+        # A human confirmation (REVIEW_CONFIRMED event) clears the self_certified
+        # REQUIRES_REVIEW on goal/progress, unblocking an otherwise permanent
+        # request_human for externally-driven runs. See issue #35.
+        # Scoped confirm (issue #394) narrows this to named components only;
+        # the payload may carry "components" or "scope" as a list, a single
+        # string, or be absent (legacy full confirm of both).
+        # The scan includes the archived prefix so compaction cannot silently
+        # discard a human's confirmation (same archive-blindness family as
+        # issue #553): without it, a confirmed run re-escalates to
+        # request_human after every compaction.
+        confirmed_components: set[str] = set()
+        # Both archive-aware scans below (confirmations and provenance) share
+        # this one fetch: read_all_events walks the archived prefix too, and
+        # re-walking it twice per assess() doubles the archive scan for no
+        # gain.
+        try:
+            archive_aware_events = self.storage.read_all_events(run_id)
+        except Exception:
+            archive_aware_events = self.storage.read_events(run_id)
+        for _ev in archive_aware_events:
+            if _ev.type is not EventType.REVIEW_CONFIRMED:
+                continue
+            # Only human confirmations clear self-certification; an agent
+            # must not be able to confirm its own work (issue #201).
+            if _ev.source != Origin.HUMAN:
+                continue
+            raw_scope = _ev.payload.get("components")
+            if raw_scope is None:
+                raw_scope = _ev.payload.get("scope")
+            if not raw_scope:
+                confirmed_components.update(["goal", "progress"])
+            elif isinstance(raw_scope, str):
+                confirmed_components.add(raw_scope.strip().lower())
+            elif isinstance(raw_scope, (list, tuple, set)):
+                for _c in raw_scope:
+                    if isinstance(_c, str) and _c.strip():
+                        confirmed_components.add(_c.strip().lower())
+                    elif _c is not None:
+                        confirmed_components.add(str(_c).strip().lower())
+            else:
+                confirmed_components.update(["goal", "progress"])
+
+        # Provenance N-hop staleness (issue #553): the shared archive-aware
+        # fetch above feeds the validator so compaction does not launder it.
+        validation = self.validator.validate(
+            restored.state,
+            current_environment=current_environment,
+            checkpoint_environment=checkpoint_environment,
+            checkpoint_version=checkpoint_version,
+            expected_model=expected_model,
+            confirmed=confirmed_components,
+            scope=scope,
+            events=archive_aware_events,
+        )
+
+        action_ledger = ActionLedger(self.storage, run_id)
+        all_uncertain = tuple(
+            a
+            for a in action_ledger.all()
+            if a.status
+            in (ActionStatus.UNKNOWN, ActionStatus.STARTED, ActionStatus.REQUIRES_REVIEW)
+        )
+        # An action tagged to a dependency outside the repair scope cannot have
+        # invalidated the part being resumed, so it does not block here. An
+        # untagged action could have touched anything and stays blocking.
+        if scope is None:
+            uncertain = all_uncertain
+        else:
+            allowed = frozenset(scope)
+            uncertain = tuple(
+                a for a in all_uncertain if a.dep_scope is None or a.dep_scope in allowed
+            )
+
+        impacted_files: frozenset[str] = frozenset()
+        if source_graph is not None and scope is not None:
+            impacted_files = frozenset(
+                str(path)
+                for resource in frozenset(scope)
+                for path in source_graph.files_using(resource)
+            )
+
+        # The degraded fold must reach the plan (issue #383): without a step,
+        # required_actions is empty and the contract's next_allowed falls
+        # through to "continue" over a requires_human verdict.
+        broken = restored.state
+        unprojectable = (
+            (
+                broken.unprojectable_at_sequence,
+                broken.unprojectable_event_type or "unknown event",
+                broken.unprojectable_reason or "unknown projection failure",
+            )
+            if broken.status is StateStatus.INVALID and broken.unprojectable_at_sequence is not None
+            else None
+        )
+        admissibility = check_admissibility(restored.checkpoint, action_ledger.all())
+        if not admissibility.admissible:
+            has_action_ref = any(d["consumed_inputs"]["action_ids"] for d in admissibility.details)
+            status = StateStatus.REQUIRES_REVIEW if has_action_ref else StateStatus.STALE
+            from continuum.models import Component, ComponentValidationEntry
+
+            entries = list(validation.report.statuses)
+            entries.append(
+                ComponentValidationEntry(
+                    component=Component.ACTION,
+                    component_id=None,
+                    status=status,
+                    detail=admissibility.reason,
+                )
+            )
+            from continuum.models import StateValidationResult
+
+            new_report = StateValidationResult(
+                run_id=validation.report.run_id,
+                checkpoint_version=validation.report.checkpoint_version,
+                statuses=entries,
+                safe_to_resume=False,
+                reason=admissibility.reason,
+                validated_at=validation.report.validated_at,
+            )
+            from continuum.state.validator import ValidationOutcome
+
+            validation = ValidationOutcome(
+                state=validation.state,
+                report=new_report,
+                environment_diff=validation.environment_diff,
+            )
+
+        # Domain validation rules (issue #761). Built-in validation asks whether
+        # the state still matches the environment; a domain rule knows
+        # staleness that question cannot reach. Rules run last, over the state
+        # built-in validation already revised, and their findings merge by
+        # maximum caution so a rule can escalate but never launder. With no
+        # rules configured this block returns the input untouched, which is
+        # what keeps the default path byte-identical.
+        rules = active_rules(self._validation_rules, validation_rules)
+        if rules:
+            rule_findings = run_validation_rules(rules, validation.state, current_environment)
+            validation = apply_rule_findings(
+                validation, rule_findings, strict_unknown=self.validator.strict_unknown
+            )
+
+        active_ledger = ledger if ledger is not None else self.ledger
+        active_budgets = (
+            dependency_budgets if dependency_budgets is not None else self.dependency_budgets
+        )
+        if active_budgets is None and active_ledger is not None:
+            try:
+                from pathlib import Path
+
+                from continuum.budgets import DEFAULT_BUDGETS_PATH, load_budgets
+
+                active_budgets = load_budgets(Path(DEFAULT_BUDGETS_PATH))
+            except Exception:
+                active_budgets = None
+
+        exhausted_dependencies: set[str] = set()
+        run_budget_exhausted = False
+        if active_ledger is not None:
+            try:
+                run_budget_exhausted = active_ledger.requires_human(
+                    run_id, scope=scope, dependency_budgets=active_budgets
+                )
+                candidate_deps: set[str] = set()
+                if scope is not None:
+                    candidate_deps.update(scope)
+                else:
+                    from continuum.models import Component
+
+                    for entry in validation.report.statuses:
+                        if entry.component == Component.EXTERNAL_DEPENDENCY and entry.component_id:
+                            candidate_deps.add(entry.component_id)
+                    for a in uncertain:
+                        if a.dep_scope:
+                            candidate_deps.add(a.dep_scope)
+
+                for dep in candidate_deps:
+                    if active_ledger.requires_human(
+                        run_id, dependency=dep, dependency_budgets=active_budgets
+                    ):
+                        exhausted_dependencies.add(dep)
+            except Exception:
+                # A degraded ledger must not brick recovery: the contract is
+                # then emitted without the budget line rather than changing
+                # the verdict.
+                run_budget_exhausted = False
+                exhausted_dependencies.clear()
+
+        plan = plan_repairs(
+            validation.report.statuses,
+            uncertain_actions=uncertain,
+            strict_unknown=self.validator.strict_unknown,
+            unprojectable=unprojectable,
+            exhausted_dependencies=exhausted_dependencies,
+            run_budget_exhausted=run_budget_exhausted,
+        )
+        liveness_advisory = None
+        liveness_breaches = 0
+        try:
+            from continuum.recovery.health import advisory_for_storage
+
+            liveness_advisory = advisory_for_storage(self.storage, run_id)
+            # Count prior breaches as DETECTED events. The archived prefix
+            # folds in via the shared fetch, so a silence detected before a
+            # compaction still counts: the live tail alone would reset the
+            # breach count to zero (same archive-blindness family as #553).
+            try:
+                liveness_breaches = sum(
+                    1 for e in archive_aware_events if e.type == EventType.LIVENESS_SILENCE_DETECTED
+                )
+            except Exception:
+                liveness_breaches = 0
+        except Exception:
+            liveness_advisory = None
+        # Risk evaluation (issue #303): map triggers to modes, collect ids.
+        # Runs before the decision so the worst trigger proposes alongside the
+        # other signals; the most cautious proposal wins regardless of order.
+        triggering_risks: list[str] = []
+        risk_mode = None
+        risk_rationale = None
+        try:
+            from continuum.recovery.risk import evaluate_risk, load_risk_policy
+
+            policy = load_risk_policy()
+            # Archive-aware: the shared fetch walks the archived prefix too, so
+            # compaction cannot empty triggering_risks by sealing the only
+            # RISK_OBSERVED events away from this scan.
+            try:
+                risk_events = [e for e in archive_aware_events if e.type == EventType.RISK_OBSERVED]
+            except Exception:
+                risk_events = []
+            best_mode = None
+            triggering: list[str] = []
+            triggers: list[str] = []
+            # Steps the risk feed flagged as repeating, collected only from the
+            # events that contribute to the winning mode. A replan verdict that
+            # names the trigger but not the steps leaves the replanning agent
+            # no way to avoid the loop it was warned about (#1426).
+            repeating_steps: list[str] = []
+            for risk_ev in risk_events:
+                trig = risk_ev.payload.get("trigger")
+                if not isinstance(trig, str):
+                    continue
+                mode_str = evaluate_risk(trig, policy)
+                if mode_str is None:
+                    continue
+                try:
+                    candidate = RecoveryMode(mode_str)
+                except Exception:
+                    continue
+                if best_mode is None or SEVERITY[candidate] > SEVERITY[best_mode]:
+                    best_mode = candidate
+                    triggering = [risk_ev.event_id]
+                    triggers = [trig]
+                    repeating_steps = []
+                elif SEVERITY[candidate] == SEVERITY[best_mode]:
+                    triggering.append(risk_ev.event_id)
+                    if trig not in triggers:
+                        triggers.append(trig)
+                else:
+                    continue
+                _collect_repeating_step(repeating_steps, risk_ev)
+            if best_mode is not None:
+                risk_mode = best_mode
+                triggering_risks = triggering
+                # Name every trigger that proposed the winning mode, not just
+                # the first: the ids in triggering_risks are all contributors
+                # to the verdict the sealed reason justifies (issue #1057).
+                # Deduplicated by trigger so an equal-severity repeat does not
+                # duplicate the sentence the way #1042's double-append did.
+                risk_rationale = f"risk {', '.join(sorted(triggers))} triggers {best_mode.value}"
+                # Located guidance: the steps the feed named, deduplicated in
+                # first-seen order so a loop observed many times reads as one
+                # set of steps to avoid, not one per observation.
+                if repeating_steps:
+                    risk_rationale = (
+                        f"{risk_rationale}; repeating steps to avoid: {', '.join(repeating_steps)}"
+                    )
+        except Exception:
+            triggering_risks = []
+            risk_mode = None
+            risk_rationale = None
+        mode, rationale = self._decide(
+            validation,
+            uncertain,
+            plan,
+            restored,
+            self.strict_unknown,
+            admissibility,
+            liveness_advisory=liveness_advisory,
+            risk_mode=risk_mode,
+            risk_rationale=risk_rationale,
+            exhausted_dependencies=exhausted_dependencies,
+            run_budget_exhausted=run_budget_exhausted,
+        )
+
+        # Authority lifecycle (issue #289c): consumed authorities block resume
+        # until an external probe reconciles them. The gate already refuses
+        # forwarding, but the recovery decision must also surface the block
+        # so that `continuum resume` does not report safe when the gate would
+        # still deny. A later AUTHORITY_RECONCILED with valid true clears the
+        # map inside collect_consumed_authorities.
+        try:
+            # Archive-aware: an authority consumed before a compaction still
+            # blocks resume, and the AUTHORITY_RECONCILED that clears it may
+            # live in the archived prefix too.
+            consumed_authorities = collect_consumed_authorities(archive_aware_events)
+        except Exception:
+            # An empty map is the *unblocked* answer, and this block exists to
+            # be the check that survives a degraded log: when the ledger
+            # cannot be read, degrade to the most cautious verdict instead of
+            # asserting a safety conclusion the engine could not compute
+            # (issue #1066).
+            consumed_authorities = None
+        if consumed_authorities:
+            # Escalate, never downgrade: REQUEST_HUMAN is the floor a consumed
+            # authority imposes, but a risk policy that already proposed
+            # ROLLBACK or ABORT is strictly more cautious and must survive
+            # (SEVERITY is ascending caution, so the max wins).
+            mode = max((mode, RecoveryMode.REQUEST_HUMAN), key=lambda m: SEVERITY[m])
+            rationale = (
+                *rationale,
+                f"consumed authority blocks resume: {sorted(consumed_authorities)}",
+            )
+        elif consumed_authorities is None:
+            # Same floor-not-overwrite rule as the readable branch above: an
+            # unreadable ledger raises the verdict to REQUEST_HUMAN, but a risk
+            # policy that already proposed ROLLBACK or ABORT is strictly more
+            # cautious and must survive. A bare assignment here downgraded a
+            # risk-driven ABORT/ROLLBACK to REQUEST_HUMAN, so a degraded log
+            # softened the decision instead of hardening it -- the opposite of
+            # this branch's stated purpose (issue #1356; #1146 escalated the
+            # sibling branch but left this one, added by #1066, unfixed).
+            mode = max((mode, RecoveryMode.REQUEST_HUMAN), key=lambda m: SEVERITY[m])
+            rationale = (
+                *rationale,
+                "consumed authority ledger unreadable: cannot clear the resume block",
+            )
+
+        reason = "; ".join(rationale) if rationale else validation.report.reason
+
+        # Post-checkpoint file observations (#208): informational evidence for
+        # the resuming agent, never a factor in the decision itself.
+        after_sequence = 0
+        latest_version = self.storage.latest_version(run_id)
+        if latest_version is not None:
+            after_sequence = latest_version.source_sequence
+        observations = collect_observations(self.storage, run_id, after_sequence=after_sequence)
+
+        # Build liveness section for contract
+        liveness_section = None
+        if liveness_advisory is not None:
+            liveness_section = {
+                "last_append_age": liveness_advisory.get("silence_seconds"),
+                "breaches": liveness_breaches,
+                "breached": bool(liveness_advisory.get("breached")),
+                "threshold_seconds": liveness_advisory.get("threshold_seconds"),
+                "phase": liveness_advisory.get("phase"),
+            }
+        contract = build_contract(
+            run_id=run_id,
+            checkpoint_version=checkpoint_version,
+            safety=_SAFETY_FOR_MODE[mode],
+            validation=validation,
+            plan=plan,
+            reason=reason,
+            scope=scope,
+            budget=self._budget_for(run_id, scope, plan),
+            post_checkpoint_observations=observations,
+            liveness=liveness_section,
+            triggering_risks=triggering_risks,
+            admissibility=admissibility,
+        )
+
+        tail_evidence: str | None = None
+        for ev in reversed(validation.state.evidence):
+            if ev.evidence_id.startswith("tail_"):
+                tail_evidence = ev.summary
+                break
+
+        # Informed retry (#265): derive the prior-attempt account from events
+        # already in the chain. Read-only, deterministic, None without history.
+        informed_retry = build_informed_retry(
+            self.storage,
+            run_id,
+            validation_report=validation.report,
+            uncertain_actions=uncertain,
+            plan=plan,
+        )
+
+        decision = RecoveryDecision(
+            run_id=run_id,
+            mode=mode,
+            contract=contract,
+            plan=plan,
+            validation=validation,
+            restored=restored,
+            uncertain_actions=uncertain,
+            rationale=rationale,
+            impacted_files=impacted_files,
+            tail_evidence=tail_evidence,
+            informed_retry=informed_retry,
+        )
+
+        # Process-wide counters (#1032). Imported lazily: observability imports
+        # RecoveryDecision from this module, so a top-level import would be
+        # circular. Collection is best-effort and never affects the verdict: a
+        # caller who resets or replaces the collector still gets the same
+        # decision, and a failure here must not change a safety property.
+        try:
+            from continuum.observability import collect_from_decision
+
+            collect_from_decision(decision)
+        except Exception:
+            pass
+
+        return decision
+
+    def _budget_for(
+        self, run_id: str, scope: Iterable[str] | None, plan: RepairPlan
+    ) -> BudgetStatus | None:
+        """The attempt budget this decision charges, or ``None`` when unknown.
+
+        Ownership is the assessment scope together with the dependencies the
+        plan's own steps name: they must agree on one dependency, otherwise the
+        attempt is unattributable and :func:`resolve_scope` returns the run-wide
+        bucket rather than charging a dependency the repair may not belong to.
+        The budget is advisory evidence in the contract; it never participates
+        in the decision, so a ledger that cannot be read costs a line of
+        evidence and nothing else.
+        """
+        if self._ledger is None:
+            return None
+        try:
+            return self._ledger.budget(run_id, scope=resolve_scope(scope, *plan.scopes))
+        except Exception:
+            return None
+
+    # -- the decision rule ------------------------------------------------ #
+
+    def assess_scoped(
+        self,
+        run_id: str,
+        resources: Iterable[str],
+        *,
+        current_environment: EnvironmentSnapshot | None = None,
+        expected_model: str | None = None,
+        replay: bool = True,
+        source_graph: SourceDependencyGraph | None = None,
+        ledger: RecoveryLedger | None = None,
+        dependency_budgets: Mapping[str, Any] | None = None,
+    ) -> RecoveryDecision:
+        """Assess ``run_id`` confined to the derivation subtree of ``resources``.
+
+        A thin wrapper over :meth:`assess` that passes ``scope`` through; kept as
+        a named entry point so callers express intent (localized recovery) rather
+        than remembering the keyword. ``source_graph`` forwards to
+        :meth:`assess` for impacted-file reporting.
+        """
+        return self.assess(
+            run_id,
+            current_environment=current_environment,
+            expected_model=expected_model,
+            replay=replay,
+            scope=resources,
+            source_graph=source_graph,
+            ledger=ledger,
+            dependency_budgets=dependency_budgets,
+        )
+
+    def record_attempt(
+        self,
+        run_id: str,
+        *,
+        note: str = "",
+        max_attempts: int | None = None,
+        dependency: str | None = None,
+        dependencies: Iterable[str] | None = None,
+        contract: RecoveryContract | None = None,
+        action: Any | None = None,
+        scope: Iterable[str] | None = None,
+        dependency_budgets: Mapping[str, Any] | None = None,
+    ) -> int:
+        """Record one recovery attempt in the configured RecoveryLedger."""
+        if self.ledger is None:
+            raise RuntimeError("RecoveryEngine was initialized without a RecoveryLedger")
+        budgets = dependency_budgets if dependency_budgets is not None else self.dependency_budgets
+        return self.ledger.record_attempt(
+            run_id,
+            note=note,
+            max_attempts=max_attempts,
+            dependency=dependency,
+            dependencies=dependencies,
+            contract=contract,
+            action=action,
+            scope=scope,
+            dependency_budgets=budgets,
+        )
+
+    def requires_human(
+        self,
+        run_id: str,
+        *,
+        max_attempts: int = 3,
+        dependency: str | None = None,
+        dependencies: Iterable[str] | None = None,
+        contract: RecoveryContract | None = None,
+        action: Any | None = None,
+        scope: Iterable[str] | None = None,
+        dependency_budgets: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Check whether human intervention is required under the configured RecoveryLedger."""
+        if self.ledger is None:
+            return False
+        budgets = dependency_budgets if dependency_budgets is not None else self.dependency_budgets
+        return self.ledger.requires_human(
+            run_id,
+            max_attempts=max_attempts,
+            dependency=dependency,
+            dependencies=dependencies,
+            contract=contract,
+            action=action,
+            scope=scope,
+            dependency_budgets=budgets,
+        )
+
+    def _decide(
+        self,
+        validation: ValidationOutcome,
+        uncertain: Sequence[Action],
+        plan: RepairPlan,
+        restored: RestoredRun,
+        strict_unknown: bool,
+        admissibility: Any | None = None,
+        liveness_advisory: dict[str, object] | None = None,
+        risk_mode: RecoveryMode | None = None,
+        risk_rationale: str | None = None,
+        exhausted_dependencies: Collection[str] = (),
+        run_budget_exhausted: bool = False,
+    ) -> tuple[RecoveryMode, tuple[str, ...]]:
+        """Collect a proposal per signal and return the most cautious."""
+        proposals: list[tuple[RecoveryMode, str]] = []
+
+        # A degraded fold (issue #383) outranks every signal computed below,
+        # which is why it is proposed unconditionally rather than guarded: the
+        # validation below ran on the last-good prefix, so its statuses describe
+        # only what was known before the break. REQUEST_HUMAN, not ABORT: the
+        # log is not necessarily dead (a human can confirm or rewrite the
+        # offending event), and declaring the run permanently unanswerable is
+        # exactly the terminal state #383 exists to remove.
+        state = restored.state
+        if state.unprojectable_at_sequence is not None and state.status is StateStatus.INVALID:
+            proposals.append(
+                (
+                    RecoveryMode.REQUEST_HUMAN,
+                    f"the event log stops folding at sequence "
+                    f"{state.unprojectable_at_sequence} "
+                    f"({state.unprojectable_event_type}: {state.unprojectable_reason}); "
+                    f"this verdict covers events through sequence "
+                    f"{state.source_sequence} only",
+                )
+            )
+
+        if validation.safe and not uncertain:
+            proposals.append((RecoveryMode.RESUME, "all state verified against the environment"))
+
+        # An uncertain side effect outranks everything repairable: until we know
+        # whether the world was modified, no further work is safe.
+        if uncertain:
+            reviewable = [a for a in uncertain if a.status is ActionStatus.REQUIRES_REVIEW]
+            if reviewable:
+                proposals.append(
+                    (
+                        RecoveryMode.REQUEST_HUMAN,
+                        f"{len(reviewable)} side effect(s) could not be reconciled automatically",
+                    )
+                )
+            elif strict_unknown:
+                proposals.append(
+                    (
+                        RecoveryMode.REQUEST_HUMAN,
+                        f"{len(uncertain)} external side effect(s) have unknown outcomes",
+                    )
+                )
+            else:
+                # Non-strict: pause and wait rather than immediately escalating to
+                # human intervention. The caller has opted in to tolerating uncertainty.
+                proposals.append(
+                    (
+                        RecoveryMode.WAIT,
+                        f"{len(uncertain)} external side effect(s) have unknown outcomes (lenient mode)",
+                    )
+                )
+
+        if not validation.safe:
+            # Count only what actually needs repair. Reporting every status
+            # would include the VALID ones and overstate the damage: a run
+            # with two verified components and one stale one would claim three
+            # need repair. The decision itself is unaffected; the operator
+            # reading the rationale is not.
+            needs_repair = [
+                e for e in validation.report.statuses if e.status is not StateStatus.VALID
+            ]
+            proposals.append(
+                (
+                    RecoveryMode.REPAIR_AND_RESUME,
+                    f"{len(needs_repair)} component(s) need repair before continuing",
+                )
+            )
+
+        if plan.requires_human:
+            proposals.append((RecoveryMode.REQUEST_HUMAN, "at least one repair needs a person"))
+
+        if exhausted_dependencies:
+            deps_str = ", ".join(sorted(exhausted_dependencies))
+            proposals.append(
+                (
+                    RecoveryMode.REQUEST_HUMAN,
+                    f"recovery budget exhausted for dependency: {deps_str}",
+                )
+            )
+
+        if run_budget_exhausted:
+            proposals.append(
+                (
+                    RecoveryMode.REQUEST_HUMAN,
+                    "recovery budget exhausted for run",
+                )
+            )
+
+        # Liveness breach maps to WAIT, never auto-rollback (issue #302)
+        # Silence tells us nothing about what to roll back, only that a human
+        # or lease-recovery decision is needed. WAIT is the most cautious
+        # signal that still allows a lease to be recovered without human.
+        if liveness_advisory is not None and bool(liveness_advisory.get("breached")):
+            silence = liveness_advisory.get("silence_seconds")
+            threshold = liveness_advisory.get("threshold_seconds")
+            phase = liveness_advisory.get("phase") or "otherwise"
+            proposals.append(
+                (
+                    RecoveryMode.WAIT,
+                    f"liveness breach: silence {silence:.1f}s exceeds threshold {threshold}s (phase {phase})",
+                )
+            )
+
+        # Risk trigger mapping (issue #303): deterministic policy to mode
+        if risk_mode is not None:
+            rationale_text = risk_rationale or f"risk triggers {risk_mode.value}"
+            proposals.append((risk_mode, rationale_text))
+
+        # A goal that is no longer valid cannot be repaired by re-running work.
+        if any(
+            e.component.value == "goal" and e.status is not StateStatus.VALID
+            for e in validation.report.statuses
+        ):
+            proposals.append((RecoveryMode.REPLAN, "the goal itself is no longer valid"))
+
+        if admissibility is not None and not admissibility.admissible:
+            has_action_ref = any(d["consumed_inputs"]["action_ids"] for d in admissibility.details)
+            if has_action_ref:
+                proposals.append((RecoveryMode.REQUEST_HUMAN, admissibility.reason))
+            else:
+                proposals.append((RecoveryMode.REPAIR_AND_RESUME, admissibility.reason))
+
+        # A run with neither checkpoint nor events cannot reach here: restore()
+        # raises CheckpointError first, so there is nothing to decide about.
+        # ABORT is reserved for callers who reject a contract outright.
+        #
+        # `proposals` is likewise never empty: either validation was clean and
+        # the ledger quiet (RESUME), or something is blocking and produced an
+        # entry. Both facts are asserted by tests rather than defended by dead
+        # branches here.
+        mode = max(proposals, key=lambda p: SEVERITY[p[0]])[0]
+        # dict.fromkeys dedups while preserving order: two proposals of the
+        # winning mode that carry the same sentence (the pasted-twice
+        # liveness block of #1042 did exactly that) must read as one reason,
+        # not as two observations that never happened.
+        rationale = tuple(
+            dict.fromkeys(reason for proposed, reason in proposals if proposed is mode)
+        )
+        return mode, rationale

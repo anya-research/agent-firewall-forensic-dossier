@@ -1,0 +1,10 @@
+dimension,weight_pct,measured_score_pct,weighted_contribution,notes
+Source-code exact similarity (SHA256),25.0,2.44,0.61,Only py.typed (empty 0-byte file) matches exactly (1 of 41 files = 2.44%)
+Architecture similarity,20.0,5.0,1.0,Inverted paradigm: Fail-Open Observability vs Fail-Closed Pre-Execution Gate
+Function and class correspondence,15.0,3.45,0.52,"1 shared class name (Policy), 16 shared generic function names (__init__, main, run, check)"
+Repository structure,10.0,12.5,1.25,"Standard Python src/ layout, but completely different directory organization and subpackages"
+Tests and edge-case correspondence,10.0,0.0,0.0,"No shared test cases or fixtures; AF sdist contains no tests, SNAGLINE tests cover failure modes"
+Documentation similarity,5.0,8.0,0.4,Zero domain-specific n-gram overlap; shared boilerplate limited to shields.io badges and standard headers
+Dependency and packaging similarity,5.0,18.0,0.9,"Both use setuptools>=77, but SNAGLINE core has 0 deps while AF core requires pydantic and PyYAML"
+Historical development correspondence,10.0,0.0,0.0,AF published 2026-10-10 before SNAGLINE security features were authored (2026-10-16 to 2026-10-31)
+TOTAL / OVERALL SIMILARITY INDEX,100.0,4.68,4.68,Comparative research metric: 4.68% overall forensic similarity

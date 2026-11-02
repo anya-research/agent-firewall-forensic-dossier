@@ -1,0 +1,1582 @@
+"""Sidecar server mode (project.md §7) -- for non-Python agents.
+
+A minimal stdlib ``http.server`` endpoint any runtime (TypeScript, Node, a
+shell script, a Claude Code hook) can POST ``StepEvent`` JSON to:
+
+    POST /events             body: a StepEvent as a JSON object      -> monitor.ingest()
+                               or a JSON array of StepEvent objects     (batched)
+    POST /hooks/claude-code  body: a native Claude Code hook payload -> mapped + ingested
+    POST /episodes/end       body: {"episode_id": "<id>"}            -> monitor.end_episode()
+    GET  /health                                                     -> 200 OK
+    GET  /metrics                                                    -> Prometheus text exposition (v0.0.4)
+    GET  /directive                                                  -> the latest halt-webhook directive
+
+A host that knows an episode is over can signal it with ``POST
+/episodes/end`` carrying ``{"episode_id": "..."}`` (issue #123): the sidecar
+forwards to ``Monitor.end_episode()`` and drops the id from the
+``snagline_episodes_active`` gauge immediately, so long-lived processes stop
+counting finished episodes without waiting for cap eviction.
+
+POST bodies are capped at ``max_body_bytes`` (default 1 MB); larger payloads
+get 413. This keeps the sidecar safe to expose and able to absorb buffered
+telemetry from any host. Each connection also has a read timeout
+(``server_read_timeout``, default 30 s, ``SNAGLINE_SERVER_READ_TIMEOUT``)
+so a stalled sender that declares a large ``Content-Length`` but dribbles
+a few bytes cannot pin a handler thread indefinitely.
+
+Optionally protect the endpoints with a shared secret by passing
+``auth_token=`` to ``make_server``/``serve``. When set, requests must carry the
+token via ``Authorization: Bearer <token>`` or ``X-Snagline-Token: <token>``;
+missing or wrong tokens get 401. ``GET /health`` stays open for liveness
+probes -- everything else, GET and POST alike, is behind the token. The
+comparison is constant-time (``hmac.compare_digest``): the gate protects
+event ingestion, metrics reads and the halt-directive path, so the token
+must not be recoverable from response timing (issue #375).
+
+The listener can terminate TLS itself (issue #120): pass ``certfile=`` and
+``keyfile=`` (or a ready-made ``ssl_context=``) and each accepted connection
+is wrapped with stdlib ``ssl`` inside its own worker thread, so the sidecar
+speaks ``https://`` on the same endpoints with identical auth semantics, and
+one stalled handshake never blocks other senders. Without these arguments
+the listener stays plain HTTP, byte-for-byte the behavior described above.
+
+``POST /risks`` retains the most recent ``max_risks`` risks (default 1000) for
+``GET /risks``; older ones are discarded so an unbounded sender cannot grow the
+sidecar's memory without limit.
+
+``GET /metrics`` speaks Prometheus text exposition version 0.0.4 by default
+(issue #98), rendered with plain string formatting and no client library:
+``snagline_events_total``, ``snagline_risks_total{trigger,severity}``,
+``snagline_episodes_active``, the ``snagline_ingest_seconds`` count/sum pair,
+and the raw ``Monitor.metrics()`` counters under ``snagline_monitor_*_total``.
+The legacy JSON counters body is still served with ``?format=classic``, for
+clients sending ``Accept: application/json``, or when the sidecar is started
+with ``SNAGLINE_METRICS_FORMAT=classic`` (config key ``metrics_format``);
+``?format=prometheus`` forces the new format back on per request.
+
+``GET /directive`` reports the newest halt-webhook directive as
+``{"action": "continue"|"pause", "reason": ..., "timestamp": ...}`` (issue
+#169). Without it, a sidecar started with ``--halt-forward URL`` had nowhere
+to publish the answer: the directive landed on the in-process
+``Monitor.last_directive`` and non-Python hosts, the whole point of server
+mode, could not read it. The resource exists as soon as the Monitor does and
+defaults to continue, so the endpoint always answers 200. It is auth-gated
+like ``GET /risks``, because a directive can pause the host.
+
+No framework, no third-party dependency -- this keeps the zero-dependency
+principle intact even for server mode. For high-throughput production use,
+front it with a real ASGI server / reverse proxy; that is the user's infra
+choice, not this library's concern.
+
+Risks produced during ingestion are dispatched to the Monitor's sinks as
+usual (console by default), not returned in the HTTP response: ingestion is
+one-way telemetry, and callers should not block on detection results.
+
+Request origin (issue #388): authenticating the *token* does not
+authenticate the *sender*. ``snagline serve`` defaults to no token ("unset
+means all endpoints are open"), and a web page the operator visits can
+address the loopback sidecar from inside the boundary the bind was meant to
+keep out. ``POST`` is therefore gated on two things a forged cross-site
+request cannot supply together:
+
+* a JSON content type. The CORS-safelisted types (``text/plain``,
+  ``application/x-www-form-urlencoded``, ``multipart/form-data``) are the
+  only ones a cross-site ``fetch`` can send without an ``OPTIONS``
+  preflight, so requiring ``application/json`` forces one, and the sidecar
+  answers any preflight with no ``Access-Control-Allow-Origin`` -- the
+  browser then never sends the request at all. Every shipped client (the
+  three network sinks, ``snagline hook``) already sends JSON.
+* a same-site origin, when the client declares one. ``Sec-Fetch-Site`` and
+  ``Origin`` are absent from non-browser clients (curl, urllib, a sink),
+  so a missing header is not an error; a request that *declares* itself
+  cross-site is refused with 403 and a warning that names the origin, so an
+  attempt is distinguishable from a mistyped token instead of vanishing into
+  the general 401 noise.
+"""
+
+from __future__ import annotations
+
+import hmac
+import json
+import logging
+import math
+import ssl
+import sys
+import threading
+import time
+from collections import OrderedDict, deque
+from collections.abc import Callable
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import parse_qs, urlsplit
+
+from snagline.adapters.claude_code import HookTracker, ingest_payload
+from snagline.config import Config
+from snagline.events import StepEvent
+from snagline.monitor import HaltDirective, Monitor
+
+logger = logging.getLogger("snagline")
+
+
+def _has_string_ids(event: StepEvent) -> bool:
+    """Return True only if the event's episode_id/step_id are both strings.
+
+    These fields key the Monitor's per-episode LRU and lock. StepEvent is an
+    unvalidated dataclass, so a POST body like ``{"episode_id": []}`` builds a
+    perfectly good StepEvent whose id then crashes ``Monitor.ingest`` before
+    its fail-open guard (issue #479). Checking here lets the endpoint answer a
+    clean 400 instead of dropping the handler thread.
+    """
+    return isinstance(event.episode_id, str) and isinstance(event.step_id, str)
+
+
+# Content type required for Prometheus text exposition format 0.0.4.
+PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+# The only content type a POST body may carry (issue #388). Everything the
+# sidecar accepts is JSON, and the CORS-safelisted types are exactly the ones a
+# cross-site fetch can send without a preflight -- see the module docstring.
+_REQUIRED_CONTENT_TYPE = "application/json"
+# Values of ``Sec-Fetch-Site`` that do not mark a request as cross-site
+# (issue #388). "none" covers a user-typed URL / bookmark / curl-equivalent
+# browser navigation; a cross-site fetch reports "cross-site".
+_SAME_SITE_VALUES = frozenset({"same-origin", "same-site", "none"})
+# Supported values of the metrics_format config/env/request toggle.
+METRICS_FORMATS = ("prometheus", "classic")
+# Bound on distinct episode ids tracked for the episodes-active gauge. Episode
+# ids are identifiers, never content; the cap keeps memory bounded even if a
+# host streams unlimited unique ids through one long-lived sidecar process.
+_MAX_TRACKED_EPISODES = 10_000
+
+# Over-cap POSTs are drained and discarded before the 413 goes out, but only
+# within this much above max_body_bytes (issue #121): reading the body lets a
+# streaming client finish sending and still read the status line instead of
+# dying on EPIPE/reset. Beyond that window the 413 is sent immediately so one
+# hostile sender cannot tie up a handler thread indefinitely.
+_MAX_OVERCAP_DRAIN_EXCESS = 65_536
+# Upper bound on a chunk-size / trailer line read while framing a chunked
+# body (issue #434): the size line is a short hex token plus optional
+# extensions, so anything longer is a broken or hostile frame.
+_MAX_FRAME_LINE_BYTES = 8_192
+# Drain reads happen in fixed chunks, so peak memory stays at one chunk no
+# matter what Content-Length claims.
+_DRAIN_CHUNK_BYTES = 16_384
+# Default socket read timeout in seconds (issue #130). Applied to the
+# handler class via ``StreamRequestHandler.timeout``; stdlib converts a
+# stalled ``rfile.read(n)`` into a logged timeout and a closed connection.
+_DEFAULT_READ_TIMEOUT = 30.0
+# Every route the sidecar serves, across GET and POST. Distinguishes "this
+# method is not allowed on this route" (405, naming what is allowed) from "no
+# such route" (404) for methods other than GET/POST/HEAD (issue #433).
+_ROUTES = (
+    "/health",
+    "/metrics",
+    "/risks",
+    "/directive",
+    "/events",
+    "/hooks/claude-code",
+    "/episodes/end",
+)
+_ALLOWED_METHODS = "GET, HEAD, POST"
+
+
+def _escape_label(value: str) -> str:
+    """Escape a Prometheus label value (backslash, quote, newline)."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _format_sample_value(value: float | int) -> str:
+    """Render a sample value the way the exposition format expects."""
+    number = float(value)
+    if math.isnan(number):
+        return "NaN"
+    if math.isinf(number):
+        return "+Inf" if number > 0 else "-Inf"
+    return repr(float(value))
+
+
+def _resolve_metrics_format(explicit: str | None) -> str:
+    """Pick the startup-time default for GET /metrics.
+
+    Precedence: explicit argument, then SNAGLINE_METRICS_FORMAT via Config,
+    then the built-in Config default ("prometheus"). Unknown values are
+    logged and replaced by "prometheus": configuration must never take the
+    sidecar down (fail-open).
+    """
+    candidate = explicit
+    if candidate is None:
+        try:
+            candidate = Config.from_env_overrides().get("metrics_format")
+        except Exception:
+            logger.debug(
+                "snagline: env lookup for metrics_format failed", exc_info=True
+            )
+            candidate = None
+    if candidate is None:
+        candidate = Config().metrics_format
+    name = str(candidate).strip().lower()
+    if name in METRICS_FORMATS:
+        return name
+    logger.warning("snagline: unknown metrics format %r; serving prometheus", candidate)
+    return "prometheus"
+
+
+def _resolve_read_timeout(explicit: float | None) -> float:
+    """Pick the effective read timeout for sidecar connections.
+
+    Precedence: explicit argument, then ``SNAGLINE_SERVER_READ_TIMEOUT`` via
+    ``Config``, then the built-in ``Config`` default (30 s). Non-positive or
+    non-numeric values are logged and replaced by the default so a bad
+    knob never takes the sidecar down (fail-open, like
+    ``_resolve_metrics_format``).
+    """
+    candidate: Any = explicit
+    if candidate is None:
+        try:
+            candidate = Config.from_env_overrides().get("server_read_timeout")
+        except Exception:
+            logger.debug(
+                "snagline: env lookup for server_read_timeout failed",
+                exc_info=True,
+            )
+            candidate = None
+    if candidate is None:
+        candidate = Config().server_read_timeout
+    try:
+        value = float(candidate)
+    except (TypeError, ValueError):
+        logger.warning(
+            "snagline: invalid server_read_timeout %r; using default %s",
+            candidate,
+            _DEFAULT_READ_TIMEOUT,
+        )
+        return _DEFAULT_READ_TIMEOUT
+    if not math.isfinite(value) or value <= 0:
+        logger.warning(
+            "snagline: server_read_timeout %r must be positive; using default %s",
+            candidate,
+            _DEFAULT_READ_TIMEOUT,
+        )
+        return _DEFAULT_READ_TIMEOUT
+    return value
+
+
+def _resolve_episode_ttl(explicit: float | None) -> float | None:
+    """Pick the effective episode TTL for the sidecar gauge (issue #173).
+
+    Precedence: explicit argument, then ``SNAGLINE_EPISODE_TTL_SECONDS`` via
+    ``Config``, then the built-in ``Config`` default (None = disabled).
+    Malformed or non-positive values are logged and treated as disabled so a
+    bad knob never takes the sidecar down (fail-open). ``0`` explicitly
+    disables as well, keeping the default byte-identical behavior.
+    Uses wall-clock seconds for the TTL value but monotonic time for expiry
+    checks, so NTP jumps cannot mass-expire or freeze entries; docs note
+    replay traffic will resurrect stale ids.
+    """
+    candidate: Any = explicit
+    if candidate is None:
+        try:
+            candidate = Config.from_env_overrides().get("episode_ttl_seconds")
+        except Exception:
+            logger.debug(
+                "snagline: env lookup for episode_ttl_seconds failed",
+                exc_info=True,
+            )
+            candidate = None
+    if candidate is None:
+        candidate = Config().episode_ttl_seconds
+    if candidate is None:
+        return None
+    try:
+        value = float(candidate)
+    except (TypeError, ValueError):
+        logger.warning(
+            "snagline: invalid episode_ttl_seconds %r; TTL disabled",
+            candidate,
+        )
+        return None
+    if not math.isfinite(value):
+        logger.warning(
+            "snagline: episode_ttl_seconds %r must be finite; TTL disabled",
+            candidate,
+        )
+        return None
+    if value == 0:
+        return None
+    if value < 0:
+        logger.warning(
+            "snagline: episode_ttl_seconds %r must be positive; TTL disabled",
+            candidate,
+        )
+        return None
+    return value
+
+
+def _choose_metrics_format(
+    query: dict[str, list[str]], accept_header: str | None, configured: str
+) -> str:
+    """Resolve the format for one GET /metrics request.
+
+    An explicit ``?format=`` parameter wins. Without it, clients that send
+    ``Accept: application/json`` keep getting the legacy JSON body; everyone
+    else gets the configured default (prometheus since issue #98).
+    """
+    requested = (query.get("format") or [""])[-1].strip().lower()
+    if requested:
+        if requested in METRICS_FORMATS:
+            return requested
+        logger.warning(
+            "snagline: unknown ?format=%r; falling back to negotiation", requested
+        )
+    accept = (accept_header or "").lower()
+    if "application/json" in accept:
+        return "classic"
+    return configured
+
+
+def _directive_payload(directive: Any) -> dict[str, Any]:
+    """Render a :class:`HaltDirective` as the ``GET /directive`` body.
+
+    Coerced rather than trusted: the handler holds whatever object the caller
+    passed as ``monitor``, and a body that cannot be serialized would turn a
+    read-only endpoint into a 500.
+    """
+    return {
+        "action": str(directive.action),
+        "reason": str(directive.reason),
+        "timestamp": float(directive.timestamp),
+    }
+
+
+class SidecarMetricsCollector:
+    """Process-lifetime sidecar counters, renderable as Prometheus text.
+
+    Counts risks per ``(trigger, severity)`` by acting as one extra sink on
+    the Monitor, plus HTTP-layer totals: events accepted, time spent inside
+    ``Monitor.ingest``, and distinct episode ids seen (bounded table with
+    least-recently-seen eviction, ids only, no content). Every entry point
+    swallows its own exceptions: like any sink, this must never take down
+    ingestion or serving.
+    """
+
+    def __init__(
+        self,
+        max_episodes: int = _MAX_TRACKED_EPISODES,
+        episode_ttl_seconds: float | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._risks: dict[tuple[str, str], int] = {}
+        self._events_total = 0
+        self._ingest_count = 0
+        self._ingest_sum = 0.0
+        # Episode id table: reseeing an id moves it to the end, so when the
+        # cap bites we forget the episode quiet for the longest time, which
+        # is the right approximation of "active" for a long-lived sidecar.
+        # With TTL enabled each id also carries a monotonic last-seen stamp;
+        # the table stays ids-plus-a-float, never content, and the same cap
+        # continues to bound memory (issue #173).
+        self._episodes: OrderedDict[str, float] = OrderedDict()
+        self._max_episodes = max(1, int(max_episodes))
+        self._ttl = _resolve_episode_ttl(episode_ttl_seconds)
+        self._clock = clock or time.monotonic
+
+    def emit(self, risk: Any) -> None:
+        """AlertSink protocol entry point; counts one risk by label pair."""
+        try:
+            key = (str(risk.trigger), str(risk.severity))
+            with self._lock:
+                self._risks[key] = self._risks.get(key, 0) + 1
+        except Exception:
+            logger.debug("snagline: metrics collector emit failed", exc_info=True)
+
+    def _expire_stale_locked(self) -> None:
+        """Remove ids not seen for longer than TTL (caller holds _lock)."""
+        if self._ttl is None:
+            return
+        try:
+            now = self._clock()
+            # OrderedDict keeps insertion order = last-seen order because
+            # record_ingest moves reseen ids to the end. Expired ids are
+            # exactly those at the front whose age exceeds TTL; we can stop
+            # at the first fresh entry. Bounded scan: at most one pass over
+            # the table per sweep, and sweep happens only on ingest and
+            # scrape, so amortized O(1) per step (project.md section 1.5).
+            expired: list[str] = []
+            for eid, last_seen in self._episodes.items():
+                if now - last_seen > self._ttl:
+                    expired.append(eid)
+                else:
+                    break
+            for eid in expired:
+                self._episodes.pop(eid, None)
+        except Exception:
+            logger.debug("snagline: TTL sweep failed", exc_info=True)
+
+    def record_ingest(self, episode_id: str | None, elapsed_seconds: float) -> None:
+        """Record one accepted event and its ingest wall time."""
+        try:
+            with self._lock:
+                self._events_total += 1
+                self._ingest_count += 1
+                self._ingest_sum += max(0.0, float(elapsed_seconds))
+                if episode_id is not None:
+                    key = str(episode_id)
+                    now = self._clock()
+                    self._episodes.pop(key, None)
+                    self._episodes[key] = now
+                    self._expire_stale_locked()
+                    while len(self._episodes) > self._max_episodes:
+                        self._episodes.popitem(last=False)
+                else:
+                    self._expire_stale_locked()
+        except Exception:
+            logger.debug("snagline: metrics record failed", exc_info=True)
+
+    def end_episode(self, episode_id: str) -> None:
+        """Forget one episode id so the gauge reflects completion at once.
+
+        Without this an ended episode keeps occupying a table slot until cap
+        eviction forgets it (issue #123). Idempotent by design: ending an
+        unknown or already-ended id is a no-op, never an error. Guarded like
+        every other entry point: bookkeeping must never take serving down.
+        """
+        try:
+            key = str(episode_id)
+            with self._lock:
+                self._episodes.pop(key, None)
+        except Exception:
+            logger.debug(
+                "snagline: metrics collector end_episode failed", exc_info=True
+            )
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a consistent copy of the counters for rendering."""
+        with self._lock:
+            self._expire_stale_locked()
+            return {
+                "events_total": self._events_total,
+                "risks": sorted(self._risks.items()),
+                "episodes_active": len(self._episodes),
+                "ingest_count": self._ingest_count,
+                "ingest_sum": self._ingest_sum,
+            }
+
+    def render_prometheus(self, monitor_metrics: dict[str, int]) -> str:
+        """Render the full exposition body (version 0.0.4 text format).
+
+        ``monitor_metrics`` is the ``Monitor.metrics()`` snapshot; those
+        counters are exposed under ``snagline_monitor_*_total`` names so the
+        sidecar view adds process-lifetime detail without renaming anything
+        the JSON endpoint already published. A key the snapshot does not
+        carry renders as 0, so an older Monitor still produces a valid body.
+        """
+        snap = self.snapshot()
+        lines: list[str] = []
+        lines.append(
+            "# HELP snagline_events_total Steps ingested through this sidecar."
+        )
+        lines.append("# TYPE snagline_events_total counter")
+        lines.append(f"snagline_events_total {snap['events_total']}")
+        lines.append(
+            "# HELP snagline_risks_total Risks emitted by trigger and severity."
+        )
+        lines.append("# TYPE snagline_risks_total counter")
+        for (trigger, severity), count in snap["risks"]:
+            lines.append(
+                f'snagline_risks_total{{trigger="{_escape_label(trigger)}",'
+                f'severity="{_escape_label(severity)}"}} {count}'
+            )
+        lines.append(
+            "# HELP snagline_episodes_active Distinct episode ids seen since start;"
+            " ids removed again on POST /episodes/end."
+        )
+        lines.append("# TYPE snagline_episodes_active gauge")
+        lines.append(f"snagline_episodes_active {snap['episodes_active']}")
+        lines.append("# HELP snagline_ingest_seconds Wall time spent ingesting steps.")
+        lines.append("# TYPE snagline_ingest_seconds summary")
+        lines.append(f"snagline_ingest_seconds_count {snap['ingest_count']}")
+        lines.append(
+            f"snagline_ingest_seconds_sum {_format_sample_value(snap['ingest_sum'])}"
+        )
+        monitor_families = (
+            (
+                "events_ingested",
+                "snagline_monitor_events_ingested_total",
+                "Events ingested by the Monitor.",
+            ),
+            (
+                "events_dropped",
+                "snagline_monitor_events_dropped_total",
+                "Events dropped before ingest (e.g. a non-string episode_id);"
+                " fail-open (#479).",
+            ),
+            (
+                "risks_emitted",
+                "snagline_monitor_risks_emitted_total",
+                "Risks emitted by the Monitor.",
+            ),
+            (
+                "detector_errors",
+                "snagline_monitor_detector_errors_total",
+                "Detector exceptions swallowed (fail-open).",
+            ),
+            (
+                "sink_errors",
+                "snagline_monitor_sink_errors_total",
+                "Sink exceptions swallowed (fail-open).",
+            ),
+            (
+                "policy_errors",
+                "snagline_monitor_policy_errors_total",
+                "Enforcement faults swallowed fail-open (#93): callback raises"
+                " and halt-webhook timeout/error fallbacks.",
+            ),
+        )
+        for key, name, help_text in monitor_families:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} counter")
+            lines.append(f"{name} {monitor_metrics.get(key, 0)}")
+        # Issue #184: retained-episode count so the leak is observable rather
+        # than inferred from RSS. Gauge, not counter; ids only.
+        retained = monitor_metrics.get(
+            "retained_episodes", monitor_metrics.get("live_episodes", 0)
+        )
+        lines.append(
+            "# HELP snagline_monitor_retained_episodes Current live episode ids retained by Monitor (issue #184)."
+        )
+        lines.append("# TYPE snagline_monitor_retained_episodes gauge")
+        lines.append(f"snagline_monitor_retained_episodes {retained}")
+        return "\n".join(lines) + "\n"
+
+
+def _attach_metrics_collector(monitor: Any, collector: SidecarMetricsCollector) -> None:
+    """Register ``collector`` as one extra sink so risks are counted per label.
+
+    Uses the public ``Monitor.add_sink`` (issue #122), so any Monitor that
+    honors the base-class contract works without reaching into privates.
+    Guarded end to end: any failure leaves serving fully functional, only the
+    per-label risk counters stay empty. Monitor dispatch already treats sinks
+    as fail-open, matching project.md §1.2.
+    """
+    try:
+        monitor.add_sink(collector)
+    except Exception:
+        logger.warning(
+            "snagline: attaching metrics collector failed; risk labels stay empty",
+            exc_info=True,
+        )
+
+
+def make_handler(
+    monitor: Monitor,
+    auth_token: str | None = None,
+    max_body_bytes: int = 1_000_000,
+    max_risks: int = 1000,
+    metrics_format: str | None = None,
+    read_timeout: float | None = None,
+    episode_ttl_seconds: float | None = None,
+) -> type[BaseHTTPRequestHandler]:
+    """Build a request-handler class bound to ``monitor``.
+
+    ``metrics_format`` pins the default GET /metrics body; when omitted the
+    SNAGLINE_METRICS_FORMAT environment variable decides, then the built-in
+    "prometheus" default (see ``_resolve_metrics_format``).
+    ``read_timeout`` sets the socket read timeout in seconds; when omitted
+    ``SNAGLINE_SERVER_READ_TIMEOUT`` / ``Config.server_read_timeout`` decides,
+    then the built-in 30 s default (see ``_resolve_read_timeout``).
+    ``episode_ttl_seconds`` sets the TTL for ``snagline_episodes_active`` ids;
+    when omitted ``SNAGLINE_EPISODE_TTL_SECONDS`` / ``Config.episode_ttl_seconds``
+    decides, then disabled (None) by default (see ``_resolve_episode_ttl``).
+    """
+    tracker = HookTracker()
+
+    class _Handler(BaseHTTPRequestHandler):
+        # BaseHTTPRequestHandler inherits ``timeout`` from
+        # StreamRequestHandler (default None = block forever). Setting it
+        # here bounds every ``rfile.read(n)``; stdlib turns a stall into a
+        # logged "Request timed out" and a closed connection (issue #130).
+        timeout = _DEFAULT_READ_TIMEOUT
+        # Class attribute set below; typed as Any to satisfy the checker.
+        snagline_monitor: Any = None
+        snagline_tracker: Any = None
+        snagline_risks: Any = None
+        # Guards snagline_risks; set alongside it in make_handler (issue #543).
+        snagline_risks_lock: Any = None
+        snagline_auth: str | None = None
+        snagline_max_body: int = 1_000_000
+        snagline_collector: Any = None
+        snagline_metrics_format: str = "prometheus"
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            # Route http.server's access log through logging, not stderr raw.
+            logger.debug("snagline http: " + format, *args)
+
+        def _authorized(self) -> bool:
+            token = self.snagline_auth
+            if not token:
+                return True
+            # Constant-time, not == (issue #375): str.__eq__ returns at the
+            # first differing character, so its runtime grows with the shared
+            # prefix and the token leaks to anyone who can average response
+            # times. This gate protects /events injection, /metrics and
+            # /risks reads, and --halt-forward's directive path, so it gets
+            # the standard treatment.
+            #
+            # Compared as UTF-8 bytes on purpose: compare_digest raises
+            # TypeError on non-ASCII str, and Authorization is
+            # attacker-controlled -- a probe carrying an accented value would
+            # otherwise crash the handler thread from an unauthenticated
+            # caller. UTF-8 encoding is a bijection for valid strings, so
+            # equality semantics are unchanged.
+            token_b = token.encode()
+            authz = self.headers.get("Authorization", "")
+            if authz.startswith("Bearer "):
+                return hmac.compare_digest(
+                    authz[len("Bearer ") :].strip().encode(), token_b
+                )
+            header = self.headers.get("X-Snagline-Token")
+            if header is None:
+                return False
+            return hmac.compare_digest(header.encode(), token_b)
+
+        def _cross_site_origin(self) -> str | None:
+            """The origin a browser declared for this request, or None.
+
+            Returns the declared origin only when the request *marks itself*
+            cross-site. Non-browser clients -- curl, urllib, a sink, a hook
+            script -- send neither ``Sec-Fetch-Site`` nor ``Origin``, so a
+            missing header is not an error and this stays None (issue #388).
+
+            ``Sec-Fetch-Site`` is authoritative when present: it is set by the
+            browser on every fetch and names the relationship directly, so it
+            needs no comparison against the bound host. ``Origin`` is the
+            fallback (Safari < 16.4 and older browsers): it is compared with
+            the ``Host`` header the request arrived on, which the browser sets
+            to the same authority for a same-origin request. ``Origin: null``
+            is a sandboxed iframe or a ``file://`` page and counts as
+            cross-site.
+            """
+            site = self.headers.get("Sec-Fetch-Site")
+            if site is not None:
+                if site.strip().lower() not in _SAME_SITE_VALUES:
+                    return self.headers.get("Origin") or site.strip().lower()
+                return None
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return None
+            declared = origin.strip().lower()
+            if declared == "null":
+                return origin
+            host = self.headers.get("Host")
+            if not host:
+                return None
+            return (
+                origin
+                if declared
+                not in {
+                    f"http://{host}".lower(),
+                    f"https://{host}".lower(),
+                }
+                else None
+            )
+
+        def _json_content_type(self) -> bool:
+            """Whether the request declared a JSON body (issue #388).
+
+            Only the media type is compared, so ``application/json;
+            charset=utf-8`` is accepted. An absent header is not: the shipped
+            clients all set it, and a browser POST always sets one.
+            """
+            raw = self.headers.get("Content-Type", "")
+            return raw.split(";", 1)[0].strip().lower() == _REQUIRED_CONTENT_TYPE
+
+        def do_GET(self) -> None:  # noqa: N802 - http.server naming
+            self._route_get(head_only=False)
+
+        def do_HEAD(self) -> None:  # noqa: N802 - http.server naming
+            # ELB/HAProxy-style liveness probes use HEAD, and the module
+            # docstring markets /health as the endpoint for exactly those
+            # probes. HEAD answers the same status and headers as GET with no
+            # body (issue #433).
+            self._route_get(head_only=True)
+
+        def _route_get(self, *, head_only: bool) -> None:
+            # /health is deliberately open: a liveness probe (k8s, ELB, docker
+            # healthcheck) generally cannot be taught to carry a shared secret,
+            # and it reveals nothing but reachability.
+            # Route on the path component only (issue #241): /health is
+            # deliberately open, and a probe that appends a query string
+            # (/health?probe=1) used to miss this branch and land behind
+            # the auth gate -- 401 from an endpoint meant to answer 200
+            # for anything that can reach it.
+            if urlsplit(self.path).path == "/health":
+                self._respond(200, {"status": "ok"}, head_only=head_only)
+                return
+            # Everything else is behind the token, including the 404 fallthrough
+            # so an unauthenticated caller cannot probe which paths exist.
+            if not self._authorized():
+                self._respond(401, {"error": "unauthorized"}, head_only=head_only)
+                return
+            split = urlsplit(self.path)
+            if split.path == "/metrics":
+                self._serve_metrics(parse_qs(split.query), head_only=head_only)
+            elif split.path == "/risks":
+                # Snapshot under the lock rather than passing the deque
+                # straight to _respond: the deque is shared by every handler
+                # thread, and list(deque) iterates it while a POST on another
+                # thread appends -- which, at maxlen, also frees the leftmost
+                # block the iterator may still be pointing at. deque iteration
+                # takes no internal lock, so serialize both ends (issue #543).
+                with self.snagline_risks_lock:
+                    risks = list(self.snagline_risks)
+                self._respond(200, {"risks": risks}, head_only=head_only)
+            elif split.path == "/directive":
+                self._serve_directive(head_only=head_only)
+            else:
+                self._respond(404, {"error": "not found"}, head_only=head_only)
+
+        def _serve_directive(self, *, head_only: bool = False) -> None:
+            """Serve the newest halt-webhook directive (issue #169).
+
+            Read-only: the Monitor owns the directive and its lock, so this
+            renders whatever the public property hands back. A monitor that
+            predates enforcement, or any failure reading it, answers with the
+            default continue rather than raising -- the same fail-open the
+            webhook path itself takes on a timeout or a dead endpoint, and a
+            500 here would tell a polling host nothing it could act on.
+            """
+            try:
+                payload = _directive_payload(self.snagline_monitor.last_directive)
+            except Exception:
+                logger.debug(
+                    "snagline: directive unreadable, reporting continue", exc_info=True
+                )
+                payload = _directive_payload(HaltDirective())
+            self._respond(200, payload, head_only=head_only)
+
+        def _serve_metrics(
+            self, query: dict[str, list[str]], *, head_only: bool = False
+        ) -> None:
+            """Serve either exposition format, failing open to an empty body.
+
+            Rendering happens under try/except because a scrape endpoint that
+            raises would break scrapers' confidence far more than an empty
+            (valid) body does.
+            """
+            fmt = _choose_metrics_format(
+                query, self.headers.get("Accept"), self.snagline_metrics_format
+            )
+            if fmt == "classic":
+                self._respond(200, self.snagline_monitor.metrics(), head_only=head_only)
+                return
+            try:
+                body = self.snagline_collector.render_prometheus(
+                    self.snagline_monitor.metrics()
+                )
+            except Exception:
+                logger.exception("snagline: prometheus render failed")
+                body = ""
+            self._respond_text(200, body, PROMETHEUS_CONTENT_TYPE, head_only=head_only)
+
+        def do_POST(self) -> None:  # noqa: N802 - http.server naming
+            # A token only proves the sender *has* it; it says nothing about
+            # where the request came from. Check the origin first so an
+            # attempt that reaches the token gate is still distinguishable
+            # from a mistyped token in the logs (issue #388).
+            cross_site = self._cross_site_origin()
+            if not self._authorized():
+                if cross_site is not None:
+                    logger.warning(
+                        "snagline http: rejected a cross-site POST from %r "
+                        "at the auth gate (token unset would have honoured it)",
+                        cross_site,
+                    )
+                # Drain the declared body before replying: closing a
+                # connection that still has unread inbound data makes the
+                # kernel send RST and the sender can lose the 401 response
+                # entirely (same rationale as the over-cap drain, #121;
+                # observed over TLS where close timing shifts the race).
+                length = self._parse_content_length()
+                if length is None:
+                    return
+                self._drain_request_body()
+                self._respond(401, {"error": "unauthorized"})
+                return
+            if cross_site is not None:
+                # This is the case the token cannot cover: with the default
+                # no-token configuration the auth gate is wide open, and a
+                # page the operator visited can issue a cross-site POST as a
+                # CORS "simple request" -- no preflight, so the browser sends
+                # it and the write lands (issue #388). Refuse it, and log the
+                # origin so the attempt is visible rather than silent.
+                logger.warning(
+                    "snagline http: refused a cross-site POST from %r; "
+                    "mutating endpoints are same-site only",
+                    cross_site,
+                )
+                length = self._parse_content_length()
+                if length is None:
+                    return
+                self._discard_overcap_body(length)
+                self._respond(403, {"error": "cross-site request refused"})
+                return
+            # Parsed once, before any gate that needs to drain a body: a
+            # malformed Content-Length answers 400 here and nothing below runs.
+            length = self._parse_content_length()
+            if length is None:
+                return
+            # A forged cross-site request cannot supply this without triggering
+            # an OPTIONS preflight, which this server answers with no
+            # Access-Control-Allow-Origin -- the browser then never sends the
+            # POST (issue #388). Every shipped client sends JSON, so this
+            # costs a real client nothing.
+            if not self._json_content_type():
+                self._discard_overcap_body(length)
+                self._respond(
+                    415,
+                    {
+                        "error": "unsupported media type",
+                        "detail": (
+                            f"POST requires Content-Type: {_REQUIRED_CONTENT_TYPE}"
+                        ),
+                    },
+                )
+                return
+            if length > self.snagline_max_body:
+                # Consume the over-cap body first: closing with megabytes
+                # unread makes the peer see EPIPE/reset instead of the 413
+                # (issue #121).
+                self._discard_overcap_body(length)
+                self._respond(413, {"error": "payload too large"})
+                return
+            # Route on the path component only (issue #241): self.path keeps
+            # any query string, so exact comparisons 404'd /events?batch=1
+            # and let /health?probe=1 fall through to the auth gate. The GET
+            # side already strips the query via urlsplit; POST now does too.
+            route = urlsplit(self.path).path
+            if route == "/events":
+                self._post_events()
+            elif route == "/hooks/claude-code":
+                self._post_claude_hook()
+            elif route == "/episodes/end":
+                self._post_episodes_end()
+            elif route == "/risks":
+                self._post_risks()
+            elif route == "/security/eval":
+                self._post_security_eval()
+            else:
+                self._drain_request_body()
+                self._respond(404, {"error": "not found"})
+
+        def _post_risks(self) -> None:
+            """Receive a ``FailureRisk`` JSON emitted by a WebhookSink elsewhere.
+
+            This closes the loop with ``sinks.webhook.WebhookSink``: a remote
+            or sibling agent posts its detected risks here, and the sidecar
+            records/displays them. Validation is lenient and fail-open -- a
+            malformed body is acknowledged (202) so the sender never retries.
+            """
+            body = self._read_body()
+            if body is None:
+                return
+            try:
+                risk = json.loads(body.decode("utf-8"))
+                if not isinstance(risk, dict):
+                    raise ValueError
+            except (ValueError, json.JSONDecodeError):
+                self._respond(400, {"error": "invalid risk JSON"})
+                return
+            # Serialize with the GET side: an append past maxlen frees the
+            # leftmost block a concurrent deque iterator may still be reading
+            # (issue #543).
+            with self.snagline_risks_lock:
+                self.snagline_risks.append(risk)
+            logger.info("snagline sidecar received risk: %s", risk)
+            print(
+                f"[sidecar] RECEIVED risk -> trigger={risk.get('trigger')} "
+                f"score={risk.get('score')} detail={risk.get('detail')}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._respond(202, {"status": "received", "trigger": risk.get("trigger")})
+
+        def _post_security_eval(self) -> None:
+            """Evaluate a proposed tool request against security controls."""
+            from snagline.security_evaluation import evaluate_request
+
+            body = self._read_body()
+            if body is None:
+                return
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except Exception as err:
+                self._respond(400, {"error": f"invalid JSON payload: {err}"})
+                return
+
+            if not isinstance(payload, dict):
+                self._respond(400, {"error": "request body must be a JSON object"})
+                return
+
+            tool_name = payload.get("tool_name")
+            if not tool_name or not isinstance(tool_name, str):
+                self._respond(400, {"error": "tool_name is required and must be a string"})
+                return
+
+            action = payload.get("action", "unknown")
+            resource = payload.get("resource")
+            tool_input = payload.get("tool_input", {})
+
+            try:
+                res = evaluate_request(
+                    tool_name=tool_name,
+                    action=str(action),
+                    resource=str(resource) if resource is not None else None,
+                    tool_input=tool_input if isinstance(tool_input, dict) else {},
+                )
+                self._respond(200, res)
+            except Exception as err:
+                self._respond(500, {"error": f"evaluation error: {err}"})
+
+
+        def _post_events(self) -> None:
+            body = self._read_body()
+            if body is None:
+                return
+            try:
+                obj = json.loads(body.decode("utf-8"))
+            except (ValueError, json.JSONDecodeError):
+                self._respond(400, {"error": "invalid StepEvent JSON"})
+                return
+            if isinstance(obj, list):
+                # Batched ingestion: a JSON array of StepEvent objects. This
+                # lets a host buffer telemetry and flush many steps in one
+                # request (useful for high-throughput or offline replay).
+                # Two passes (issue #239): validate and construct the whole
+                # batch before ingesting anything. Ingesting inline meant a
+                # bad item at position k answered 400 with items 0..k-1
+                # already inside the Monitor, so a retrying client re-fed
+                # the accepted prefix on every attempt -- duplicated steps
+                # for the loop/cascade/CUSUM detectors and double-counted
+                # metrics.
+                events: list[StepEvent] = []
+                for item in obj:
+                    if not isinstance(item, dict):
+                        self._respond(400, {"error": "invalid StepEvent in batch"})
+                        return
+                    try:
+                        event = StepEvent(**item)
+                    except (ValueError, TypeError):
+                        self._respond(400, {"error": "invalid StepEvent in batch"})
+                        return
+                    # episode_id/step_id key the Monitor's per-episode maps; a
+                    # non-string (e.g. a JSON list) would crash ingest, so
+                    # reject the whole batch now -- before ingesting any item,
+                    # preserving the #239 two-pass atomicity (issue #479).
+                    if not _has_string_ids(event):
+                        self._respond(400, {"error": "invalid StepEvent in batch"})
+                        return
+                    events.append(event)
+                for event in events:
+                    self._ingest_recorded(event)
+                self._respond(202, {"status": "ingested", "count": len(events)})
+                return
+            if not isinstance(obj, dict):
+                self._respond(
+                    400, {"error": "event body must be a JSON object or array"}
+                )
+                return
+            try:
+                event = StepEvent(**obj)
+            except (ValueError, TypeError):
+                self._respond(400, {"error": "invalid StepEvent JSON"})
+                return
+            # episode_id/step_id must be strings: a non-string id crashes the
+            # Monitor's per-episode keying (issue #479). Reject with a clean
+            # 400 rather than letting ingest take down the handler thread.
+            if not _has_string_ids(event):
+                self._respond(400, {"error": "invalid StepEvent JSON"})
+                return
+            # Ingest itself is fail-open inside the Monitor; a bad event shape
+            # above is the only client-visible error.
+            self._ingest_recorded(event)
+            self._respond(202, {"status": "ingested", "step_id": event.step_id})
+
+        def _post_episodes_end(self) -> None:
+            """Accept an end-of-episode signal (issue #123).
+
+            Body is ``{"episode_id": "<id>"}``. The id is forwarded to
+            ``Monitor.end_episode`` (detector finalization plus state
+            teardown) and removed from the metrics episodes table so the
+            gauge stops counting it immediately. Ids only: the body is never
+            logged or retained. Fail-open end to end -- malformed bodies get
+            400, monitor failures are logged and swallowed, and the client
+            always gets a clean response because this endpoint must never be
+            the one that takes the sidecar down.
+            """
+            body = self._read_body()
+            if body is None:
+                return
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (ValueError, json.JSONDecodeError):
+                self._respond(400, {"error": "invalid end-episode JSON"})
+                return
+            episode_id = (
+                payload.get("episode_id") if isinstance(payload, dict) else None
+            )
+            if not isinstance(episode_id, str) or not episode_id:
+                self._respond(400, {"error": "episode_id must be a non-empty string"})
+                return
+            try:
+                self.snagline_monitor.end_episode(episode_id)
+            except Exception:
+                # Monitor dispatch is fail-open internally already; this guard
+                # covers misconfigured monitors (fail_open=False) so a bad
+                # signal can still never escape into the server plumbing.
+                logger.exception("snagline: end_episode dispatch failed")
+            finally:
+                collector = self.snagline_collector
+                if collector is not None:
+                    collector.end_episode(episode_id)
+            self._respond(200, {"status": "ended", "episode_id": episode_id})
+
+        def _ingest_recorded(self, event: StepEvent) -> None:
+            """Ingest one event while recording sidecar metrics around it.
+
+            The collector swallows its own exceptions, so bookkeeping can
+            never turn into a serving failure; the ingest call itself keeps
+            exactly the Monitor's own fail-open contract.
+            """
+            collector = self.snagline_collector
+            start = time.perf_counter()
+            try:
+                self.snagline_monitor.ingest(event)
+            finally:
+                if collector is not None:
+                    elapsed = time.perf_counter() - start
+                    collector.record_ingest(event.episode_id, elapsed)
+
+        def _post_claude_hook(self) -> None:
+            """Accept a native Claude Code hook payload (http hook type).
+
+            Claude Code posts its own JSON (hook_event_name, session_id,
+            tool_name, ...); the adapter maps it to a StepEvent. Used for
+            unmapped lifecycle events too, responding 202 so the host never
+            retries noise.
+            """
+            body = self._read_body()
+            if body is None:
+                return
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError
+            except (ValueError, json.JSONDecodeError):
+                self._respond(400, {"error": "invalid hook JSON"})
+                return
+            collector = self.snagline_collector
+            start = time.perf_counter()
+            event = ingest_payload(
+                self.snagline_monitor, payload, self.snagline_tracker
+            )
+            if collector is not None and event is not None:
+                elapsed = time.perf_counter() - start
+                collector.record_ingest(event.episode_id, elapsed)
+            self._respond(
+                202,
+                {
+                    "status": "ingested" if event is not None else "ignored",
+                    "step_id": event.step_id if event else None,
+                },
+            )
+
+        def _parse_content_length(self) -> int | None:
+            """Parse Content-Length, or None if malformed (already answered 400).
+
+            An absent Content-Length header is treated as length 0 -- the body
+            is bodyless unless it is framed as ``Transfer-Encoding: chunked``,
+            which ``_read_body`` decodes separately (issue #434). A present
+            but non-numeric or negative value is answered
+            with 400 {"error": "invalid Content-Length"} and the caller
+            must return without reading any body bytes. Shared by ``do_POST``
+            and ``_read_body`` so every entry point fails the same way.
+            """
+            raw = self.headers.get("Content-Length")
+            if raw is None:
+                return 0
+            text = raw.strip() if isinstance(raw, str) else str(raw).strip()
+            if text == "":
+                self._respond(400, {"error": "invalid Content-Length"})
+                return None
+            try:
+                length = int(text)
+            except (ValueError, TypeError):
+                self._respond(400, {"error": "invalid Content-Length"})
+                return None
+            if length < 0:
+                self._respond(400, {"error": "invalid Content-Length"})
+                return None
+            return length
+
+        def _discard_overcap_body(self, declared_length: int) -> None:
+            """Read and throw away an over-cap body before replying 413.
+
+            Bodies up to ``max_body_bytes + _MAX_OVERCAP_DRAIN_EXCESS`` are
+            drained fully so the sender can finish writing and still read the
+            response; anything larger is abandoned after that window (the 413
+            still goes out at once). Reads happen in fixed-size chunks, so
+            peak memory is bounded regardless of claimed Content-Length.
+            Fail-open: a client that hangs up mid-drain is logged and
+            forgotten, never turned into a serving error.
+            """
+            remaining = min(
+                declared_length,
+                self.snagline_max_body + _MAX_OVERCAP_DRAIN_EXCESS,
+            )
+            while remaining > 0:
+                try:
+                    chunk = self.rfile.read(min(remaining, _DRAIN_CHUNK_BYTES))
+                except OSError:
+                    logger.debug(
+                        "snagline: over-cap body drain interrupted", exc_info=True
+                    )
+                    return
+                if not chunk:
+                    return  # client hung up early; nothing more to discard
+                remaining -= len(chunk)
+
+        def _read_body(self) -> bytes | None:
+            """Read the request body, or None if the framing was malformed.
+
+            On malformed Content-Length the helper has already sent the 400
+            response; the caller must return immediately without sending
+            another response, otherwise the connection would see two status
+            lines.
+
+            An absent Content-Length no longer means an empty body
+            (issue #434): a client streaming a body it cannot pre-size sends
+            ``Transfer-Encoding: chunked``, which is framed and decoded here
+            so the telemetry is ingested instead of rejected with a misleading
+            "invalid StepEvent JSON" and a connection reset on close.
+            """
+            length = self._parse_content_length()
+            if length is None:
+                return None
+            if length == 0 and self._is_chunked():
+                return self._read_chunked_body()
+            return self.rfile.read(length)
+
+        def _is_chunked(self) -> bool:
+            """Whether the request body uses Transfer-Encoding: chunked."""
+            raw = self.headers.get("Transfer-Encoding")
+            if not raw:
+                return False
+            return "chunked" in raw.strip().lower()
+
+        def _read_chunked_body(self) -> bytes | None:
+            """Decode a ``Transfer-Encoding: chunked`` body (issue #434).
+
+            The framed body is capped at the same ``max_body_bytes`` a
+            Content-Length request is rejected above, so a chunked client
+            cannot stream around the body cap: anything larger is drained
+            best-effort (bounded by the same excess the declared path allows
+            its drain) and answered 413 exactly like it, returning None
+            afterwards so the caller returns at once instead of sending a
+            second status line.
+            """
+            limit = self.snagline_max_body
+            parts: list[bytes] = []
+            total = 0  # bytes accepted so far; the cap is on bytes, not frames
+            while True:
+                line = self.rfile.readline(_MAX_FRAME_LINE_BYTES)
+                if not line:
+                    return b"".join(parts)  # client hung up; keep what arrived
+                try:
+                    size = int(line.strip().split(b";", 1)[0], 16)
+                except ValueError:
+                    self._respond(400, {"error": "invalid chunk size"})
+                    return None
+                if size == 0:
+                    self._drain_chunked_trailer()
+                    return b"".join(parts)
+                if size < 0:
+                    self._respond(400, {"error": "invalid chunk size"})
+                    return None
+                if total + size > limit:
+                    # The over-limit chunk's *size line* is consumed but its
+                    # payload is still on the wire, so hand the size to the
+                    # drain: starting it without that context makes it read the
+                    # payload as the next size line, and a payload of hex-valid
+                    # bytes ("a" is a hex digit) parses into an astronomically
+                    # large chunk size, after which the drain blocks reading a
+                    # byte count the client never intends to send (issue #586).
+                    self._drain_chunked_rest(pending=size)
+                    self._respond(413, {"error": "payload too large"})
+                    return None
+                chunk = self.rfile.read(size)
+                if not chunk:
+                    return b"".join(parts)
+                parts.append(chunk)
+                total += len(chunk)
+                self.rfile.read(2)  # trailing CRLF after each chunk
+
+        def _drain_chunked_trailer(self) -> None:
+            """Consume the optional trailer section after the final 0 chunk."""
+            for _ in range(_MAX_FRAME_LINE_BYTES):
+                line = self.rfile.readline(_MAX_FRAME_LINE_BYTES)
+                if not line or line in (b"\r\n", b"\n"):
+                    return
+
+        def _drain_chunked_rest(self, pending: int = 0) -> None:
+            """Best-effort drain of an over-cap chunked body before replying.
+
+            ``pending`` is the size of the chunk whose size line the caller
+            already consumed but whose payload it did not read -- the over-cap
+            case in ``_read_chunked_body``. Consuming it here keeps the drain
+            aligned on a frame boundary; without it the payload is read as a
+            size line, and hex-valid payload bytes parse into a size the client
+            is never going to send, so the drain blocks holding the 413
+            (issue #586).
+
+            The total discarded is bounded by the same excess the declared path
+            allows its own drain (issue #121), so a client that never
+            terminates cannot hold the reply past that budget; the handler's
+            read timeout bounds the rest.
+            """
+            budget = _MAX_OVERCAP_DRAIN_EXCESS
+            while pending > 0 and budget > 0:
+                chunk = self.rfile.read(min(pending, budget, _DRAIN_CHUNK_BYTES))
+                if not chunk:
+                    return
+                spent = len(chunk)
+                pending -= spent
+                budget -= spent
+            if pending == 0:
+                self.rfile.read(2)  # trailing CRLF of the pending chunk
+            while budget > 0:
+                line = self.rfile.readline(_MAX_FRAME_LINE_BYTES)
+                if not line:
+                    return
+                try:
+                    size = int(line.strip().split(b";", 1)[0], 16)
+                except ValueError:
+                    return  # broken framing: nothing more to drain usefully
+                if size <= 0:
+                    return  # terminating (or malformed) chunk: stream is done
+                # Never act on a size line claiming more than the whole drain
+                # budget: the frame is already over-cap, and a size parsed out
+                # of payload data can be enormous because every hex digit is a
+                # valid digit (issue #586).
+                size = min(size, budget)
+                remaining = size
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, _DRAIN_CHUNK_BYTES))
+                    if not chunk:
+                        return
+                    remaining -= len(chunk)
+                budget -= size
+                self.rfile.read(2)  # trailing CRLF
+
+        def _drain_request_body(self) -> None:
+            """Consume an unread body before replying so close does not RST.
+
+            A chunked body carries no Content-Length, so its remainder is
+            drained best-effort instead of by declared length (issue #434).
+            """
+            declared = self._parse_content_length()
+            if declared is None:
+                return
+            self._discard_overcap_body(declared)
+            if declared == 0 and self._is_chunked():
+                self._drain_chunked_rest()
+
+        def _respond(
+            self, code: int, payload: dict, *, head_only: bool = False
+        ) -> None:
+            data = (json.dumps(payload) + "\n").encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(data)
+
+        def _respond_text(
+            self, code: int, text: str, content_type: str, *, head_only: bool = False
+        ) -> None:
+            data = text.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if not head_only:
+                self.wfile.write(data)
+
+        def send_error(
+            self, code: int, message: Any = None, explain: Any = None
+        ) -> None:  # noqa: A002
+            # BaseHTTPRequestHandler dispatches ``do_<METHOD>`` and answers 501
+            # when no such method exists. The route does exist, so 405 naming
+            # what it accepts is the honest answer -- 501 reads as a broken
+            # sidecar rather than a usage error, and the built-in path never
+            # drains the body either, so a PUT/DELETE carrying a payload leaves
+            # megabytes unread and the kernel RSTs the connection before the
+            # client reads the status (issue #433).
+            if code == 501 and getattr(self, "path", None) is not None:
+                self._method_not_allowed()
+                return
+            return super().send_error(code, message, explain)
+
+        def _method_not_allowed(self) -> None:
+            """Answer a route that exists but does not accept this method."""
+            self._drain_body()
+            path = urlsplit(self.path).path
+            # Same auth-first ordering as the GET path: /health stays open, and
+            # an unauthenticated caller gets the same answer for every path so
+            # the 405 cannot be used to probe which routes exist.
+            if path != "/health" and not self._authorized():
+                self._respond(401, {"error": "unauthorized"})
+                return
+            if path in _ROUTES:
+                self.send_response(405)
+                self.send_header("Allow", _ALLOWED_METHODS)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._respond(404, {"error": "not found"})
+
+        def _drain_body(self) -> None:
+            """Read and discard a declared request body before answering.
+
+            Used on the paths that do not read a body themselves: leaving it
+            unread makes the peer see EPIPE/reset instead of the status line
+            (the same hazard the 401/413 paths already drain for, #121).
+            """
+            declared = self._parse_content_length()
+            if not declared:
+                # None: a malformed Content-Length was already answered 400.
+                # 0: no body declared.
+                return
+            self._discard_overcap_body(declared)
+
+    _Handler.snagline_monitor = monitor
+    _Handler.snagline_tracker = tracker
+    # Bounded: POST /risks is an open-ended ingest point, so retain only the
+    # most recent max_risks entries rather than growing without limit.
+    _Handler.snagline_risks = deque(maxlen=max(1, max_risks))
+    # The deque is read on GET /risks and written on POST /risks from different
+    # handler threads; both ends serialize on this lock (issue #543).
+    _Handler.snagline_risks_lock = threading.Lock()
+    _Handler.snagline_auth = auth_token
+    if max_body_bytes <= 0:
+        # do_POST compares ``length > snagline_max_body`` with a strict ``>``,
+        # so a cap of 0 (or any negative) rejects *every* POST with 413: the
+        # sidecar starts cleanly, answers /health green, and silently drops
+        # 100% of inbound telemetry. Reject it at construction, before the
+        # banner claims a working server (issue #394).
+        raise ValueError(
+            "max_body_bytes must be a positive number of bytes, got "
+            f"{max_body_bytes}; the cap is compared with a strict >, so a "
+            "non-positive value rejects every POST with 413"
+        )
+    _Handler.snagline_max_body = max_body_bytes
+    _Handler.snagline_collector = SidecarMetricsCollector(
+        episode_ttl_seconds=episode_ttl_seconds
+    )
+    _attach_metrics_collector(monitor, _Handler.snagline_collector)
+    _Handler.snagline_metrics_format = _resolve_metrics_format(metrics_format)
+    _Handler.timeout = _resolve_read_timeout(read_timeout)
+    return _Handler
+
+
+def _resolve_ssl_context(
+    ssl_context: ssl.SSLContext | None,
+    certfile: str | None,
+    keyfile: str | None,
+    client_ca: str | None = None,
+) -> ssl.SSLContext | None:
+    """Return the server-side TLS context for the listener, or None.
+
+    An explicit ``ssl_context`` wins; otherwise ``certfile`` (with optional
+    ``keyfile``) is loaded into a fresh ``ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)``.
+    When ``client_ca`` is given the CA bundle is loaded via
+    ``load_verify_locations`` and ``verify_mode`` is set to
+    ``ssl.CERT_REQUIRED`` so every handshake must present a trusted client
+    certificate (issue #145). Contradictory or incomplete arguments raise
+    ``ValueError`` at startup: silently ignoring half a TLS configuration
+    would bind plaintext while the operator believes the listener is encrypted.
+    """
+    if ssl_context is not None:
+        if certfile is not None or keyfile is not None or client_ca is not None:
+            raise ValueError(
+                "pass either ssl_context or certfile/keyfile to serve(), not both"
+            )
+        return ssl_context
+    if certfile is None:
+        if keyfile is not None:
+            raise ValueError("keyfile requires certfile")
+        if client_ca is not None:
+            raise ValueError("client-ca requires certfile")
+        return None
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile, keyfile)
+    if client_ca is not None:
+        context.load_verify_locations(client_ca)
+        context.verify_mode = ssl.CERT_REQUIRED
+    return context
+
+
+class _TLSThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that terminates TLS inside the worker thread.
+
+    The listening socket stays a plain socket; each accepted connection is
+    wrapped (and its TLS handshake driven) in ``finish_request``, which
+    ThreadingMixIn already runs on the per-connection worker thread. A client
+    that opens a connection and stalls the handshake therefore ties up only
+    its own thread, not the accept loop: one slow or hostile peer cannot
+    freeze every other sender (the failure mode of wrapping the listener
+    itself, where ``accept()`` performs the handshake inline).
+
+    The accepted socket also gets the configured read timeout *before* it is
+    wrapped, so the handshake phase is bounded too (issue #542). Without it the
+    timeout only takes effect in ``StreamRequestHandler.setup`` -- *after*
+    ``wrap_socket`` returns -- and a peer that never sends its ClientHello
+    parks its worker thread and socket FD forever; a few hundred such peers
+    exhaust both and the sidecar stops serving.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        snagline_ssl_context: ssl.SSLContext,
+        snagline_read_timeout: float,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.snagline_ssl_context = snagline_ssl_context
+        self.snagline_read_timeout = snagline_read_timeout
+
+    def finish_request(self, request: Any, client_address: Any) -> None:
+        try:
+            # Bound the handshake: wrap_socket() drives it synchronously with
+            # do_handshake_on_connect=True, and this socket has no timeout
+            # until setup() runs on the other side of this call.
+            request.settimeout(self.snagline_read_timeout)
+            tls_request = self.snagline_ssl_context.wrap_socket(
+                request, server_side=True
+            )
+        except (ssl.SSLError, OSError):
+            # Failed handshake (plaintext probe against the TLS port, port
+            # scan, stale client): drop this one connection and keep serving.
+            # Fail-open per project.md §1.2; never surface as a serving error.
+            # socket.timeout is a subclass of OSError, so a handshake that
+            # stalls past the read timeout lands here as well.
+            logger.debug(
+                "snagline sidecar: TLS handshake failed from %s:%s",
+                client_address[0],
+                client_address[1],
+                exc_info=True,
+            )
+            return
+        # Annotated locally: typeshed binds this call's server parameter to
+        # Self, which the subclass indirection here trips over.
+        handler_class: Any = self.RequestHandlerClass
+        handler_class(tls_request, client_address, self)
+
+
+def make_server(
+    monitor: Monitor,
+    host: str = "127.0.0.1",
+    port: int = 8787,
+    auth_token: str | None = None,
+    max_body_bytes: int = 1_000_000,
+    max_risks: int = 1000,
+    metrics_format: str | None = None,
+    read_timeout: float | None = None,
+    episode_ttl_seconds: float | None = None,
+    ssl_context: ssl.SSLContext | None = None,
+    certfile: str | None = None,
+    keyfile: str | None = None,
+    client_ca: str | None = None,
+) -> ThreadingHTTPServer:
+    """Construct a ready-to-``serve_forever()`` sidecar server.
+
+    With ``ssl_context`` or ``certfile``/``keyfile`` the sidecar speaks
+    HTTPS directly (issue #120): connections are wrapped server-side via
+    stdlib ``ssl`` with the handshake running on each connection's own
+    worker thread. Without them the server is plain HTTP, exactly as before.
+    ``read_timeout`` bounds stalled body reads (issue #130) and, with TLS on,
+    the handshake itself (issue #542); ``None`` resolves
+    via ``SNAGLINE_SERVER_READ_TIMEOUT`` / ``Config.server_read_timeout``.
+    ``episode_ttl_seconds`` sets the TTL for ``snagline_episodes_active`` ids;
+    ``None`` resolves via ``SNAGLINE_EPISODE_TTL_SECONDS`` / ``Config.episode_ttl_seconds``
+    and defaults to disabled (see ``_resolve_episode_ttl``). When
+    ``client_ca`` is given the server requests a client certificate on
+    every handshake and verifies it against that CA bundle (issue #145).
+    """
+    tls_context = _resolve_ssl_context(ssl_context, certfile, keyfile, client_ca)
+    # Resolve once and share it with the handler so the handshake bound here
+    # and the body-read bound in setup() are always the same number.
+    resolved_read_timeout = _resolve_read_timeout(read_timeout)
+    handler = make_handler(
+        monitor,
+        auth_token,
+        max_body_bytes,
+        max_risks,
+        metrics_format,
+        resolved_read_timeout,
+        episode_ttl_seconds,
+    )
+    if tls_context is None:
+        return ThreadingHTTPServer((host, port), handler)
+    return _TLSThreadingHTTPServer(
+        (host, port),
+        handler,
+        snagline_ssl_context=tls_context,
+        snagline_read_timeout=resolved_read_timeout,
+    )
+
+
+def serve(
+    monitor: Monitor,
+    host: str = "127.0.0.1",
+    port: int = 8787,
+    auth_token: str | None = None,
+    max_body_bytes: int = 1_000_000,
+    max_risks: int = 1000,
+    metrics_format: str | None = None,
+    read_timeout: float | None = None,
+    episode_ttl_seconds: float | None = None,
+    ssl_context: ssl.SSLContext | None = None,
+    certfile: str | None = None,
+    keyfile: str | None = None,
+    client_ca: str | None = None,
+) -> None:
+    """Run the sidecar server in the foreground until interrupted."""
+    tls_enabled = ssl_context is not None or certfile is not None
+    server = make_server(
+        monitor,
+        host=host,
+        port=port,
+        auth_token=auth_token,
+        max_body_bytes=max_body_bytes,
+        max_risks=max_risks,
+        metrics_format=metrics_format,
+        read_timeout=read_timeout,
+        episode_ttl_seconds=episode_ttl_seconds,
+        ssl_context=ssl_context,
+        certfile=certfile,
+        keyfile=keyfile,
+        client_ca=client_ca,
+    )
+    logger.info(
+        "snagline sidecar listening on %s://%s:%d (POST /events, GET /health)%s",
+        "https" if tls_enabled else "http",
+        host,
+        port,
+        "" if auth_token else " -- no auth token set, all endpoints are open",
+    )
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()

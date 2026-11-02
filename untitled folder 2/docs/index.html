@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CONTINUUM: Verifiable Semantic Recovery for AI Agents</title>
+  <meta name="description" content="Framework-agnostic semantic recovery layer for long-running AI agents. 13 MCP tools, 55 CLI commands, 3950 tests. Deny-by-default, crash-recovery proven.">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" type="image/png" href="assets/favicon.png">
+</head>
+<body>
+
+  <div class="scroll-progress" id="scrollProgress"></div>
+<div class="global-background">
+    <svg width="0" height="0" style="position:absolute">
+      <defs>
+        <filter id="cloudBlur">
+          <feGaussianBlur stdDeviation="6"/>
+        </filter>
+        <filter id="cloudHalo">
+          <feGaussianBlur stdDeviation="22"/>
+        </filter>
+        <linearGradient id="cloudFill" x1="0%" y1="0%" x2="0%" y2="100%">
+          <stop offset="0%" style="stop-color:rgba(255,255,255,0.55);"/>
+          <stop offset="50%" style="stop-color:rgba(245,250,255,0.42);"/>
+          <stop offset="100%" style="stop-color:rgba(220,238,250,0.20);"/>
+        </linearGradient>
+      </defs>
+    </svg>
+    <div class="clouds">
+      <!-- Cloud A: large, upper left -->
+      <div class="cloud cloud-a">
+        <svg viewBox="0 0 300 120" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M5 88 C8 75, 22 72, 38 74 C48 58, 65 52, 82 55 C92 40, 112 35, 132 38 C152 28, 175 32, 195 38 C215 32, 235 42, 250 52 C262 58, 275 68, 278 80 C280 92, 270 100, 252 102 C232 106, 208 102, 185 103 C162 106, 138 102, 115 103 C92 106, 72 102, 54 101 C36 100, 18 98, 8 94 C4 92, 2 90, 5 88 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)"/>
+        </svg>
+        <svg viewBox="0 0 300 120" xmlns="http://www.w3.org/2000/svg" class="cloud-halo">
+          <path d="M5 88 C8 75, 22 72, 38 74 C48 58, 65 52, 82 55 C92 40, 112 35, 132 38 C152 28, 175 32, 195 38 C215 32, 235 42, 250 52 C262 58, 275 68, 278 80 C280 92, 270 100, 252 102 C232 106, 208 102, 185 103 C162 106, 138 102, 115 103 C92 106, 72 102, 54 101 C36 100, 18 98, 8 94 C4 92, 2 90, 5 88 Z" fill="rgba(255,255,255,0.12)" filter="url(#cloudHalo)"/>
+        </svg>
+      </div>
+
+      <!-- Cloud B: medium, upper area -->
+      <div class="cloud cloud-b">
+        <svg viewBox="0 0 210 85" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M4 64 C6 54, 18 51, 30 53 C38 40, 50 36, 64 38 C72 28, 88 24, 104 26 C120 20, 138 24, 152 28 C166 24, 180 32, 190 40 C198 45, 205 54, 206 64 C207 74, 200 80, 188 82 C174 85, 158 82, 142 83 C126 85, 110 82, 96 83 C82 85, 68 82, 56 82 C44 83, 32 82, 22 80 C12 79, 6 76, 4 72 C2 70, 2 68, 4 64 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)"/>
+        </svg>
+        <svg viewBox="0 0 210 85" xmlns="http://www.w3.org/2000/svg" class="cloud-halo">
+          <path d="M4 64 C6 54, 18 51, 30 53 C38 40, 50 36, 64 38 C72 28, 88 24, 104 26 C120 20, 138 24, 152 28 C166 24, 180 32, 190 40 C198 45, 205 54, 206 64 C207 74, 200 80, 188 82 C174 85, 158 82, 142 83 C126 85, 110 82, 96 83 C82 85, 68 82, 56 82 C44 83, 32 82, 22 80 C12 79, 6 76, 4 72 C2 70, 2 68, 4 64 Z" fill="rgba(255,255,255,0.10)" filter="url(#cloudHalo)"/>
+        </svg>
+      </div>
+
+      <!-- Cloud C: large, upper right (partially clipped) -->
+      <div class="cloud cloud-c">
+        <svg viewBox="0 0 340 135" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M5 100 C8 85, 25 80, 45 82 C58 65, 78 58, 98 62 C112 45, 138 38, 162 42 C188 30, 222 36, 248 42 C268 36, 290 48, 308 62 C322 72, 335 86, 338 100 C340 115, 328 125, 308 128 C285 132, 258 128, 232 129 C206 132, 180 128, 155 129 C130 132, 108 128, 86 128 C64 130, 44 128, 28 126 C14 124, 6 120, 5 116 C3 113, 3 110, 5 106 C4 103, 4 101, 5 100 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)"/>
+        </svg>
+        <svg viewBox="0 0 340 135" xmlns="http://www.w3.org/2000/svg" class="cloud-halo">
+          <path d="M5 100 C8 85, 25 80, 45 82 C58 65, 78 58, 98 62 C112 45, 138 38, 162 42 C188 30, 222 36, 248 42 C268 36, 290 48, 308 62 C322 72, 335 86, 338 100 C340 115, 328 125, 308 128 C285 132, 258 128, 232 129 C206 132, 180 128, 155 129 C130 132, 108 128, 86 128 C64 130, 44 128, 28 126 C14 124, 6 120, 5 116 C3 113, 3 110, 5 106 C4 103, 4 101, 5 100 Z" fill="rgba(255,255,255,0.10)" filter="url(#cloudHalo)"/>
+        </svg>
+      </div>
+
+      <!-- Cloud D: small, mid right -->
+      <div class="cloud cloud-d">
+        <svg viewBox="0 0 180 70" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M3 54 C5 44, 14 41, 26 43 C34 32, 46 28, 58 30 C66 22, 80 18, 94 20 C108 15, 124 18, 136 22 C148 19, 160 26, 168 34 C174 38, 178 46, 179 54 C180 62, 174 68, 164 70 C152 73, 138 70, 124 71 C110 73, 96 70, 84 71 C72 73, 60 70, 50 70 C40 71, 30 70, 22 68 C12 67, 5 64, 3 60 C1 58, 1 56, 3 54 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)"/>
+        </svg>
+        <svg viewBox="0 0 180 70" xmlns="http://www.w3.org/2000/svg" class="cloud-halo">
+          <path d="M3 54 C5 44, 14 41, 26 43 C34 32, 46 28, 58 30 C66 22, 80 18, 94 20 C108 15, 124 18, 136 22 C148 19, 160 26, 168 34 C174 38, 178 46, 179 54 C180 62, 174 68, 164 70 C152 73, 138 70, 124 71 C110 73, 96 70, 84 71 C72 73, 60 70, 50 70 C40 71, 30 70, 22 68 C12 67, 5 64, 3 60 C1 58, 1 56, 3 54 Z" fill="rgba(255,255,255,0.08)" filter="url(#cloudHalo)"/>
+        </svg>
+      </div>
+
+      <!-- Cloud E: medium, lower left -->
+      <div class="cloud cloud-e">
+        <svg viewBox="0 0 250 100" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M4 78 C6 65, 18 61, 32 63 C42 48, 56 42, 72 44 C84 30, 102 25, 122 28 C142 20, 164 24, 182 30 C198 26, 216 34, 228 46 C238 52, 246 64, 248 76 C250 88, 242 96, 228 100 C212 104, 194 100, 176 101 C158 104, 140 100, 124 101 C108 104, 92 100, 78 101 C64 104, 52 100, 42 99 C32 98, 22 96, 14 94 C8 92, 4 90, 3 87 C2 85, 2 83, 3 81 C3 79, 3 78, 4 78 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)"/>
+        </svg>
+        <svg viewBox="0 0 250 100" xmlns="http://www.w3.org/2000/svg" class="cloud-halo">
+          <path d="M4 78 C6 65, 18 61, 32 63 C42 48, 56 42, 72 44 C84 30, 102 25, 122 28 C142 20, 164 24, 182 30 C198 26, 216 34, 228 46 C238 52, 246 64, 248 76 C250 88, 242 96, 228 100 C212 104, 194 100, 176 101 C158 104, 140 100, 124 101 C108 104, 92 100, 78 101 C64 104, 52 100, 42 99 C32 98, 22 96, 14 94 C8 92, 4 90, 3 87 C2 85, 2 83, 3 81 C3 79, 3 78, 4 78 Z" fill="rgba(255,255,255,0.08)" filter="url(#cloudHalo)"/>
+        </svg>
+      </div>
+
+      <!-- Cloud F: large, lower right -->
+      <div class="cloud cloud-f">
+        <svg viewBox="0 0 300 120" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M5 88 C8 72, 24 68, 42 70 C55 52, 75 45, 95 48 C110 32, 135 26, 158 30 C182 22, 210 28, 232 34 C252 28, 272 40, 286 54 C296 64, 300 78, 298 92 C295 106, 282 114, 262 116 C240 120, 215 116, 192 117 C168 120, 145 116, 122 117 C100 120, 80 116, 62 115 C44 114, 28 112, 16 108 C8 105, 4 102, 3 98 C2 95, 2 92, 4 89 C4 88, 5 88, 5 88 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)"/>
+        </svg>
+        <svg viewBox="0 0 300 120" xmlns="http://www.w3.org/2000/svg" class="cloud-halo">
+          <path d="M5 88 C8 72, 24 68, 42 70 C55 52, 75 45, 95 48 C110 32, 135 26, 158 30 C182 22, 210 28, 232 34 C252 28, 272 40, 286 54 C296 64, 300 78, 298 92 C295 106, 282 114, 262 116 C240 120, 215 116, 192 117 C168 120, 145 116, 122 117 C100 120, 80 116, 62 115 C44 114, 28 112, 16 108 C8 105, 4 102, 3 98 C2 95, 2 92, 4 89 C4 88, 5 88, 5 88 Z" fill="rgba(255,255,255,0.08)" filter="url(#cloudHalo)"/>
+        </svg>
+      </div>
+
+      <!-- Additional clouds for fuller sky -->
+
+      <!-- Cloud G: small, far upper left -->
+      <div class="cloud cloud-g">
+        <svg viewBox="0 0 150 60" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M2 50 C2 42, 10 38, 20 40 C26 30, 36 26, 48 28 C56 20, 70 16, 84 18 C98 12, 116 16, 130 22 C142 26, 148 36, 147 46 C145 54, 136 58, 125 56 C112 59, 98 56, 85 57 C72 58, 60 56, 50 56 C40 57, 30 55, 22 53 C14 51, 8 48, 4 45 C2 43, 2 42, 2 50 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)" opacity="0.7"/>
+        </svg>
+      </div>
+
+      <!-- Cloud H: medium, center top -->
+      <div class="cloud cloud-h">
+        <svg viewBox="0 0 230 90" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M3 75 C3 64, 16 58, 34 62 C46 48, 64 40, 84 44 C100 32, 124 26, 148 30 C170 22, 196 30, 214 42 C226 50, 232 64, 230 78 C226 90, 214 96, 198 94 C180 97, 160 93, 142 94 C124 96, 108 93, 94 94 C80 96, 68 93, 58 92 C48 91, 38 88, 32 84 C26 80, 22 75, 20 70 C18 66, 18 62, 20 58 C22 54, 26 52, 30 52 C34 52, 38 54, 42 58 C46 62, 48 66, 48 70 C48 74, 46 78, 42 82 C38 86, 34 88, 30 88 C26 88, 22 86, 20 82 C18 78, 18 74, 20 70" fill="url(#cloudFill)" filter="url(#cloudBlur)" opacity="0.6"/>
+        </svg>
+      </div>
+
+      <!-- Cloud I: small, right edge -->
+      <div class="cloud cloud-i">
+        <svg viewBox="0 0 160 65" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M2 54 C2 44, 12 40, 24 42 C32 32, 44 28, 58 30 C68 22, 84 18, 100 20 C114 14, 132 18, 144 26 C154 32, 158 44, 156 54 C153 62, 144 66, 132 64 C118 67, 104 63, 92 64 C80 66, 68 63, 58 63 C48 64, 38 62, 30 60 C22 58, 14 55, 10 52 C6 49, 4 46, 4 42 C4 40, 4 38, 6 36 C8 34, 10 33, 14 33 C18 33, 22 35, 24 38 C26 41, 26 44, 24 47 C22 50, 18 52, 14 52 C10 52, 6 50, 4 47 C2 44, 2 42, 4 40 C6 38, 10 38, 14 40 C18 42, 20 46, 20 50 C20 54, 18 58, 14 60 C10 62, 6 62, 4 60 C2 58, 2 56, 4 54 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)" opacity="0.5"/>
+        </svg>
+      </div>
+
+      <!-- Cloud A copies with different sizes and opacities -->
+      <div class="cloud cloud-a-copy-1">
+        <svg viewBox="0 0 300 120" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M5 88 C8 75, 22 72, 38 74 C48 58, 65 52, 82 55 C92 40, 112 35, 132 38 C152 28, 175 32, 195 38 C215 32, 235 42, 250 52 C262 58, 275 68, 278 80 C280 92, 270 100, 252 102 C232 106, 208 102, 185 103 C162 106, 138 102, 115 103 C92 106, 72 102, 54 101 C36 100, 18 98, 8 94 C4 92, 2 90, 5 88 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)"/>
+        </svg>
+      </div>
+
+      <div class="cloud cloud-a-copy-2">
+        <svg viewBox="0 0 300 120" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M5 88 C8 75, 22 72, 38 74 C48 58, 65 52, 82 55 C92 40, 112 35, 132 38 C152 28, 175 32, 195 38 C215 32, 235 42, 250 52 C262 58, 275 68, 278 80 C280 92, 270 100, 252 102 C232 106, 208 102, 185 103 C162 106, 138 102, 115 103 C92 106, 72 102, 54 101 C36 100, 18 98, 8 94 C4 92, 2 90, 5 88 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)"/>
+        </svg>
+      </div>
+
+      <div class="cloud cloud-a-copy-3">
+        <svg viewBox="0 0 300 120" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M5 88 C8 75, 22 72, 38 74 C48 58, 65 52, 82 55 C92 40, 112 35, 132 38 C152 28, 175 32, 195 38 C215 32, 235 42, 250 52 C262 58, 275 68, 278 80 C280 92, 270 100, 252 102 C232 106, 208 102, 185 103 C162 106, 138 102, 115 103 C92 106, 72 102, 54 101 C36 100, 18 98, 8 94 C4 92, 2 90, 5 88 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)"/>
+        </svg>
+      </div>
+
+      <div class="cloud cloud-a-copy-4">
+        <svg viewBox="0 0 300 120" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M5 88 C8 75, 22 72, 38 74 C48 58, 65 52, 82 55 C92 40, 112 35, 132 38 C152 28, 175 32, 195 38 C215 32, 235 42, 250 52 C262 58, 275 68, 278 80 C280 92, 270 100, 252 102 C232 106, 208 102, 185 103 C162 106, 138 102, 115 103 C92 106, 72 102, 54 101 C36 100, 18 98, 8 94 C4 92, 2 90, 5 88 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)"/>
+        </svg>
+      </div>
+
+      <div class="cloud cloud-a-copy-5">
+        <svg viewBox="0 0 300 120" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M5 88 C8 75, 22 72, 38 74 C48 58, 65 52, 82 55 C92 40, 112 35, 132 38 C152 28, 175 32, 195 38 C215 32, 235 42, 250 52 C262 58, 275 68, 278 80 C280 92, 270 100, 252 102 C232 106, 208 102, 185 103 C162 106, 138 102, 115 103 C92 106, 72 102, 54 101 C36 100, 18 98, 8 94 C4 92, 2 90, 5 88 Z" fill="url(#cloudFill)" filter="url(#cloudBlur)"/>
+        </svg>
+      </div>
+
+      <!-- Prettiest cloud - big, bright white -->
+      <div class="cloud cloud-pretty">
+        <svg viewBox="0 0 350 140" xmlns="http://www.w3.org/2000/svg" class="cloud-body">
+          <path d="M5 120 C5 105, 20 98, 40 100 C55 80, 78 72, 100 76 C115 58, 142 50, 168 54 C195 42, 228 50, 255 62 C278 54, 305 68, 322 86 C335 100, 342 118, 338 132 C332 148, 315 156, 292 152 C268 156, 242 150, 218 152 C195 155, 172 150, 152 151 C130 154, 112 148, 95 146 C78 145, 62 140, 50 134 C38 128, 28 120, 22 112 C16 104, 12 95, 14 86 C16 78, 22 72, 32 70 C42 68, 52 72, 60 80 C68 88, 72 98, 68 108 C64 118, 56 124, 46 122 C36 120, 28 112, 30 102 C32 92, 40 84, 50 86 C60 88, 66 96, 64 104 C62 112, 56 118, 48 116 C40 114, 34 106, 36 98 C38 90, 44 84, 52 88 C60 92, 64 100, 62 108 C60 116, 54 120, 46 118 C38 116, 34 108, 36 100 C38 92, 44 88, 52 92 C60 96, 64 104, 62 112 C60 120, 54 124, 46 122 C38 120, 34 112, 36 104 C38 96, 44 92, 52 96 C60 100, 64 108, 62 116 C60 124, 54 128, 46 126 C38 124, 34 116, 36 108" fill="url(#cloudFill)" filter="url(#cloudBlur)" opacity="0.95"/>
+        </svg>
+        <svg viewBox="0 0 350 140" xmlns="http://www.w3.org/2000/svg" class="cloud-halo">
+          <path d="M5 120 C5 105, 20 98, 40 100 C55 80, 78 72, 100 76 C115 58, 142 50, 168 54 C195 42, 228 50, 255 62 C278 54, 305 68, 322 86 C335 100, 342 118, 338 132 C332 148, 315 156, 292 152 C268 156, 242 150, 218 152 C195 155, 172 150, 152 151 C130 154, 112 148, 95 146 C78 145, 62 140, 50 134 C38 128, 28 120, 22 112 C16 104, 12 95, 14 86 C16 78, 22 72, 32 70 C42 68, 52 72, 60 80 C68 88, 72 98, 68 108 C64 118, 56 124, 46 122 C36 120, 28 112, 30 102 C32 92, 40 84, 50 86 C60 88, 66 96, 64 104 C62 112, 56 118, 48 116 C40 114, 34 106, 36 98 C38 90, 44 84, 50 88 C60 92, 64 100, 62 108 C60 116, 54 120, 46 118 C38 116, 34 108, 36 100 C38 92, 44 88, 52 92 C60 96, 64 104, 62 112 C60 120, 54 124, 46 122 C38 120, 34 112, 36 104 C38 96, 44 92, 52 96 C60 100, 64 108, 62 116 C60 124, 54 128, 46 126 C38 124, 34 116, 36 108" fill="rgba(255,255,255,0.15)" filter="url(#cloudHalo)"/>
+        </svg>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- HERO -->
+  <section class="hero-canvas" id="top">
+    <div class="top-bar">
+      <div class="top-bar-left">
+        <img src="assets/logo.png" alt="CONTINUUM Logo" class="top-logo">
+        <span class="top-brand">CONTINUUM</span>
+        <span class="top-badge">v1</span>
+      </div>
+      <div class="top-ruler" id="topRuler"></div>
+      <div class="top-bar-right">
+        <a href="https://github.com/Cyrax321/CONTINUUM" target="_blank" rel="noopener" class="top-github">GitHub</a>
+        <span class="live-dot"></span>
+        <span class="live-text">LIVE &middot; <span id="liveTime">--:--:--</span></span>
+      </div>
+    </div>
+
+    <div class="nav-pill">
+      <a href="#features" class="nav-link">Features</a>
+      <a href="#mcp" class="nav-link">MCP</a>
+      <a href="#mcp-intro" class="nav-link">Safety</a>
+      <a href="architecture.html" class="nav-link">Architecture</a>
+      <a href="https://github.com/Cyrax321/CONTINUUM/blob/main/README.md" target="_blank" rel="noopener" class="nav-link">Docs</a>
+      <a href="api/cli.md" class="nav-link">CLI</a>
+      <a href="api/README.md" class="nav-link">API</a>
+      <a href="guides/README.md" class="nav-link">Guides</a>
+      <a href="research/README.md" class="nav-link">Research</a>
+      <a href="https://colab.research.google.com/github/Cyrax321/CONTINUUM/blob/main/examples/demo.ipynb" target="_blank" rel="noopener" class="nav-link">Demo</a>
+      <a href="mailto:cyrax8590@gmail.com" class="nav-link nav-contact">Contact</a>
+    </div>
+
+    <div class="status-pill status-available">
+      <span class="status-dot-sm"></span>
+      <span>open source</span>
+    </div>
+
+    <div class="status-pill status-email">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FF5017" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M22 6L12 13 2 6"/></svg>
+      <span>cyrax8590@gmail.com</span>
+    </div>
+
+    <div class="hero-content">
+      <div class="yc-badge">
+        <span>Open source under</span>
+        <span class="yc-orange">Apache-2.0</span>
+        <span>since 2026</span>
+      </div>
+
+      <h1 class="pixel-headline" aria-label="Agents that survive">
+        <span class="line-1">AGENTS THAT</span>
+        <span class="line-2">SURVIVE <span class="period">.</span></span>
+      </h1>
+
+      <div class="hero-tagline">we don't do forgotten context +</div>
+
+      <div class="hero-copy-box">
+        <div class="copy-handle tl"></div>
+        <div class="copy-handle tr"></div>
+        <div class="copy-handle bl"></div>
+        <div class="copy-handle br"></div>
+        <span class="copy-label">verified state</span>
+        <p class="hero-copy">Crashes happen. Context disappears. CONTINUUM remembers what actually matters, so nothing gets done twice.</p>
+      </div>
+
+    <div class="hero-ctas">
+      <a href="https://github.com/Cyrax321/CONTINUUM/blob/main/README.md" target="_blank" rel="noopener" class="cta-primary">View Documentation</a>
+      <a href="https://github.com/Cyrax321/CONTINUUM" target="_blank" rel="noopener" class="cta-secondary">GitHub</a>
+      </div>
+    </div>
+
+    <!-- Metrics refresh note: TESTS from `pytest --collect-only -q` (README canonical figure), MCP TOOLS from the @server.tool count in src/continuum/mcp/server.py, CLI COMMANDS from len(build_parser() choices). -->
+    <div class="bottom-copy bottom-left">
+      <div>3,950 TESTS COLLECTED</div>
+      <div class="muted">python 3.11, 3.12, 3.13</div>
+    </div>
+
+    <div class="bottom-copy bottom-right">
+      <div>13 MCP TOOLS</div>
+      <div class="muted">deny-by-default auth</div>
+    </div>
+
+    <div class="designer-cursor" id="designerCursor">
+      <svg width="12" height="16" viewBox="0 0 12 16" fill="#3B82F6"><path d="M0 0L12 10L6 10L4 16L0 0Z"/></svg>
+      <span>You</span>
+    </div>
+  </section>
+
+  <!-- WHY SWITCH -->
+  <section class="switch-section" id="why-switch">
+    <div class="switch-content">
+      <div class="switch-intro">
+        <p class="handwritten-label">why it matters</p>
+        <h2 class="switch-title">
+          <span class="line">SAME CRASH.</span>
+          <span class="line">DIFFERENT RECOVERY.</span>
+        </h2>
+      </div>
+
+      <div class="difference-frame">
+        <div class="compare-header">
+          <div class="compare-header-left">
+            <div class="browser-dots">
+              <span class="browser-dot red"></span>
+              <span class="browser-dot yellow"></span>
+              <span class="browser-dot green"></span>
+            </div>
+            <span class="file-name">recovery-compare</span>
+          </div>
+          <div class="compare-header-right">
+            <span class="file-percent">100%</span>
+            <div class="collaborators">
+              <span class="collab-avatar orange">V</span>
+              <span class="collab-avatar blue">M</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="compare-canvas">
+          <div class="compare-left">
+            <div class="left-header">
+              <span class="left-title">most frameworks</span>
+              <span class="locked-label">LOCKED</span>
+            </div>
+            <div class="left-list">
+              <div class="left-item"><span class="x-icon"></span> Full transcript replay, nothing verified.</div>
+              <div class="left-item"><span class="x-icon"></span> Replay every tool call after a crash.</div>
+              <div class="left-item"><span class="x-icon"></span> Duplicate side effects, silently.</div>
+              <div class="left-item"><span class="x-icon"></span> Five calls before a single recovery.</div>
+              <div class="left-item"><span class="x-icon"></span> Safe, on brand-ish, instantly forgettable.</div>
+            </div>
+          </div>
+
+          <div class="vs-badge">VS</div>
+
+          <div class="compare-right">
+            <div class="pick-badge">
+              <span class="pick-check"></span>
+              <span class="pick-label">pick this one</span>
+            </div>
+            <div class="right-header">
+              <span class="brand-icon"></span>
+              <span class="brand-name">Continuum</span>
+              <span class="editing-pill">RECOVERY</span>
+            </div>
+            <div class="right-list">
+              <div class="right-item"><span class="check-circle"></span> Semantic checkpoints, not conversation dumps.</div>
+              <div class="right-item"><span class="check-circle"></span> Resume from a semantic checkpoint, not from scratch.</div>
+              <div class="right-item"><span class="check-circle"></span> Idempotent action ledger, zero duplicates.</div>
+              <div class="right-item"><span class="check-circle"></span> Less replay. More resuming.</div>
+              <div class="right-item"><span class="check-circle"></span> Verified, inspectable, genuinely hard to lose.</div>
+            </div>
+            <span class="selected-tag">Continuum &middot; selected</span>
+          </div>
+        </div>
+
+        <div class="compare-footer">
+          <p class="footer-text">
+            <span class="text-dark">Same crash, same budget.</span><br>
+            <span class="text-orange">Wildly different recovery.</span>
+          </p>
+          <a href="#features" class="compare-btn">see the features &#8594;</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- AGENT RECOVERY INTRO -->
+  <section class="agent-recovery-intro">
+    <p class="agent-recovery-eyebra">agent recovery</p>
+    <h2 class="agent-recovery-title">NO LOST STATE. NO GUESSES. JUST RECOVERY.</h2>
+    <div class="agent-recovery-note">55 event types. 7 recovery modes. 6 checkpoint policies. Every component verified before resume.</div>
+  </section>
+
+  <!-- FEATURES -->
+  <section class="features-section" id="features">
+    <div class="features-card">
+      <div class="features-header">
+        <div class="header-top">
+          <span class="header-label">FEATURES</span>
+          <span class="header-pill">&#9679; 55 event types</span>
+        </div>
+        <h2 class="header-title">Built for agents that run for hours.</h2>
+        <p class="header-desc">55 event types. 7 recovery modes. 6 checkpoint policies. Hash-chained audit trail. Every component verified before resume.</p>
+        <div class="header-badge">&#10003; Verified before resume</div>
+      </div>
+
+      <div class="features-nav">
+        <span class="nav-left">CORE CAPABILITIES</span>
+        <span class="nav-right">6 FEATURES</span>
+      </div>
+
+      <div class="features-control">
+        <span class="control-text">AGENT RECOVERY SYSTEM</span>
+      </div>
+
+      <div class="features-label">EXPLORE THE CAPABILITIES</div>
+
+      <div class="features-list">
+        <div class="feat-item"><div class="feat-check"></div><div class="feat-content"><h4 class="feat-title">Semantic Checkpoints</h4><p class="feat-desc">Not a conversation dump. A compact, versioned tree of verified goals, decisions, findings, evidence, and pending tasks.</p></div></div>
+        <div class="feat-item"><div class="feat-check"></div><div class="feat-content"><h4 class="feat-title">Environment Validation</h4><p class="feat-desc">Every checkpoint component checked against the live environment. Staleness propagates through the dependency graph.</p></div></div>
+        <div class="feat-item"><div class="feat-check"></div><div class="feat-content"><h4 class="feat-title">Idempotent Action Ledger</h4><p class="feat-desc">7 action states. Two-phase claim/complete protocol. Raises UnknownSideEffect rather than guessing.</p></div></div>
+        <div class="feat-item"><div class="feat-check"></div><div class="feat-content"><h4 class="feat-title">Hash-Chained Events</h4><p class="feat-desc">Append-only event log with SHA-256 digests. verify() reports trusted_through for partial tamper recovery.</p></div></div>
+        <div class="feat-item"><div class="feat-check"></div><div class="feat-content"><h4 class="feat-title">Recovery Contracts</h4><p class="feat-desc">Deterministic, sealed with integrity hash. Names exactly one next permitted action.</p></div></div>
+        <div class="feat-item"><div class="feat-check"></div><div class="feat-content"><h4 class="feat-title">Provenance Tracking</h4><p class="feat-desc">Every state component traces to its origin event. Agent-reported state marked REQUIRES_REVIEW.</p></div></div>
+      </div>
+
+      <div class="features-advanced-divider"><span class="advanced-pill">ADVANCED RECOVERY</span></div>
+
+      <div class="features-advanced">
+        <div class="adv-item"><span class="adv-check"></span> Tamper recovery</div>
+        <div class="adv-item"><span class="adv-check"></span> Cross-environment validation</div>
+        <div class="adv-item"><span class="adv-check"></span> Full provenance graph</div>
+        <div class="adv-item"><span class="adv-check"></span> Automatic checkpoint replay</div>
+        <div class="adv-item"><span class="adv-check"></span> External-agent state reconciliation</div>
+        <div class="adv-item"><span class="adv-check"></span> Recovery contract enforcement</div>
+      </div>
+
+      <div class="features-cta">
+        <a href="#quickstart" class="cta-button">START BUILDING &#8594;</a>
+        <p class="cta-sub">Built for agents that don't forget.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- MCP SERVER INTRO -->
+  <section class="what-we-make-section" id="mcp-intro">
+    <div class="what-we-make-container">
+      <p class="what-we-make-eyebra">thirteen tools, one protocol</p>
+      <h2 class="what-we-make-title">DENY BY DEFAULT. WORKS WITH CLAUDE CODE.</h2>
+      <div class="what-we-make-note">Route external side effects through the ledger without embedding the library.</div>
+    </div>
+  </section>
+
+  <!-- MCP SERVER -->
+  <section class="mcp-section" id="mcp">
+    <div class="mcp-card">
+      <div class="mcp-top">
+        <div class="mcp-top-left">
+          <span class="mcp-eyebrow">MCP SERVER</span>
+          <h2 class="mcp-headline">13 tools. Deny-by-default.<br>Works with Claude Code.</h2>
+          <p class="mcp-desc">Route external side effects through the ledger without embedding the library.</p>
+        </div>
+        <div class="mcp-preview">
+          <div class="mcp-preview-header">
+            <span class="mcp-preview-dot"></span>
+            <span class="mcp-preview-dot"></span>
+            <span class="mcp-preview-dot"></span>
+            <span class="mcp-preview-title">mcp-server.ts</span>
+          </div>
+          <div class="mcp-preview-body">
+            <div class="mcp-preview-row"><span class="mcp-preview-num">01</span><span class="mcp-preview-name">record_progress</span></div>
+            <div class="mcp-preview-row"><span class="mcp-preview-num">02</span><span class="mcp-preview-name">checkpoint</span></div>
+            <div class="mcp-preview-row"><span class="mcp-preview-num">03</span><span class="mcp-preview-name">intercept_action</span></div>
+            <div class="mcp-preview-row"><span class="mcp-preview-num">04</span><span class="mcp-preview-name">complete_action</span></div>
+            <div class="mcp-preview-row"><span class="mcp-preview-num">05</span><span class="mcp-preview-name">fail_action</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="mcp-divider"></div>
+
+      <div class="mcp-lower">
+        <div class="mcp-lower-left">
+          <h3 class="mcp-lower-title">THE SERVER</h3>
+          <p class="mcp-lower-text">Route external side effects through the ledger without embedding the library. Mutating tools require caller authorization. Read-only tools stay open to everyone.</p>
+        </div>
+        <div class="mcp-lower-right">
+          <h3 class="mcp-lower-title">TOOLS</h3>
+          <div class="mcp-tools-grid">
+            <span class="mcp-tool-tag">continuum_record_progress</span>
+            <span class="mcp-tool-tag">continuum_checkpoint</span>
+            <span class="mcp-tool-tag">continuum_intercept_action</span>
+            <span class="mcp-tool-tag">continuum_complete_action</span>
+            <span class="mcp-tool-tag">continuum_fail_action</span>
+            <span class="mcp-tool-tag">continuum_reconcile_action</span>
+            <span class="mcp-tool-tag">continuum_validate</span>
+            <span class="mcp-tool-tag">continuum_resume</span>
+            <span class="mcp-tool-tag">continuum_list_actions</span>
+          </div>
+          <div class="mcp-auth">
+            <h4 class="mcp-auth-title">Authorization</h4>
+            <p class="mcp-auth-text">Mutating tools match callers against an allowlist from <code class="mcp-code">CONTINUUM_MCP_MUTATING_CLIENTS</code> env var or <code class="mcp-code">.continuum/mcp-policy.json</code>.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SIMULATOR -->
+  <section class="simulator-section" id="simulator">
+    <div class="section-header">
+      <h2 class="section-title">Interactive Fault Recovery Simulator</h2>
+      <p class="section-subtitle">Simulate real-world agent failures and inspect how CONTINUUM handles recovery contracts.</p>
+    </div>
+
+    <div class="sim-container">
+      <div class="sim-sidebar">
+        <div class="sim-sidebar-title">Select Failure Scenario</div>
+        <button class="sim-nav-btn active" data-scenario="crash">
+          <span>Process Crash / Restart</span>
+          <span class="sim-badge ok">RESUME</span>
+        </button>
+        <button class="sim-nav-btn" data-scenario="dataset">
+          <span>Environment Shift (v3 &rarr; v4)</span>
+          <span class="sim-badge warn">REPAIR</span>
+        </button>
+        <button class="sim-nav-btn" data-scenario="model">
+          <span>Model Switch (GPT-4 &rarr; Claude)</span>
+          <span class="sim-badge warn">MODEL</span>
+        </button>
+        <button class="sim-nav-btn" data-scenario="sideeffect">
+          <span>Uncertain Side Effect</span>
+          <span class="sim-badge err">HUMAN</span>
+        </button>
+      </div>
+
+      <div class="sim-main">
+        <div class="sim-topbar">
+          <div class="sim-tabs">
+            <button class="sim-tab-btn active" data-tab="terminal">Terminal Output</button>
+            <button class="sim-tab-btn" data-tab="state">Semantic State JSON</button>
+            <button class="sim-tab-btn" data-tab="contract">Recovery Contract JSON</button>
+          </div>
+          <span class="sim-version">continuum-cli v0.1.0</span>
+        </div>
+        <div class="sim-output-area" id="simOutputArea">
+          <!-- Dynamically populated by app.js -->
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- WHAT WE MAKE -->
+  <section class="what-we-make-section" id="what-we-make">
+    <div class="what-we-make-container">
+      <p class="what-we-make-eyebra">the good stuff</p>
+      <h2 class="what-we-make-title">WHAT WE MAKE</h2>
+      <div class="what-we-make-note">One library. Three surfaces: Python SDK, MCP server, CLI.</div>
+    </div>
+  </section>
+
+  <!-- QUICKSTART -->
+  <section class="quickstart-section" id="quickstart">
+    <div class="quickstart-card">
+      <div class="quickstart-header">
+        <p class="quickstart-eyebra">start building</p>
+        <h2 class="quickstart-title">Up and running in minutes</h2>
+        <p class="quickstart-note">On PyPI as <code>continuum-agent</code>, or install from a clone. The core library depends only on <code>pydantic</code>; the <code>mcp</code> extra adds the server.</p>
+      </div>
+
+      <div class="quickstart-grid">
+        <div class="qs-block">
+          <div class="qs-block-head">
+            <span class="qs-num">01</span>
+            <h3 class="qs-heading">Install</h3>
+          </div>
+          <div class="qs-code-wrap"><button class="qs-copy" type="button" aria-label="Copy code">Copy</button><pre class="qs-code"><code>git clone https://github.com/Cyrax321/CONTINUUM
+cd CONTINUUM
+uv venv
+uv pip install -e ".[dev]"</code></pre></div>
+          <p class="qs-text">Two entrypoints land on your PATH: <code>continuum</code> (the CLI) and <code>continuum-mcp</code> (the MCP server).</p>
+        </div>
+
+        <div class="qs-block">
+          <div class="qs-block-head">
+            <span class="qs-num">02</span>
+            <h3 class="qs-heading">Record a run</h3>
+          </div>
+          <div class="qs-code-wrap"><button class="qs-copy" type="button" aria-label="Copy code">Copy</button><pre class="qs-code"><code>from continuum import EventType, Run, SQLiteStorage
+
+store = SQLiteStorage("agent.db")
+store.create_run(Run(run_id="run_4821", goal="Analyze docs"))
+store.append_event("run_4821", EventType.RUN_STARTED, {"total": 10_000})</code></pre></div>
+          <p class="qs-text">Append events as the agent works. The chain is hash linked and verifiable after a crash.</p>
+        </div>
+
+        <div class="qs-block">
+          <div class="qs-block-head">
+            <span class="qs-num">03</span>
+            <h3 class="qs-heading">Resume</h3>
+          </div>
+          <div class="qs-code-wrap"><button class="qs-copy" type="button" aria-label="Copy code">Copy</button><pre class="qs-code"><code>continuum resume run_4821
+continuum validate run_4821</code></pre></div>
+          <p class="qs-text">Decide how a run may safely resume, or validate state against the live environment. See <code>python examples/crash_recovery_agent.py</code>.</p>
+        </div>
+      </div>
+
+      <div class="quickstart-cta">
+        <a href="https://github.com/Cyrax321/CONTINUUM/blob/main/README.md" target="_blank" rel="noopener" class="qs-btn">Read the full README &#8594;</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- METRICS & CAPABILITIES -->
+  <section class="metrics-section" id="metrics">
+    <div class="metrics-container">
+      <div class="metrics-card">
+        <span class="card-label">METRICS</span>
+        <div class="metrics-grid">
+          <div class="metric-row">
+            <span class="metric-value">3950<span class="accent">+</span></span>
+            <span class="metric-label">TESTS COLLECTED</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-value">47</span>
+            <span class="metric-label">CLI COMMANDS</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-value">13</span>
+            <span class="metric-label">MCP TOOLS</span>
+          </div>
+        </div>
+      </div>
+      <div class="capabilities-card">
+        <span class="card-label">CAPABILITIES</span>
+        <div class="capabilities-pills">
+          <span class="cap-pill">Semantic Recovery</span>
+          <span class="cap-pill">MCP Server</span>
+          <span class="cap-pill">State Validation</span>
+          <span class="cap-pill">Action Ledger</span>
+          <span class="cap-pill">Checkpointing</span>
+          <span class="cap-pill">Audit Chain</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ / NOSY SECTION -->
+  <section class="faq-section" id="faq">
+    <div class="faq-container">
+      <div class="faq-header">
+        <p class="faq-eyebra">ask away</p>
+        <h2 class="faq-title">THE NOSY SECTION</h2>
+        <div class="faq-note">everything you'd grill us on a call, minus the call.</div>
+      </div>
+      <div class="faq-list">
+        <div class="faq-item">
+          <div class="faq-tab"><span class="tab-icon"></span><span class="tab-label">HOW-IT-WORKS.FRAME</span></div>
+          <div class="faq-body">
+            <span class="faq-num">01</span>
+            <span class="faq-question">What exactly does CONTINUUM do?</span>
+            <button class="faq-plus" type="button" aria-expanded="false" aria-controls="faq-answer-1">+</button>
+          </div>
+          <div class="faq-answer" id="faq-answer-1">
+            <span class="answer-label">ANSWER</span>
+            <p class="answer-text">It is a recovery layer for long-running AI agents. When an agent crashes, it resumes from a compact semantic checkpoint (a versioned tree of verified goals, decisions, findings, evidence, and pending tasks) rather than replaying the whole conversation, and every component is revalidated against the live environment before it continues.</p>
+          </div>
+        </div>
+        <div class="faq-item">
+          <div class="faq-tab"><span class="tab-icon"></span><span class="tab-label">NEED-FOR-SPEED.FRAME</span></div>
+          <div class="faq-body">
+            <span class="faq-num">02</span>
+            <span class="faq-question">How is this different from just replaying the transcript?</span>
+            <button class="faq-plus" type="button" aria-expanded="false" aria-controls="faq-answer-2">+</button>
+          </div>
+          <div class="faq-answer" id="faq-answer-2">
+            <span class="answer-label">ANSWER</span>
+            <p class="answer-text">Replay re-runs every tool call and can repeat external side effects. CONTINUUM keeps a semantic state representation, an idempotent action ledger (claim/complete, with UnknownSideEffect raised rather than guessing), and a hash-chained append-only event log. Duplicate work and duplicate charges are refused, not merely hoped away.</p>
+          </div>
+        </div>
+        <div class="faq-item">
+          <div class="faq-tab"><span class="tab-icon"></span><span class="tab-label">THE-FIREHOSE.FRAME</span></div>
+          <div class="faq-body">
+            <span class="faq-num">03</span>
+            <span class="faq-question">What does "verified before resume" mean?</span>
+            <button class="faq-plus" type="button" aria-expanded="false" aria-controls="faq-answer-3">+</button>
+          </div>
+          <div class="faq-answer" id="faq-answer-3">
+            <span class="answer-label">ANSWER</span>
+            <p class="answer-text">Every checkpoint component is checked against the current environment, and staleness propagates through the dependency graph. Recovery contracts are deterministic and sealed with an integrity hash, naming exactly one next permitted action. Agent-reported progress carries provenance and is marked REQUIRES_REVIEW, so an agent cannot certify its own safety.</p>
+          </div>
+        </div>
+        <div class="faq-item">
+          <div class="faq-tab"><span class="tab-icon"></span><span class="tab-label">THE-WHOLE-THING.FRAME</span></div>
+          <div class="faq-body">
+            <span class="faq-num">04</span>
+            <span class="faq-question">Does it work with my agent framework?</span>
+            <button class="faq-plus" type="button" aria-expanded="false" aria-controls="faq-answer-4">+</button>
+          </div>
+          <div class="faq-answer" id="faq-answer-4">
+            <span class="answer-label">ANSWER</span>
+            <p class="answer-text">It is framework-agnostic. There are adapters for generic Python, the OpenAI Agents SDK, LangGraph, and LangChain, plus a deny-by-default MCP server (13 tools) that lets Claude Code and other MCP clients route side effects through the ledger without embedding the library.</p>
+          </div>
+        </div>
+        <div class="faq-item">
+          <div class="faq-tab"><span class="tab-icon"></span><span class="tab-label">THE-DO-OVER.FRAME</span></div>
+          <div class="faq-body">
+            <span class="faq-num">05</span>
+            <span class="faq-question">Is it ready to use today?</span>
+            <button class="faq-plus" type="button" aria-expanded="false" aria-controls="faq-answer-5">+</button>
+          </div>
+          <div class="faq-answer" id="faq-answer-5">
+            <span class="answer-label">ANSWER</span>
+            <p class="answer-text">Phases 1-11 of the roadmap are complete: event log, semantic state, SQLite persistence, checkpointing, validation, the action ledger, the recovery engine, the CLI, crash-recovery examples, and framework adapters. The benchmark suite, cloud API, and dashboard are planned next. Known limitations are tracked openly in STATUS.md and the issue tracker.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CONTRIBUTE CTA -->
+  <section class="nothing-section" id="contribute">
+    <div class="nothing-glow"></div>
+    <div class="nothing-container">
+      <p class="nothing-eyebra">open source, contributions welcome</p>
+      <h2 class="nothing-headline">
+        <span>GOOD FIRST ISSUES</span>
+        <span>ARE <span class="orange">LABELED</span></span>
+      </h2>
+      <p class="nothing-text">Bug reports, adapters, benchmarks, docs. The issue tracker and CONTRIBUTING.md tell you where to start.</p>
+      <a href="https://github.com/Cyrax321/CONTINUUM/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22" target="_blank" rel="noopener" class="nothing-btn" style="text-decoration:none;">
+        <span>Start contributing</span>
+        <svg class="btn-cursor" width="14" height="16" viewBox="0 0 14 16" fill="none"><path d="M2 2L12 11L7 11L5 16L2 2Z" fill="white"/></svg>
+      </a>
+    </div>
+  </section>
+
+  <!-- FOOTER -->
+  <footer class="footer-premium">
+    <div class="footer-container">
+      <div class="footer-inner">
+        <div class="footer-header">
+          <div class="footer-brand">
+            <div class="footer-logo-dot"></div>
+            <span class="footer-label">CONTINUUM</span>
+          </div>
+          <button class="scroll-top-btn" id="scrollTopBtn" aria-label="Scroll to top">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 15l-6-6-6 6"/></svg>
+          </button>
+        </div>
+
+        <div class="footer-main">
+          <div class="footer-contact">
+            <p class="footer-eyebrow">HAVE AN AGENT THAT NEEDS RECOVERY?</p>
+            <a href="mailto:cyrax8590@gmail.com" class="footer-email">
+              <span>cyrax8590@gmail.com</span>
+              <span class="email-arrow">&#8599;</span>
+            </a>
+            <div class="footer-cta-row">
+              <a href="mailto:cyrax8590@gmail.com" class="footer-cta">Start building &#8594;</a>
+              <div class="footer-status">
+                <span class="status-dot"></span>
+                <span class="status-text">open source</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="footer-nav">
+            <div class="footer-nav-col">
+              <div class="footer-nav-heading">PRODUCT</div>
+              <ul>
+                <li><a href="#features">Features</a></li>
+                <li><a href="#mcp">MCP Server</a></li>
+                <li><a href="api/cli.md">CLI Reference</a></li>
+                <li><a href="#simulator">Simulator</a></li>
+                <li><a href="#quickstart">Quickstart</a></li>
+              </ul>
+            </div>
+            <div class="footer-nav-col">
+              <div class="footer-nav-heading">RESOURCES</div>
+              <ul>
+                <li><a href="https://github.com/Cyrax321/CONTINUUM/blob/main/README.md" target="_blank" rel="noopener">Documentation</a></li>
+                <li><a href="architecture.html">Architecture</a></li>
+                <li><a href="api/README.md">API Reference</a></li>
+                <li><a href="guides/README.md">Operator Guides</a></li>
+                <li><a href="GLOSSARY.md">Glossary</a></li>
+                <li><a href="concepts/README.md">Concepts</a></li>
+                <li><a href="research/README.md">Research Notes</a></li>
+                <li><a href="https://colab.research.google.com/github/Cyrax321/CONTINUUM/blob/main/examples/demo.ipynb" target="_blank" rel="noopener">Demo (Colab)</a></li>
+                <li><a href="https://mybinder.org/v2/gh/Cyrax321/CONTINUUM/HEAD?labpath=examples%2Fdemo.ipynb" target="_blank" rel="noopener">Demo (Binder)</a></li>
+                <li><a href="https://github.com/Cyrax321/CONTINUUM" target="_blank" rel="noopener">GitHub</a></li>
+                <li><a href="https://github.com/Cyrax321/CONTINUUM/blob/main/LICENSE" target="_blank" rel="noopener">License</a></li>
+              </ul>
+            </div>
+            <div class="footer-nav-col">
+              <div class="footer-nav-heading">CONNECT</div>
+              <ul>
+                <li><a href="https://github.com/Cyrax321/CONTINUUM" target="_blank" rel="noopener">GitHub</a></li>
+                <li><a href="mailto:cyrax8590@gmail.com">Email</a></li>
+                <li><a href="https://www.linkedin.com/in/anandhupshaji/" target="_blank" rel="noopener">LinkedIn</a></li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="footer-giant">
+          <span class="giant-o">c</span><span>ontinuum</span>
+        </div>
+
+        <div class="footer-divider"></div>
+
+        <div class="footer-meta">
+          <div class="meta-left">
+            <span class="meta-square"></span>
+            <span>continuum-mcp</span>
+          </div>
+          <div class="meta-center">
+            <span class="meta-dot"></span>
+            <span>apache-2.0 </span>
+            <span class="meta-time" id="footerTime">--:-- IST</span>
+          </div>
+          <div class="meta-right">
+            <span>&copy; 2026 &middot; made by continuum, not ai</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <script src="app.js?v=2"></script>
+</body>
+</html>

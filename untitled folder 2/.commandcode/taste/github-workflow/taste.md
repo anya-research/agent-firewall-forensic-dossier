@@ -1,0 +1,16 @@
+# GitHub / PR workflow
+
+- Check `main` branch protection before attempting a merge: it currently requires 1 approving review, code-owner reviews, dismissal of stale reviews, last-push approval, and a set of required status checks. Confidence: 0.9
+- `require_last_push_approval` means the last pusher's own approval does not satisfy the review gate; arrange approval from another write-capable account or ask the contributor. Confidence: 0.9
+- Fork PRs' workflow runs sit in `action_required` until a maintainer approves each run through the Actions API; approve them explicitly or CI never starts. Confidence: 0.85
+- Merge is blocked while any review thread is unresolved: reply to every bot/human thread with concrete evidence, then resolve it via the GraphQL `resolveReviewThread` mutation. Confidence: 0.85
+- `gh` has multiple logged-in accounts (e.g. Cyrax321, anya-research). A `GH_TOKEN`/`GITHUB_TOKEN` env var silently overrides the active `gh` account — unset it or run `gh auth switch --user <login>` before acting as a specific identity. Confidence: 0.85
+- A fine-grained PAT (the `anya-research` account) can lack review-creation scope, so `gh pr review` fails for it even though the account has write access; check token scopes before assuming an account can approve. Confidence: 0.85
+- When pushing to a contributor's fork, verify their original commits remain ancestors of the pushed branch (fast-forward, no history rewrite). Confidence: 0.75
+- Do not post top-level comments on issues or PRs (notes to other contributors, "please approve" requests, status pings) unless the user explicitly asks — the user treats unsolicited agent comments as noise and asks for them to be deleted. Review-thread replies needed to unblock a merge are a separate case. Confidence: 0.85
+- When the user asks to remove something you posted, delete every matching artifact you created across issues and PRs (not just the first one), and report the outcome per artifact, including ones that were already absent. Confidence: 0.75
+- GitHub's contribution graph counts a commit once per ref it appears in (default branch + feature branch + PR head), so identical commits can multiply a day's total; reconcile a day's count by summing per-ref counts, not unique SHAs. Confidence: 0.85
+- The contribution graph is a historical ledger of pushes, not recomputed from currently reachable commits — force-pushing a rewritten branch does not retroactively clear an inflated day's count; that needs deleting/recreating the repo or GitHub Support. Confidence: 0.8
+- After force-pushing rewritten history, local branches in the clone may still hold the old commits, and a later `git push --all` would resurrect them — reset/delete the local refs as part of any history cleanup. Confidence: 0.8
+- Before deleting a repo (e.g. to recreate it), snapshot everything needed for a faithful recreation: description, homepage, topics, visibility, default branch, feature toggles (issues/wiki/projects/discussions), license and stargazers. Confidence: 0.8
+- Deleting and recreating a public repo is not expected to clear its contribution-graph tiles (the push ledger persists); treat delete/recreate as unproven and verify with a throwaway repo before relying on it as a graph fix. Confidence: 0.7

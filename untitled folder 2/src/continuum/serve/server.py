@@ -1,0 +1,1259 @@
+"""The CONTINUUM sidecar: a language-agnostic wire protocol.
+
+This is the Tier 0 boundary from references/integration-architecture.md. Any
+process, in any language, can drive CONTINUUM's recovery operations by speaking
+a tiny newline-delimited JSON protocol, without embedding Python or the MCP
+SDK. The protocol mirrors the MCP tool surface so the two stay in sync.
+
+Request (one JSON object per line)::
+
+    {"id": <any>, "method": "<name>", "params": {<kwargs>}}
+
+Response::
+
+    {"id": <same>, "result": {<json>}}
+    {"id": <same>, "error": {"type": "<code>", "message": "<text>"}}
+
+A line that is not a JSON object -- not valid JSON at all, or valid JSON of some
+other type -- is not a request, and there is nowhere in it to read an ``id``
+from. It is answered ``bad_request`` with ``"id": null``, and the session
+continues (#582).
+
+Only the core of CONTINUUM is imported here, so ``continuum serve`` does not
+require the ``mcp`` extra. Authentication is a fail-closed shared secret (see
+``SidecarAuth``), the same model as the MCP server's ``AuthPolicy``.
+"""
+
+from __future__ import annotations
+
+import hmac
+import json
+import os
+import sys
+import threading
+from collections.abc import Mapping, Sequence
+from typing import Any, TextIO, cast
+
+from continuum.actions.ledger import ActionLedger
+from continuum.adapters.generic import GenericAgentAdapter
+from continuum.environment import StaticProvider, capture
+from continuum.events import Event, EventType
+from continuum.models import (
+    ActionStatus,
+    EnvironmentSnapshot,
+    EnvResource,
+    Origin,
+    Run,
+    SemanticState,
+    UnknownSideEffect,
+)
+from continuum.recovery.contract import render_contract
+from continuum.recovery.guidance import human_steps_for, self_report_guidance
+from continuum.state.semantic import project
+from continuum.storage import RunNotFound, Storage, open_storage
+
+#: Every run-state write the sidecar performs is asserted by a remote caller
+#: about its own work, so it is recorded as self-certified.
+AGENT_SOURCE = Origin.EXTERNAL_AGENT
+
+#: Which methods write run state, as descriptive metadata for clients that want
+#: to treat a write differently from a read (confirm it, log it, retry it).
+#:
+#: This does **not** govern sidecar authentication, and never has: ``dispatch``
+#: verifies the shared secret for *every* method, read-only ones included. The
+#: name invites the opposite reading, so it is spelled out here -- a caller that
+#: gates its own token on this set will be refused on ``resume``. See
+#: ``SidecarServer.dispatch`` for why the sidecar is stricter than the MCP
+#: server, whose policy really is mutating-only.
+MUTATING = {
+    "record_progress",
+    "checkpoint",
+    "confirm",
+    "intercept_action",
+    "complete_action",
+    "fail_action",
+    "reconcile_action",
+    "compensate_action",
+}
+
+#: HTTP requests longer than this are refused with 413 before the body is read.
+#: The sidecar carries small control messages -- a run id, two counters, a goal
+#: string -- so an unbounded read here is denial-of-service surface against the
+#: durability plane itself. Matched to the dashboard's 1 MB rather than the
+#: gateway's 10 MB: neither surface forwards a caller's payload anywhere (#533).
+MAX_SIDECAR_BODY_BYTES = 1 * 1024 * 1024
+
+#: Upper bound on how much we will drain-and-discard before giving up, the same
+#: bound the gateway and dashboard use, so all three HTTP surfaces fail closed
+#: alike (#317, #522, #533).
+SIDECAR_DRAIN_LIMIT_BYTES = 256 * 1024 * 1024
+
+#: Read granularity while draining, and the cap on one chunk-framing line.
+_DRAIN_READ_BYTES = 1024 * 1024
+_CHUNK_LINE_LIMIT = 65536
+
+
+class MalformedRunLog(RuntimeError):
+    """A run's event log does not begin with RUN_STARTED."""
+
+
+class SidecarError(Exception):
+    """Base error for sidecar dispatch failures; subclasses carry a wire code."""
+
+    code = "error"
+
+
+class MethodNotFound(SidecarError):
+    """The requested sidecar method does not exist."""
+
+    code = "method_not_found"
+
+
+class NotAuthorized(SidecarError):
+    """The call lacked the required shared secret."""
+
+    code = "not_authorized"
+
+
+class BadParams(SidecarError):
+    """The request was read but its parameters are invalid."""
+
+    code = "bad_params"
+
+
+class BadRequest(SidecarError):
+    """A body that could not be read as a request at all (issue #582).
+
+    Distinct from :class:`BadParams`, which answers a request that *was* read
+    and dispatched and so comes back carrying that request's ``id``. This one
+    has no ``id`` to carry, and on the stdio wire it reuses the ``bad_request``
+    type already answered for a line that is not JSON.
+    """
+
+    code = "bad_request"
+
+
+class SidecarAuth:
+    """Fail-closed shared-secret authentication for the sidecar.
+
+    Supports per-client tokens and a dedicated confirmation credential.
+    When configured, calls must present a matching bearer token in the
+    Authorization header or auth_token parameter. Confirmation (the confirm method)
+    requires a dedicated confirm credential so that normal client agents cannot
+    self-certify or approve human reviews.
+
+    Token comparisons use constant-time matching (hmac.compare_digest) to eliminate
+    timing side channels.
+    """
+
+    def __init__(
+        self,
+        expected: str | None = None,
+        *,
+        client_tokens: str | Sequence[str] | set[str] | None = None,
+        confirm_token: str | None = None,
+    ) -> None:
+        tokens: set[str] = set()
+        if expected and expected.strip():
+            tokens.add(expected.strip())
+        if client_tokens is not None:
+            if isinstance(client_tokens, str):
+                for item in client_tokens.split(","):
+                    if item.strip():
+                        tokens.add(item.strip())
+            else:
+                for item in client_tokens:
+                    if str(item).strip():
+                        tokens.add(str(item).strip())
+        self.client_tokens = tokens
+        self.confirm_token = (
+            confirm_token.strip() if confirm_token and confirm_token.strip() else None
+        )
+
+    @classmethod
+    def from_environ(cls, env: Mapping[str, str] | None = None) -> SidecarAuth:
+        """Construct SidecarAuth from environment variables."""
+        environ = os.environ if env is None else env
+        single = environ.get("CONTINUUM_SERVE_TOKEN") or None
+        multi = environ.get("CONTINUUM_SERVE_CLIENT_TOKENS") or None
+        tokens: list[str] = []
+        if single and single.strip():
+            tokens.append(single.strip())
+        if multi:
+            tokens.extend([item.strip() for item in multi.split(",") if item.strip()])
+        confirm_token = environ.get("CONTINUUM_SERVE_CONFIRM_TOKEN") or None
+        return cls(
+            expected=tokens[0] if tokens else None,
+            client_tokens=tokens if tokens else None,
+            confirm_token=confirm_token,
+        )
+
+    @property
+    def expected(self) -> str | None:
+        """First configured client token, for backward compatibility."""
+        if not self.client_tokens:
+            return None
+        return next(iter(self.client_tokens))
+
+    @expected.setter
+    def expected(self, val: str | None) -> None:
+        self.client_tokens.clear()
+        if val and val.strip():
+            self.client_tokens.add(val.strip())
+
+    @property
+    def client_auth_disabled(self) -> bool:
+        """True when no client secret is configured."""
+        return len(self.client_tokens) == 0
+
+    @property
+    def disabled(self) -> bool:
+        """True when neither client tokens nor confirm token are configured."""
+        return self.client_auth_disabled and self.confirm_token is None
+
+    def verify(self, token: str | None) -> None:
+        """Accept matching client tokens; raise NotAuthorized otherwise, unless disabled."""
+        if self.client_auth_disabled:
+            return
+        if not token:
+            raise NotAuthorized(
+                "expected shared secret (set CONTINUUM_SERVE_TOKEN on the server "
+                "and pass auth_token on the client)"
+            )
+        token_bytes = token.encode("utf-8")
+        matched = False
+        for candidate in self.client_tokens:
+            if hmac.compare_digest(token_bytes, candidate.encode("utf-8")):
+                matched = True
+        if not matched:
+            raise NotAuthorized(
+                "expected shared secret (set CONTINUUM_SERVE_TOKEN on the server "
+                "and pass auth_token on the client)"
+            )
+
+    def verify_confirm(self, token: str | None) -> None:
+        """Verify confirm credential; normal client tokens are explicitly rejected."""
+        if self.confirm_token is not None:
+            if not token:
+                raise NotAuthorized(
+                    "confirm requires dedicated confirm credential (set CONTINUUM_SERVE_CONFIRM_TOKEN "
+                    "on the server and provide confirm_token or Authorization header)"
+                )
+            if not hmac.compare_digest(token.encode("utf-8"), self.confirm_token.encode("utf-8")):
+                raise NotAuthorized(
+                    "an agent holding a normal token cannot call confirm; "
+                    "dedicated confirm credential required"
+                )
+            return
+
+        # No confirm token configured on server:
+        if not self.client_auth_disabled:
+            # Client auth is enabled, but no confirm token configured: fail closed!
+            raise NotAuthorized(
+                "confirm requires dedicated confirm credential (set CONTINUUM_SERVE_CONFIRM_TOKEN "
+                "on the server); an agent holding a normal token cannot call confirm"
+            )
+
+        # Entire auth system is disabled (testing/local unauthenticated mode)
+        return
+
+
+def _require(params: dict[str, Any], key: str) -> Any:
+    if key not in params or params[key] is None:
+        raise BadParams(f"missing parameter {key!r}")
+    return params[key]
+
+
+def _env_versions(env: Any) -> dict[str, str]:
+    """Normalize the two accepted ``env`` shapes to ``{resource: version}``.
+
+    Callers send either a mapping or a list of ``name=version`` strings, and both
+    the snapshot and the dependency declaration have to agree on what was pinned.
+    Strict as CLI ``_environment``: an entry without ``=`` or with an empty
+    version raises ``BadParams`` with the same message, so switching transports
+    cannot silently ignore a typo.
+    """
+    versions: dict[str, str] = {}
+    if isinstance(env, dict):
+        for name, version in env.items():
+            name_s = str(name)
+            version_s = str(version)
+            if not name_s or "=" in name_s:
+                raise BadParams(f"--env expects name=version, got {name_s!r}")
+            if not version_s:
+                raise BadParams(
+                    f"--env {name_s}= has an empty version; "
+                    f"omit the flag entirely if the value is unknown"
+                )
+            versions[name_s] = version_s
+    elif isinstance(env, list):
+        for item in env:
+            if not isinstance(item, str):
+                raise BadParams(f"--env expects name=version, got {item!r}")
+            name, separator, version = item.partition("=")
+            if not name or not separator:
+                raise BadParams(f"--env expects name=version, got {item!r}")
+            if not version:
+                raise BadParams(
+                    f"--env {name}= has an empty version; "
+                    f"omit the flag entirely if the value is unknown"
+                )
+            versions[name] = version
+    return versions
+
+
+def _environment(run_id: str, env: Any) -> EnvironmentSnapshot | None:
+    if not env:
+        return None
+    versions = _env_versions(env)
+    if not versions:
+        return None
+    resources = {
+        name: EnvResource(name=name, version=version) for name, version in versions.items()
+    }
+    return capture(run_id, StaticProvider(resources))
+
+
+def _declare_dependencies(server: SidecarServer, run_id: str, env: Any) -> None:
+    """Record the pinned environment as declared dependencies of the run.
+
+    A snapshot alone cannot invalidate anything: the validator decides staleness
+    per declared dependency and returns early when a state has none, so a
+    checkpoint carrying only a snapshot reports ``safe_to_resume`` even after the
+    resource underneath it moved. Mirrors ``continuum.mcp.server``: the two
+    surfaces expose the same recovery semantics and must not disagree about
+    whether drift is safe.
+    """
+    if not env:
+        return
+    versions = _env_versions(env)
+    if not versions:
+        return
+
+    declared = {
+        dependency.resource: dependency.version
+        for dependency in project(
+            run_id, server.storage.read_events(run_id), on_unprojectable="degrade"
+        ).external_dependencies
+    }
+    for name, version in versions.items():
+        if declared.get(name) == version:
+            continue
+        server.storage.append_event(
+            run_id,
+            EventType.DEPENDENCY_DECLARED,
+            {"resource": name, "version": version},
+            source=AGENT_SOURCE,
+        )
+
+
+class SidecarServer:
+    """Dispatches wire-protocol methods onto CONTINUUM's core operations."""
+
+    def __init__(
+        self,
+        database: str | None = None,
+        *,
+        storage: Storage | None = None,
+        auth: SidecarAuth | None = None,
+    ) -> None:
+        self.database = database or os.environ.get("CONTINUUM_DB") or "continuum.db"
+        self.storage: Storage = storage or open_storage(self.database)
+        self.adapter = GenericAgentAdapter(self.storage)
+        self.auth = auth or SidecarAuth.from_environ()
+
+    # -- core helpers (mirror ContinuumMCP) ---------------------------------- #
+
+    def _ensure_run(self, run_id: str, goal: str | None = None) -> Run:
+        try:
+            run = self.storage.get_run(run_id)
+        except RunNotFound:
+            if goal is None:
+                raise
+            run = self.storage.create_run(Run(run_id=run_id, goal=goal))
+        archived = self.storage.read_archived_events(run_id)
+        if archived:
+            first: Event | None = archived[0]
+        else:
+            live = self.storage.read_events(run_id, upto=1)
+            if live:
+                first = live[0]
+            else:
+                all_live = self.storage.read_events(run_id)
+                first = all_live[0] if all_live else None
+        if not first:
+            self.storage.append_event(
+                run_id, EventType.RUN_STARTED, {"goal": goal or run.goal}, source=AGENT_SOURCE
+            )
+        elif first.type is not EventType.RUN_STARTED:
+            raise MalformedRunLog(
+                f"run {run_id!r} does not begin with RUN_STARTED "
+                f"(first event is {first.type.value})"
+            )
+        return run
+
+    def _ledger(self, run_id: str) -> ActionLedger:
+        return ActionLedger(self.storage, run_id, source=AGENT_SOURCE)
+
+    def _append_projectable(
+        self,
+        run_id: str,
+        event_type: EventType,
+        payload: Mapping[str, Any],
+        *,
+        attempts: int = 3,
+    ) -> SemanticState:
+        """Commit ``payload`` only if the fold accepts it against the state it lands on.
+
+        Mirrors ``ContinuumMCP._append_projectable`` (issue #364), which closed
+        the same ordering gap on the MCP transport. ``record_progress`` used to
+        append first and project afterwards (#1221), so an update the fold
+        refused was already durable when the refusal arrived: the response
+        carried a ``projection_failed_at`` block describing a break the caller
+        could no longer correct. Because the fold validates every intermediate
+        state, no later event could repair it, and every projecting surface for
+        that run stayed dead permanently -- ``status``, ``resume``,
+        ``briefing`` and ``replay`` -- while the action tools kept working, so
+        the run could still authorise real side effects that recovery could not
+        vouch for. That inversion is what makes an unprojectable log worse than
+        a rejected call, so a refused call writes nothing here.
+
+        The candidate is folded in memory rather than written and rolled back:
+        there is no transaction spanning the append, and a rollback that failed
+        would leave behind precisely the state this prevents.
+
+        ``expected_sequence`` closes the gap between validating and committing.
+        They are two statements, so a second writer can advance the run in
+        between and two individually-legal payloads compose into a log neither
+        would have been allowed to produce (for example ``total=50`` landing
+        between the read and the write of a ``completed=75`` that omits
+        ``total``). Losing that race says nothing about whether this update is
+        valid, so it re-validates against the new head rather than failing;
+        bounded, so a permanently busy run answers instead of spinning.
+        """
+        from continuum.storage import ConcurrentWriteError
+
+        for remaining in range(attempts - 1, -1, -1):
+            history = list(self.storage.read_events(run_id))
+            head = history[-1].sequence if history else 0
+            candidate = Event(
+                run_id=run_id,
+                sequence=head + 1,
+                type=event_type,
+                payload=dict(payload),
+                source=AGENT_SOURCE,
+            )
+            try:
+                state = project(run_id, [*history, candidate])
+            except ValueError as exc:
+                # pydantic's ValidationError is a ValueError, so this covers both
+                # the model invariants and the projector's own checks. Re-raised
+                # as bad_params with the payload named, because the bare pydantic
+                # message reports the folded figures without saying which call
+                # produced them.
+                raise BadParams(
+                    f"{event_type.value} {dict(payload)} would leave run {run_id!r} "
+                    f"unprojectable and was not recorded: {exc}"
+                ) from exc
+            try:
+                self.storage.append_event(
+                    run_id,
+                    event_type,
+                    payload,
+                    expected_sequence=head,
+                    source=AGENT_SOURCE,
+                )
+            except ConcurrentWriteError:
+                if remaining:
+                    continue
+                raise BadParams(
+                    f"run {run_id!r} is being written concurrently and this update lost the "
+                    f"race {attempts} times; nothing was recorded. One run is meant to have "
+                    f"one owner at a time, so check whether another agent holds this run."
+                ) from None
+            return state
+        # Unreachable: every iteration either returns, raises on the
+        # unprojectable candidate, or raises once the retries are spent.
+        raise BadParams(  # pragma: no cover - the loop always returns or raises
+            f"run {run_id!r} update retried {attempts} times without committing"
+        )
+
+    def dispatch(
+        self,
+        method: str,
+        params: dict[str, Any],
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        """Authenticate, then route to the handler for ``method``.
+
+        The secret is required for every method, not just the ones in
+        ``MUTATING``. Calling confirm requires a dedicated confirm credential
+        so that agents holding normal client tokens cannot self-approve.
+        """
+        handler = _HANDLERS.get(method)
+        if handler is None:
+            raise MethodNotFound(method)
+        if method == "confirm":
+            confirm_cred = token or params.get("confirm_token") or params.get("auth_token")
+            self.auth.verify_confirm(confirm_cred)
+        else:
+            client_cred = token or params.get("auth_token")
+            self.auth.verify(client_cred)
+        return cast("dict[str, Any]", handler(self, params))
+
+    # -- wire loop ---------------------------------------------------------- #
+
+    def serve_stdio(self, instream: TextIO | None = None, outstream: TextIO | None = None) -> int:
+        """Serve newline-delimited JSON requests until EOF; returns the exit code."""
+        instream = instream or sys.stdin
+        outstream = outstream or sys.stdout
+        for raw in instream:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                req = _request_object(json.loads(line))
+            except (json.JSONDecodeError, BadRequest) as exc:
+                # One arm for both: unreadable as JSON, or readable and not an
+                # object. Neither is a request, so neither answer can name an
+                # id, and the session has to outlive both.
+                _write(
+                    outstream, {"id": None, "error": {"type": "bad_request", "message": str(exc)}}
+                )
+                continue
+            rid = req.get("id")
+            try:
+                result = self.dispatch(str(req.get("method")), dict(req.get("params") or {}))
+            except SidecarError as exc:
+                _write(outstream, {"id": rid, "error": {"type": exc.code, "message": str(exc)}})
+            except Exception as exc:
+                _write(
+                    outstream,
+                    {
+                        "id": rid,
+                        "error": {"type": "internal", "message": f"{type(exc).__name__}: {exc}"},
+                    },
+                )
+            else:
+                _write(outstream, {"id": rid, "result": result})
+        return 0
+
+    def close(self) -> None:
+        """Close the backing storage."""
+        self.storage.close()
+
+
+class SidecarHTTP:
+    """HTTP transport over the sidecar dispatch (issue #238).
+
+    POST /<method> with a JSON body is dispatched exactly like the stdio
+    wire: same handlers, same token auth (``CONTINUUM_SERVE_TOKEN``), same
+    errors mapped to status codes (404 unknown method, 403 unauthorized,
+    400 bad params, 500 sidecar failure). Binds 127.0.0.1 by default; the
+    transport exists so non-Python agents get the durability plane without
+    embedding the library.
+
+    The body is read fail-closed, the same way the gateway and dashboard read
+    theirs (#533): over ``MAX_SIDECAR_BODY_BYTES`` is 413, a ``Content-Length``
+    that is not a non-negative integer is 400 rather than an exception that
+    closes the connection unanswered, and ``Transfer-Encoding: chunked`` is
+    refused instead of being read as an empty body -- which is how a chunked
+    stream used to get past the cap entirely.
+
+    A refusal that could not establish where the body ends also closes the
+    connection, since ``protocol_version`` is HTTP/1.1 and an unread remainder
+    on a kept-alive socket is read as the next request.
+    """
+
+    def __init__(self, sidecar: SidecarServer, port: int = 8765, bind: str = "127.0.0.1") -> None:
+        import http.server
+
+        sidecar_ref = sidecar
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            """HTTP/1.1 handler dispatching POSTs onto the sidecar."""
+
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args: Any) -> None:  # silence
+                """Suppress the default per-request stderr logging."""
+                pass
+
+            def _json(self, code: int, payload: dict[str, Any]) -> None:
+                body = json.dumps(payload).encode()
+                self.send_response(code)
+                if getattr(self, "close_connection", False):
+                    self.send_header("Connection", "close")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Continuum-Version", "1.0")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _drain_chunked(self) -> str | None:
+                """Discard a chunked body, bounded, and say how that went.
+
+                ``None`` means the stream was consumed (or the client stopped
+                writing) and the caller may answer. ``"unbounded"`` means the
+                shared drain bound was crossed; ``"malformed"`` means the chunk
+                framing does not parse. Draining before answering lets the
+                client finish writing and read the refusal, instead of dying on
+                a broken pipe mid-send -- the same reason the oversize
+                Content-Length path drains.
+                """
+                drained = 0
+
+                def take(count: int) -> bytes:
+                    """Read up to count bytes while tracking the drain total."""
+                    nonlocal drained
+                    data = self.rfile.read(count)
+                    drained += len(data)
+                    return data
+
+                while True:
+                    if drained > SIDECAR_DRAIN_LIMIT_BYTES:
+                        return "unbounded"
+                    line = self.rfile.readline(_CHUNK_LINE_LIMIT)
+                    if not line:
+                        return None
+                    drained += len(line)
+                    # A chunk header is a hex length, optionally followed by
+                    # extensions after a semicolon.
+                    header = line.strip().split(b";", 1)[0].strip()
+                    if not header:
+                        continue
+                    try:
+                        size = int(header, 16)
+                    except ValueError:
+                        return "malformed"
+                    if size < 0:
+                        return "malformed"
+                    if size == 0:
+                        # Terminal chunk: trailers, then the closing empty line.
+                        while True:
+                            if drained > SIDECAR_DRAIN_LIMIT_BYTES:
+                                return "unbounded"
+                            trailer = self.rfile.readline(_CHUNK_LINE_LIMIT)
+                            if not trailer or trailer in (b"\r\n", b"\n"):
+                                return None
+                            drained += len(trailer)
+                    remaining = size
+                    while remaining > 0:
+                        if drained > SIDECAR_DRAIN_LIMIT_BYTES:
+                            return "unbounded"
+                        chunk = take(min(_DRAIN_READ_BYTES, remaining))
+                        if not chunk:
+                            return None
+                        remaining -= len(chunk)
+                    # The chunk data must be followed by its own CRLF. Consuming
+                    # two bytes blindly would eat the front of the next chunk
+                    # header when that CRLF is missing, and the drain would then
+                    # report a clean finish from the middle of the stream -- the
+                    # one outcome whose refusal keeps the connection open.
+                    terminator = self.rfile.readline(_CHUNK_LINE_LIMIT)
+                    drained += len(terminator)
+                    if terminator.strip():
+                        return "malformed"
+
+            def _read_body(self) -> bytes | None:
+                """Return the request body, or answer the refusal and return None.
+
+                An absent or zero-length body stays the empty JSON object, so a
+                method that needs no params is still callable with no body.
+                """
+                header = self.headers.get("Transfer-Encoding") or ""
+                encodings = {v.strip().lower() for v in header.split(",")}
+                if "chunked" in encodings:
+                    # Refused rather than decoded. A chunked body carries no
+                    # length to check, so reading one means reading unbounded
+                    # framing into memory -- the very thing the cap exists to
+                    # stop -- and no sidecar client needs streaming to send a
+                    # run id and a counter (#533).
+                    try:
+                        outcome = self._drain_chunked()
+                    except OSError:
+                        outcome = "malformed"
+                    if outcome == "unbounded":
+                        self.close_connection = True
+                        self._json(413, {"error": "request body too large to drain"})
+                    elif outcome == "malformed":
+                        # Closed, not answered on a live socket: the drain stopped
+                        # at framing it could not parse, so where the body ends is
+                        # unknown. protocol_version is HTTP/1.1, so keeping the
+                        # connection means the unread remainder is read as the next
+                        # request line, and a body shaped like a request gets
+                        # dispatched instead of discarded (request smuggling).
+                        self.close_connection = True
+                        self._json(400, {"error": "invalid chunked Transfer-Encoding"})
+                    else:
+                        # Kept alive: ``None`` means the stream reached its terminal
+                        # chunk or ended, so the boundary is known and the next
+                        # bytes on this socket really are the next request.
+                        self._json(400, {"error": "chunked Transfer-Encoding is not supported"})
+                    return None
+
+                raw_length = self.headers.get("Content-Length")
+                if raw_length is None:
+                    return b"{}"
+                # Answered, not raised: int() on a malformed header used to
+                # escape the handler and close the connection with no response
+                # at all, which reads to the caller as a network fault (#533).
+                # A header that is present but blank is malformed too, not zero.
+                token = raw_length.strip()
+                if not (token.isascii() and token.isdigit()):
+                    # Closed for the same reason as unparseable chunk framing: a
+                    # length that is not a number cannot say how many bytes to
+                    # discard, so the body stays unread and any bytes the client
+                    # already wrote would be parsed as a pipelined request.
+                    self.close_connection = True
+                    self._json(400, {"error": f"invalid Content-Length: {raw_length!r}"})
+                    return None
+                length = int(token)
+                if length > MAX_SIDECAR_BODY_BYTES:
+                    drained = 0
+                    while drained < length:
+                        chunk = self.rfile.read(min(_DRAIN_READ_BYTES, length - drained))
+                        if not chunk:
+                            break
+                        drained += len(chunk)
+                        if drained > SIDECAR_DRAIN_LIMIT_BYTES:
+                            self.close_connection = True
+                            self._json(413, {"error": "request body too large to drain"})
+                            return None
+                    self._json(
+                        413,
+                        {"error": f"request body exceeds {MAX_SIDECAR_BODY_BYTES} bytes"},
+                    )
+                    return None
+                return self.rfile.read(length) if length else b"{}"
+
+            def do_POST(self) -> None:
+                """Route one POST body through the sidecar dispatch."""
+                method = self.path.strip("/").split("?")[0]
+                raw = self._read_body()
+                if raw is None:
+                    return  # the refusal is already on the wire
+                try:
+                    params = _request_object(json.loads(raw))
+                except json.JSONDecodeError as exc:
+                    self._json(400, {"error": f"invalid JSON body: {exc}"})
+                    return
+                except BadRequest as exc:
+                    # The arm now sits on the statement that raises. This
+                    # refusal was already spelled out here, then escaped the
+                    # handler and closed the connection unanswered (#582).
+                    self._json(400, {"error": str(exc)})
+                    return
+                header_token: str | None = None
+                auth_header = self.headers.get("Authorization")
+                if auth_header:
+                    scheme, _, token_val = auth_header.partition(" ")
+                    if scheme.lower() == "bearer" and token_val.strip():
+                        header_token = token_val.strip()
+
+                confirm_header = self.headers.get("X-Continuum-Confirm-Token")
+                if method == "confirm" and confirm_header and confirm_header.strip():
+                    header_token = confirm_header.strip()
+
+                try:
+                    result = sidecar_ref.dispatch(method, params, token=header_token)
+                except MethodNotFound as exc:
+                    self._json(404, {"error": str(exc), "code": exc.code})
+                    return
+                except NotAuthorized as exc:
+                    self._json(403, {"error": str(exc), "code": exc.code})
+                    return
+                except BadParams as exc:
+                    self._json(400, {"error": str(exc), "code": exc.code})
+                    return
+                except SidecarError as exc:
+                    self._json(500, {"error": str(exc), "code": exc.code})
+                    return
+                except Exception as exc:  # storage errors (missing run etc.)
+                    self._json(500, {"error": str(exc), "code": "internal"})
+                    return
+                self._json(200, result)
+
+            def do_GET(self) -> None:
+                """Route GET requests for health probes and OpenAPI schema."""
+                path = self.path.split("?")[0].rstrip("/")
+                if path in ("/healthz", "/readyz"):
+                    self._json(200, {"status": "ok", "version": "1.0"})
+                    return
+                if path in ("/openapi.json", "/spec"):
+                    from continuum.serve.openapi import get_openapi_spec
+
+                    self._json(200, get_openapi_spec())
+                    return
+                self._json(404, {"error": f"not found: {self.path}", "code": "not_found"})
+
+        server = http.server.ThreadingHTTPServer((bind, port), Handler)
+        self.httpd = server
+        self.bind = bind
+        self.port = int(server.server_address[1])
+        self._thread: threading.Thread | None = None
+
+    def serve_forever(self) -> None:
+        """Block serving HTTP until shut down."""
+        self.httpd.serve_forever()
+
+    def start_background(self) -> None:
+        """Serve HTTP on a daemon thread."""
+        self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        """Shut the HTTP server down and close it."""
+        if self._thread is not None and self._thread.is_alive():
+            self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+# -- wire loop ---------------------------------------------------------- #
+
+
+def _write(stream: TextIO, payload: dict[str, Any]) -> None:
+    stream.write(json.dumps(payload, default=str) + "\n")
+    stream.flush()
+
+
+def _request_object(parsed: Any) -> dict[str, Any]:
+    """Refuse a parsed body that is not a JSON object (issue #582).
+
+    One check for both transports. Neither had one that worked. ``json.loads``
+    returns whatever the body happened to be, and stdio simply assumed a
+    mapping, reading ``.get`` off it one line above the guard whose comment
+    promises to report and never crash the loop, so a single ``[]`` line killed
+    a long-lived session and every request still queued behind it. The HTTP
+    handler did spell out this exact refusal, but inside a ``try`` that caught
+    only ``JSONDecodeError``, so it escaped ``do_POST`` and the connection closed
+    with no response -- indistinguishable, to a client, from a sidecar that had
+    died.
+    """
+    if not isinstance(parsed, dict):
+        raise BadRequest("body must be a JSON object")
+    return parsed
+
+
+# --------------------------------------------------------------------------- #
+# handlers
+# --------------------------------------------------------------------------- #
+
+
+def _decision_payload(decision: Any, *, goal: str) -> dict[str, Any]:
+    report = decision.validation.report
+    try:
+        from continuum.checkpoint.context import build_recovery_context
+        from continuum.state.semantic import constraint_pins_payload
+
+        rendered = build_recovery_context(decision.state).render()
+        constraint_pins = constraint_pins_payload(decision.state, rendered)
+    except Exception:
+        constraint_pins = {"pins": {}, "flagged": [], "grace_seconds": None}
+    return {
+        "checkpoint_version": report.checkpoint_version,
+        "validation_reason": report.reason,
+        "run_id": decision.state.run_id,
+        "goal": goal,
+        "mode": decision.mode.value,
+        "safe": decision.safe,
+        "next_allowed_action": decision.next_allowed_action,
+        "human_steps": human_steps_for(decision, run_id=decision.state.run_id),
+        "rationale": list(decision.rationale),
+        "repairs": [
+            {
+                "action": step.action_name,
+                "kind": step.kind.value,
+                "target": step.target,
+                "reason": step.reason,
+                "requires_human": step.requires_human,
+            }
+            for step in decision.plan.steps
+        ],
+        "uncertain_actions": [
+            {"action_id": a.action_id, "action_type": a.action_type, "status": a.status.value}
+            for a in decision.uncertain_actions
+        ],
+        "progress": {
+            "completed": decision.state.progress.completed,
+            "pending": decision.state.progress.pending,
+            "failed": decision.state.progress.failed,
+            "total": decision.state.progress.total,
+        },
+        "tail_evidence": decision.tail_evidence,
+        "informed_retry": getattr(decision, "informed_retry", None),
+        "attempt_lessons": [
+            lesson.model_dump(mode="json") for lesson in decision.state.attempt_lessons
+        ],
+        "contract": decision.contract.model_dump(mode="json"),
+        "contract_text": render_contract(decision.contract),
+        "report": decision.render(),
+        "environment_changes": [d.render() for d in decision.environment_diff.breaking],
+        **self_report_guidance(decision),
+        "constraint_pins": constraint_pins,
+    }
+
+
+def _h_record_progress(server: SidecarServer, params: dict[str, Any]) -> dict[str, Any]:
+    run_id = _require(params, "run_id")
+    completed = _require(params, "completed")
+    total = params.get("total")
+    failed = params.get("failed", 0)
+    goal = params.get("goal")
+    if completed < 0 or failed < 0:
+        raise BadParams("progress counters must be non-negative")
+    if total is not None and completed + failed > total:
+        raise BadParams(f"completed ({completed}) + failed ({failed}) exceeds total ({total})")
+    server._ensure_run(run_id, goal)
+    payload: dict[str, Any] = {"completed": completed, "failed": failed}
+    if total is not None:
+        payload["total"] = total
+        payload["pending"] = max(total - completed - failed, 0)
+    # Validate before committing, not after (issue #1221): a payload is legal or
+    # not relative to the state it lands on, so the guards above -- which see
+    # only this call's own arguments -- are blind to the total already on record.
+    # An agent reports ``total`` once and then sends ``completed``/``failed``
+    # updates, so the accumulated figure is visible to the fold alone. Appending
+    # first and degrading afterwards (#383) left the refused event durable while
+    # reporting the break, and no later event could correct it. The MCP transport
+    # refuses the same call and records nothing (#364); the two transports that
+    # expose one tool now agree.
+    state = server._append_projectable(run_id, EventType.TASK_UPDATED, payload)
+    return {
+        "run_id": run_id,
+        "completed": state.progress.completed,
+        "pending": state.progress.pending,
+        "failed": state.progress.failed,
+        "total": state.progress.total,
+        "source_sequence": state.source_sequence,
+    }
+
+
+def _h_checkpoint(server: SidecarServer, params: dict[str, Any]) -> dict[str, Any]:
+    run_id = _require(params, "run_id")
+    server._ensure_run(run_id)
+    _declare_dependencies(server, run_id, params.get("env"))
+    # Full history (read_all_events) so compaction cannot make the checkpoint
+    # itself unprojectable: after compaction the live log holds only the anchor
+    # and the tail, with RUN_STARTED in the archive, and ``project`` refuses a
+    # log with no goal. _ensure_run above already accepts a compacted run, so a
+    # live-only read here made the checkpoint endpoint the broken link.
+    state = project(run_id, server.storage.read_all_events(run_id))
+    checkpoint = server.adapter.capture_state(
+        run_id,
+        state,
+        environment=_environment(run_id, params.get("env")),
+        reason=params.get("reason", ""),
+    )
+    return {
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "run_id": run_id,
+        "version": checkpoint.version,
+        "trigger": checkpoint.trigger,
+        "integrity_hash": checkpoint.integrity_hash,
+        "completed": checkpoint.state.progress.completed,
+        "source_sequence": checkpoint.state.source_sequence,
+    }
+
+
+def _h_validate(server: SidecarServer, params: dict[str, Any]) -> dict[str, Any]:
+    run_id = _require(params, "run_id")
+    decision = server.adapter.resume(
+        run_id,
+        current_environment=_environment(run_id, params.get("env")),
+        expected_model=params.get("expected_model"),
+    )
+    report = decision.validation.report
+    try:
+        from continuum.checkpoint.context import build_recovery_context
+        from continuum.state.semantic import constraint_pins_payload
+
+        rendered = build_recovery_context(decision.state).render()
+        constraint_pins = constraint_pins_payload(decision.state, rendered)
+    except Exception:
+        constraint_pins = {"pins": {}, "flagged": [], "grace_seconds": None}
+    try:
+        from continuum.recovery.health import advisory_for_storage
+
+        liveness = advisory_for_storage(server.storage, run_id)
+    except Exception:
+        liveness = {"breached": False, "silence_seconds": None}
+    return {
+        "run_id": run_id,
+        "safe": decision.safe,
+        "mode": decision.mode.value,
+        "checkpoint_version": report.checkpoint_version,
+        "reason": report.reason,
+        "components": [
+            {
+                "component": e.component.value,
+                "component_id": e.component_id,
+                "status": e.status.value,
+                "detail": e.detail,
+            }
+            for e in report.statuses
+        ],
+        "environment_changes": [d.render() for d in decision.environment_diff.breaking],
+        "constraint_pins": constraint_pins,
+        "liveness": liveness,
+    }
+
+
+def _h_resume(server: SidecarServer, params: dict[str, Any]) -> dict[str, Any]:
+    # run_id is optional, exactly as it is on continuum_resume: a session that
+    # was interrupted and restarted has no id to send, so an omitted one means
+    # "the run that was interrupted". Reported as a mode rather than a protocol
+    # error, so a client branches on mode alone across both transports.
+    run_id = params.get("run_id")
+    if not run_id:
+        active = server.storage.get_active_run()
+        if active is None:
+            return {
+                "run_id": None,
+                "mode": "no_active_run",
+                "safe": False,
+                "message": (
+                    "No active run to resume. Start one with "
+                    "record_progress(run_id, completed, total, goal=...)."
+                ),
+            }
+        run_id = active.run_id
+    decision = server.adapter.resume(
+        run_id,
+        current_environment=_environment(run_id, params.get("env")),
+        expected_model=params.get("expected_model"),
+    )
+    # The goal travels with the decision so a resumed client knows what to
+    # continue without keeping its own task file. Read-only: returning the
+    # self-reported goal confirms nothing, so a self-certified run still comes
+    # back as request_human.
+    payload = _decision_payload(decision, goal=server.storage.get_run(run_id).goal)
+    try:
+        from continuum.recovery.health import advisory_for_storage
+
+        payload["liveness"] = advisory_for_storage(server.storage, run_id)
+    except Exception:
+        payload["liveness"] = {"breached": False, "silence_seconds": None}
+    return payload
+
+
+def _h_confirm(server: SidecarServer, params: dict[str, Any]) -> dict[str, Any]:
+    run_id = _require(params, "run_id")
+    server.storage.append_event(
+        run_id,
+        EventType.REVIEW_CONFIRMED,
+        {"components": ["goal", "progress"]},
+        source=Origin.HUMAN,
+    )
+    decision = server.adapter.resume(run_id, expected_model=params.get("expected_model"))
+    return {
+        "run_id": run_id,
+        "mode": decision.mode.value,
+        "safe": decision.safe,
+        "next_allowed_action": decision.next_allowed_action,
+        "report": decision.render(),
+    }
+
+
+def _h_intercept_action(server: SidecarServer, params: dict[str, Any]) -> dict[str, Any]:
+    run_id = _require(params, "run_id")
+    action_type = _require(params, "action_type")
+    server._ensure_run(run_id)
+    ledger = server._ledger(run_id)
+    from continuum.actions.grants import GrantDenied, normalize_grant
+
+    grant_clean = normalize_grant(params.get("grant"))
+    try:
+        outcome = ledger.claim(
+            action_type,
+            arguments=params.get("arguments"),
+            key=params.get("key"),
+            scoped_to_run=params.get("scoped_to_run", True),
+            grant=grant_clean,
+        )
+    except UnknownSideEffect as exc:
+        return {
+            "run_id": run_id,
+            "action_type": action_type,
+            "proceed": False,
+            "status": ActionStatus.UNKNOWN.value,
+            "reason": str(exc),
+            "guidance": (
+                "A previous attempt was interrupted and its outcome is unknown. "
+                "Do not retry. Verify with the external system, then report via "
+                "reconcile_action."
+            ),
+        }
+    except GrantDenied as exc:
+        return {
+            "run_id": run_id,
+            "action_type": action_type,
+            "proceed": False,
+            "reason_code": "grant_denied",
+            "grant_id": exc.grant_id,
+            "reason": str(exc),
+            "guidance": (
+                "This single-use authority was already consumed (recorded in the "
+                "ledger). It does not come back after a restore. Ask the operator "
+                "for a fresh grant."
+            ),
+        }
+    if outcome.fresh:
+        return {
+            "run_id": run_id,
+            "action_type": action_type,
+            "proceed": True,
+            "action_key": str(outcome.key),
+            "status": outcome.action.status.value,
+            "guidance": "Perform the action now, then call complete_action with this action_key.",
+        }
+    return {
+        "run_id": run_id,
+        "action_type": action_type,
+        "proceed": False,
+        "action_key": str(outcome.key),
+        "status": outcome.action.status.value,
+        "external_id": outcome.external_id,
+        "previous_result": dict(outcome.result) if outcome.result else None,
+        "guidance": "Already performed. Reuse the previous result; do not repeat it.",
+    }
+
+
+def _h_complete_action(server: SidecarServer, params: dict[str, Any]) -> dict[str, Any]:
+    run_id = _require(params, "run_id")
+    action_key = _require(params, "action_key")
+    try:
+        action = server._ledger(run_id).complete(
+            action_key,
+            external_id=params.get("external_id"),
+            result=params.get("result"),
+            consumed_inputs=params.get("consumed_inputs"),
+        )
+    except ValueError as exc:
+        # Malformed caller input (e.g. consumed_inputs shape) is a parameter
+        # error, not a server failure (#645 review).
+        raise BadParams(str(exc)) from exc
+    return {
+        "run_id": run_id,
+        "action_id": action.action_id,
+        "action_type": action.action_type,
+        "status": action.status.value,
+        "external_id": action.external_id,
+    }
+
+
+def _h_fail_action(server: SidecarServer, params: dict[str, Any]) -> dict[str, Any]:
+    run_id = _require(params, "run_id")
+    action_key = _require(params, "action_key")
+    error = _require(params, "error")
+    action = server._ledger(run_id).fail(action_key, error, certain=params.get("certain", False))
+    return {
+        "run_id": run_id,
+        "action_id": action.action_id,
+        "status": action.status.value,
+        "side_effect_uncertain": action.side_effect_uncertain,
+    }
+
+
+def _h_reconcile_action(server: SidecarServer, params: dict[str, Any]) -> dict[str, Any]:
+    run_id = _require(params, "run_id")
+    action_key = _require(params, "action_key")
+    occurred = _require(params, "occurred")
+    try:
+        action = server._ledger(run_id).reconcile(
+            action_key,
+            occurred=occurred,
+            external_id=params.get("external_id"),
+            note=params.get("note", ""),
+            consumed_inputs=params.get("consumed_inputs"),
+        )
+    except ValueError as exc:
+        raise BadParams(str(exc)) from exc
+    return {
+        "run_id": run_id,
+        "action_id": action.action_id,
+        "status": action.status.value,
+        "external_id": action.external_id,
+        "side_effect_uncertain": action.side_effect_uncertain,
+    }
+
+
+def _h_compensate_action(server: SidecarServer, params: dict[str, Any]) -> dict[str, Any]:
+    run_id = _require(params, "run_id")
+    action_key = _require(params, "action_key")
+    action = server._ledger(run_id).compensate(
+        action_key,
+        note=params.get("note", ""),
+        by=params.get("by"),
+    )
+    return {
+        "run_id": run_id,
+        "action_id": action.action_id,
+        "action_type": action.action_type,
+        "status": action.status.value,
+        "compensated_by": list(action.compensated_by),
+    }
+
+
+def _h_list_actions(server: SidecarServer, params: dict[str, Any]) -> dict[str, Any]:
+    run_id = _require(params, "run_id")
+    server.storage.get_run(run_id)
+    ledger = server._ledger(run_id)
+    actions = ledger.all()
+    unresolved = {a.action_id for a in ledger.pending()}
+    return {
+        "run_id": run_id,
+        "actions": [
+            {
+                "action_id": a.action_id,
+                "action_type": a.action_type,
+                "status": a.status.value,
+                "external_id": a.external_id,
+                "side_effect_uncertain": a.side_effect_uncertain,
+                # The durable flag above is only set once an action has been
+                # escalated to UNKNOWN, so one left STARTED by a crash reads
+                # false while its outcome is in fact unresolved.
+                "outcome_unresolved": a.action_id in unresolved,
+            }
+            for a in actions
+        ],
+        "unresolved": len(unresolved),
+    }
+
+
+_HANDLERS: dict[str, Any] = {
+    "record_progress": _h_record_progress,
+    "checkpoint": _h_checkpoint,
+    "validate": _h_validate,
+    "resume": _h_resume,
+    "confirm": _h_confirm,
+    "intercept_action": _h_intercept_action,
+    "complete_action": _h_complete_action,
+    "fail_action": _h_fail_action,
+    "reconcile_action": _h_reconcile_action,
+    "compensate_action": _h_compensate_action,
+    "list_actions": _h_list_actions,
+}
+
+
+def list_methods() -> list[str]:
+    """The methods the sidecar exposes, for tooling and docs."""
+    return sorted(_HANDLERS)
+
+
+__all__ = [
+    "SidecarServer",
+    "SidecarHTTP",
+    "AGENT_SOURCE",
+    "SidecarAuth",
+    "SidecarError",
+    "MethodNotFound",
+    "NotAuthorized",
+    "BadParams",
+    "BadRequest",
+    "MalformedRunLog",
+    "MUTATING",
+    "MAX_SIDECAR_BODY_BYTES",
+    "SIDECAR_DRAIN_LIMIT_BYTES",
+    "list_methods",
+]

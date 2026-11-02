@@ -1,0 +1,142 @@
+"""Controlled failure scenarios with ground truth (issue 10).
+
+Eleven deterministic scenarios, each isolating one failure mode. Every
+scenario declares its expected recovery behaviour upfront so the harness is
+never grading against an assumption it also produced. The shapes follow
+project.md, for example dataset_change has checkpoint_version v3,
+environment_version v4, expected REPAIR_AND_RESUME.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+__all__ = [
+    "ControlledScenario",
+    "SCENARIOS",
+    "by_name",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ControlledScenario:
+    """One row of ground truth: a failure mode and the recovery it must get.
+
+    The fields are read by the harness, never by recovery itself:
+    ``checkpoint_version`` and ``environment_version`` describe the state the
+    scenario constructs (a moved pin, a changed model), and ``expected`` is
+    the ``RecoveryMode`` name the assessment must propose for that state.
+    ``description`` is prose for the results table, not a graded input.
+    """
+
+    scenario: str
+    checkpoint_version: str
+    environment_version: str
+    expected: str
+    description: str
+
+
+SCENARIOS: tuple[ControlledScenario, ...] = (
+    ControlledScenario(
+        scenario="process_crash",
+        checkpoint_version="v1",
+        environment_version="v1",
+        expected="RESUME",
+        description="Agent process killed after checkpoint, no environment change",
+    ),
+    ControlledScenario(
+        scenario="context_compaction",
+        checkpoint_version="v1",
+        environment_version="v1",
+        expected="RESUME",
+        description="Transcript compacted after checkpoint, state still valid",
+    ),
+    ControlledScenario(
+        scenario="tool_failure",
+        checkpoint_version="v1",
+        environment_version="v1",
+        # A returned error settles the action as FAILED (ledger.fail with
+        # certain=True), which is known not to have landed. The engine builds
+        # its uncertain set from UNKNOWN, STARTED and REQUIRES_REVIEW only, so a
+        # FAILED action never blocks the run. RESUME, not a "RETRY" mode the
+        # enum does not define.
+        expected="RESUME",
+        description="Tool returns error, retry is safe",
+    ),
+    ControlledScenario(
+        scenario="api_timeout",
+        checkpoint_version="v1",
+        environment_version="v1",
+        # A timeout is not evidence of absence: the request may have landed, so
+        # the ledger records UNKNOWN with side_effect_uncertain set
+        # (ledger.fail with certain=False). The engine's uncertain arm then
+        # proposes REQUEST_HUMAN in strict mode and WAIT in lenient, so this is
+        # the strict-mode value. The same shape as external_side_effect below,
+        # which already declares REQUEST_HUMAN, and project.md forbids a blind
+        # retry when the side effect is unknown.
+        expected="REQUEST_HUMAN",
+        description="External API timed out, side effect uncertain",
+    ),
+    ControlledScenario(
+        scenario="dataset_change",
+        checkpoint_version="v3",
+        environment_version="v4",
+        expected="REPAIR_AND_RESUME",
+        description="Pinned dataset moved, evidence derived from it is stale",
+    ),
+    ControlledScenario(
+        scenario="file_modification",
+        checkpoint_version="v2",
+        environment_version="v3",
+        expected="REPAIR_AND_RESUME",
+        description="File watched by checkpoint was modified",
+    ),
+    ControlledScenario(
+        scenario="permission_change",
+        checkpoint_version="v1",
+        environment_version="v1",
+        expected="REQUEST_HUMAN",
+        description="Credentials revoked, recovery requires human",
+    ),
+    ControlledScenario(
+        scenario="model_switch",
+        checkpoint_version="v1",
+        environment_version="v2",
+        expected="REPLAN",
+        description="Model changed, goal assumptions invalidated",
+    ),
+    ControlledScenario(
+        scenario="external_side_effect",
+        checkpoint_version="v1",
+        environment_version="v1",
+        expected="REQUEST_HUMAN",
+        description="Side effect outcome unknown after crash",
+    ),
+    ControlledScenario(
+        scenario="stale_decision",
+        checkpoint_version="v2",
+        environment_version="v3",
+        expected="REPAIR_AND_RESUME",
+        description="Decision rests on stale evidence",
+    ),
+    ControlledScenario(
+        scenario="partial_completion",
+        checkpoint_version="v1",
+        environment_version="v1",
+        expected="RESUME",
+        description="Some work done, checkpoint covers it, resume continues",
+    ),
+)
+
+
+def by_name(name: str) -> ControlledScenario:
+    """Return the scenario row with ``scenario == name``.
+
+    Raises ``KeyError`` when no scenario carries that name; the message
+    names the unknown scenario so a typo in a benchmark invocation is
+    diagnosable from the traceback alone.
+    """
+    for scenario in SCENARIOS:
+        if scenario.scenario == name:
+            return scenario
+    raise KeyError(f"unknown controlled scenario {name!r}")

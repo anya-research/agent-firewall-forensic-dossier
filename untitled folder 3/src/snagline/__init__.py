@@ -1,0 +1,72 @@
+"""SNAGLINE -- lightweight, dependency-free failure detection for AI agents.
+
+Public API (core, zero third-party dependencies):
+  * ``Monitor`` -- orchestrator with the fail-open guarantee. ``Monitor.default()``
+    returns a ready-to-use instance with the tier-1 detectors and console sink.
+  * ``StepEvent`` / ``EpisodeMeta`` / ``make_signature`` -- canonical schema.
+  * ``FailureRisk`` -- the signal detectors emit and sinks consume.
+  * ``severity_from_score`` / ``SEVERITY_*`` -- the score->severity mapping the
+    sinks route on, for custom sinks that filter the same way.
+  * ``Config`` -- all tunable thresholds in one place.
+  * ``watch`` -- the stdlib ``raw`` adapter for plain Python loops.
+
+Pre-execution authorization lives in ``snagline.authorize`` and is deliberately
+NOT re-exported here: it is a policy gate that can deny a tool call, which is a
+different product from the monitor's fail-open observation path. Import it
+explicitly (``from snagline.authorize import Policy``) so using it is a visible
+decision rather than an accidental side effect of importing SNAGLINE.
+"""
+
+from __future__ import annotations
+
+from snagline.adapters.raw import watch
+from snagline.baseline import (
+    BaselineProfile,
+    ToolBaseline,
+    fit_baseline_from_jsonl,
+    load_baseline,
+    save_baseline,
+)
+from snagline.config import Config
+from snagline.detectors.goal_drift import GoalDriftDetector
+from snagline.detectors.ml_ensemble import MLOrchestrator
+from snagline.events import EpisodeMeta, StepEvent, make_signature
+from snagline.monitor import Monitor
+from snagline.risk import (
+    SEVERITY_CRITICAL,
+    SEVERITY_INFO,
+    SEVERITY_WARNING,
+    FailureRisk,
+    TriggerType,
+    severity_from_score,
+)
+
+try:
+    from importlib.metadata import version
+
+    __version__ = version("snagline")
+except Exception:
+    __version__ = "0.1.1.dev0"
+
+__all__ = [
+    "__version__",
+    "Monitor",
+    "StepEvent",
+    "EpisodeMeta",
+    "make_signature",
+    "FailureRisk",
+    "TriggerType",
+    "severity_from_score",
+    "SEVERITY_CRITICAL",
+    "SEVERITY_WARNING",
+    "SEVERITY_INFO",
+    "Config",
+    "watch",
+    "BaselineProfile",
+    "ToolBaseline",
+    "fit_baseline_from_jsonl",
+    "save_baseline",
+    "load_baseline",
+    "GoalDriftDetector",
+    "MLOrchestrator",
+]

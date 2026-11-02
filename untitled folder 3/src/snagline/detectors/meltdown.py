@@ -1,0 +1,268 @@
+"""Meltdown detector (opt-in): entropy collapse / thrash detection.
+
+Long-horizon agents exhibit a characteristic transition called *meltdown*
+(arXiv:2603.29231, which detects it via sliding-window entropy over tool-call
+sequences): coherent behavior degrades into either rote repetition or chaotic
+churn. This detector computes exactly that statistic per episode.
+
+Per episode, maintain a sliding window of the last ``meltdown_window_size``
+**tool-call identities** (``tool_name``, falling back to a signature prefix).
+Each full window yields Shannon entropy H over the identity distribution:
+
+* ``H < meltdown_low_entropy``  -> the window collapsed onto essentially one
+  repeated tool. Rote looping that exact-signature matching misses whenever
+  args vary slightly (timestamps, page numbers, attempt counters).
+* ``H > meltdown_high_entropy`` -> pathological churn across many unrelated
+  tools: the "exploration spiral" shape. The paper's practical note is that
+  these are ambition mismatches where a context reset recovers value.
+
+Thresholds are in **bits**, tuned against fixtures so healthy purposeful work
+stays quiet: uniform alternation across eight tools (~2.97 bits at window 20)
+is below the default high threshold of 3.4 (about 10.5 tools uniform,
+2**3.4); collapse onto 1-2 tools (<0.4 bits) and churn across 12+
+(~3.52 bits) fire. An eight-tool ReAct agent used evenly is therefore in
+the quiet zone while 12 distinct tools in one window still triggers.
+Non-tool steps (message /
+plan_step / observation) do not feed the window -- they dilute the tool-call
+distribution the statistic reasons about.
+
+Re-arm discipline mirrors the other detectors: emit once per crossing, stay
+quiet while the condition persists, and re-arm only after ``rearm_steps``
+consecutive in-band steps so a second independent collapse still alerts.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import Counter, deque
+from typing import Any
+
+from snagline.config import Config
+from snagline.detectors.base import snapshot_items
+from snagline.detectors.windowing import effective_window_size
+from snagline.events import StepEvent
+from snagline.risk import FailureRisk
+
+
+class _EpisodeWindow:
+    """Sliding window + incremental counts for one episode."""
+
+    __slots__ = ("window", "counts")
+
+    def __init__(self) -> None:
+        self.window: deque[str] = deque()
+        self.counts: Counter[str] = Counter()
+
+    def push(self, key: str, maxlen: int) -> None:
+        self.window.append(key)
+        self.counts[key] += 1
+        # Pop while over, not once: push() appends exactly one item, so a
+        # single pop only ever holds a too-wide window at its current width.
+        # A window that arrives oversized -- a restore whose inferred
+        # position disagreed with the live target -- would then stay the
+        # wrong size for the rest of the episode, computing entropy over a
+        # sample the bit-tuned thresholds were not written for (issue #403).
+        while len(self.window) > maxlen:
+            old = self.window.popleft()
+            self.counts[old] -= 1
+            if self.counts[old] <= 0:
+                del self.counts[old]
+
+    def entropy(self) -> float:
+        total = len(self.window)
+        if total == 0:
+            return 0.0
+        h = 0.0
+        for c in self.counts.values():
+            p = c / total
+            h -= p * math.log2(p)
+        return h
+
+
+class MeltdownDetector:
+    name = "meltdown"
+
+    def __init__(
+        self,
+        window_size: int | None = None,
+        low_entropy: float | None = None,
+        high_entropy: float | None = None,
+        rearm_steps: int | None = None,
+        config: Config | None = None,
+    ) -> None:
+        cfg = config or Config()
+        self.window_size = (
+            window_size if window_size is not None else cfg.meltdown_window_size
+        )
+        self.low_entropy = (
+            low_entropy if low_entropy is not None else cfg.meltdown_low_entropy
+        )
+        self.high_entropy = (
+            high_entropy if high_entropy is not None else cfg.meltdown_high_entropy
+        )
+        self.rearm_steps = (
+            rearm_steps if rearm_steps is not None else cfg.meltdown_rearm_steps
+        )
+        if not (self.low_entropy < self.high_entropy):
+            raise ValueError("meltdown_low_entropy must be < meltdown_high_entropy")
+        # Issue #591: entropy is non-negative bits, so a negative or non-finite
+        # threshold is never a real bar -- ``H < low`` becomes unreachable and
+        # ``H > high`` trivially true. Config rejects this via
+        # _validated_counts_and_windows; this guard is defense in depth for a
+        # detector constructed directly, alongside the window check below.
+        for value, label in (
+            (self.low_entropy, "low_entropy"),
+            (self.high_entropy, "high_entropy"),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(
+                    f"{label} must be a finite, non-negative number of bits; "
+                    f"got {value!r}"
+                )
+        # Issue #346: below 3 the entropy statistic is vacuous -- a one-item
+        # window scores 0.0 bits by construction and a two-item window can only
+        # be 0.0 or 1.0 -- so the low threshold pages on an ordinary one-tool
+        # episode instead of a collapse. Config rejects this via
+        # _validated_counts_and_windows; this guard is defense in depth for a
+        # detector constructed directly.
+        if self.window_size < 3:
+            raise ValueError(
+                f"window_size must be >= 3; got {self.window_size!r}. Below 3 the "
+                "window cannot hold a distribution, so its entropy is always 0.0 "
+                "and the collapse alarm is trivially true"
+            )
+        self._eps: dict[str, _EpisodeWindow] = {}
+        self._fired: dict[str, bool] = {}
+        self._clear_streak: dict[str, int] = {}
+        # Window auto-scaling (issue #92): inert unless cfg.window_scale_steps
+        # > 0; the effective size is recomputed per step and handed to push(),
+        # which retains more items as the cap grows.
+        self._scale_steps = cfg.window_scale_steps
+        self._max_window = cfg.max_window
+        self._counts: dict[str, int] = {}
+
+    @staticmethod
+    def _identity(event: StepEvent) -> str:
+        # The full signature, never a prefix. This identity is only ever
+        # compared for equality and counted into the window's distribution --
+        # never displayed or stored per-character -- so truncation buys
+        # nothing and reintroduces issue #15's collision: two distinct actions
+        # sharing a 16-char prefix (endpoint-style signatures like
+        # ``search:database:alpha`` / ``:omega``) would collapse to one
+        # identity, deflating the window's entropy toward the "collapse"
+        # threshold and firing a false meltdown on healthy alternation. See
+        # ``make_signature`` in ``events.py``, which returns the full digest
+        # for exactly this reason.
+        return event.tool_name or event.action_signature
+
+    def observe(self, event: StepEvent) -> FailureRisk | None:
+        if event.action_type != "tool_call":
+            return None
+        ep = event.episode_id
+        n = self._counts.get(ep, 0) + 1
+        self._counts[ep] = n
+        target = effective_window_size(
+            self.window_size, n, self._scale_steps, self._max_window
+        )
+        w = self._eps.setdefault(ep, _EpisodeWindow())
+        w.push(self._identity(event), target)
+
+        # Readiness opens once the *base* window has filled, not the scaled
+        # target (issue #477). effective_window_size grows as base*ceil(n/steps),
+        # which outpaces the fill count n whenever window_size > scale_steps, so
+        # len(w.window) < target would never come true while scaling is active --
+        # silently delaying the first entropy check from step `window_size` to
+        # step `max_window` (and suppressing it entirely for shorter episodes).
+        # Scaling is meant to retain *more* history (a larger push cap above),
+        # not to postpone detection; the entropy statistic is meaningful over any
+        # window of at least window_size items, and the window keeps growing
+        # toward target on subsequent steps.
+        if len(w.window) < self.window_size:
+            return None
+
+        h = w.entropy()
+        in_band = self.low_entropy <= h <= self.high_entropy
+        if in_band:
+            streak = self._clear_streak.get(ep, 0) + 1
+            self._clear_streak[ep] = streak
+            if streak >= self.rearm_steps:
+                self._fired[ep] = False
+            return None
+
+        self._clear_streak[ep] = 0
+        if self._fired.get(ep, False):
+            return None
+        self._fired[ep] = True
+        distinct = len(w.counts)
+        if h < self.low_entropy:
+            score = 0.7
+            detail = (
+                f"tool-choice entropy collapsed to {h:.2f} bits "
+                f"({distinct} distinct in last {len(w.window)} steps)"
+            )
+        else:
+            score = 0.6
+            detail = (
+                f"tool-choice entropy spiked to {h:.2f} bits "
+                f"({distinct} distinct in last {len(w.window)} steps)"
+            )
+        return FailureRisk(
+            ep, event.step_id, score, "meltdown", detail, event.timestamp
+        )
+
+    def reset(self, episode_id: str) -> None:
+        self._eps.pop(episode_id, None)
+        self._counts.pop(episode_id, None)
+        self._fired.pop(episode_id, None)
+        self._clear_streak.pop(episode_id, None)
+
+    def dump_state(self) -> dict[str, Any]:
+        # snapshot_items: a concurrent ingest meeting a new episode must not
+        # change the key set mid-comprehension (issue #231).
+        return {
+            "window_size": self.window_size,
+            "windows": {ep: list(w.window) for ep, w in snapshot_items(self._eps)},
+            "counts": dict(self._counts),
+            "fired": dict(self._fired),
+            "clear_streak": dict(self._clear_streak),
+        }
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        snapshot_counts = state.get("counts", {})
+        # Tolerant .get(): pre-#92 snapshots carry no scaler positions, so
+        # each episode's position is inferred from the window it shipped.
+        # The inferred value must seed _counts as well, not merely size the
+        # window -- observe() reads _counts.get(ep, 0) to compute the target,
+        # so an episode left absent starts the scaler over at the base and
+        # the first post-restore observe refits the just-restored window away
+        # (issue #403).
+        # Everything is built into locals and published only once the whole
+        # snapshot has parsed. ``Monitor.restore_dict`` catches the
+        # ``ValueError`` a bad count raises and moves on, so assigning live
+        # attribute-by-attribute would leave the detector half-restored --
+        # rebuilt windows paired with the fired flags and clear streaks it
+        # still holds from live traffic -- with the live windows destroyed and
+        # nothing reporting the mismatch (review of #402).
+        eps: dict[str, _EpisodeWindow] = {}
+        new_counts: dict[str, int] = {}
+        for ep, keys in state.get("windows", {}).items():
+            w = _EpisodeWindow()
+            n = int(snapshot_counts.get(ep, len(keys)))
+            target = effective_window_size(
+                self.window_size, n, self._scale_steps, self._max_window
+            )
+            for key in keys:
+                w.push(key, target)
+            eps[ep] = w
+            new_counts[ep] = n
+        for ep, n in snapshot_counts.items():
+            # A position may exist without a window (an episode whose history
+            # expired but whose scaler position should survive a further
+            # restore), and it is authoritative when both are present.
+            new_counts.setdefault(ep, int(n))
+        fired = {ep: bool(v) for ep, v in state.get("fired", {}).items()}
+        clear_streak = {ep: int(v) for ep, v in state.get("clear_streak", {}).items()}
+        self._eps = eps
+        self._counts = new_counts
+        self._fired = fired
+        self._clear_streak = clear_streak

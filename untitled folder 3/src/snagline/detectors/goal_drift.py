@@ -1,0 +1,141 @@
+"""Goal-drift detector (next phase, step 2).
+
+Compares a live run's per-tool behavior against a *persisted healthy*
+``BaselineProfile`` (see ``snagline.baseline``) and flags meaningful drift: a
+rising error rate, latency blowing past the healthy mean by several sigmas, or
+tools that never appeared in the healthy baseline.
+
+The detector is dependency-free. An optional ``embedder`` callable
+(``StepEvent -> Sequence[float]``) is accepted for future content-level
+semantic drift, but the shipped behavior is the structural comparison above,
+which needs no ML dependency and stays safe for the zero-dep default.
+
+The detector is a no-op until a baseline is supplied, so it can be wired into
+``Monitor.default()`` behind ``Config.goal_drift_enabled`` without changing
+default behavior.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from snagline.baseline import BaselineProfile
+from snagline.config import Config
+from snagline.detectors.base import snapshot_items
+from snagline.events import StepEvent
+from snagline.risk import FailureRisk
+
+
+class GoalDriftDetector:
+    name = "goal_drift"
+
+    def __init__(
+        self,
+        baseline: BaselineProfile | None = None,
+        config: Config | None = None,
+        embedder: Any = None,
+    ) -> None:
+        self._baseline = baseline
+        self._cfg = config or Config()
+        self._embedder = embedder
+        # Per-episode live accumulation reuses BaselineProfile's accumulators.
+        self._live: dict[str, BaselineProfile] = {}
+        self._fired: dict[str, bool] = {}
+
+    def observe(self, event: StepEvent) -> FailureRisk | None:
+        if self._baseline is None:
+            return None
+        baseline = self._baseline
+        live = self._live.setdefault(event.episode_id, BaselineProfile())
+        live.add_event(event)
+        # Gate on the number of *tool-call* observations, not total_steps
+        # (issue #478). BaselineProfile.total_steps counts every event, but the
+        # drift score is built exclusively from per-tool tool_call stats
+        # (error_rate / latency, over live.tools). Gating on total_steps let an
+        # episode of mostly message/plan_step/observation steps clear the sample
+        # bar on non-representative volume and then score a tool's error_rate on
+        # a single sample -- so one errored tool call among a few messages fired
+        # at score 1.00. Counting the samples the score actually consumes keeps
+        # the detector quiet until there is enough tool history for a rate to
+        # mean anything. (The semantic detector in drift/goal_drift.py is
+        # unaffected: its centroid is computed over all events by design.)
+        tool_samples = sum(tb.count for tb in live.tools.values())
+        if tool_samples < self._cfg.goal_drift_min_samples:
+            return None
+        score = self._drift_score(event.episode_id, baseline)
+        if score < self._cfg.goal_drift_score_threshold:
+            # Below threshold: the episode has recovered from whatever fired
+            # before, so re-arm. Without this the latch held forever (issue
+            # #247) -- a long-lived episode that recovered from one drift and
+            # later hit a second, independent one never alerted again. This
+            # mirrors the re-arm semantics every other shipped detector has
+            # (loop clears when the signature leaves the window; the ESN
+            # CUSUM resets to re-alarm on persistent faults).
+            self._fired[event.episode_id] = False
+            return None
+        if self._fired.get(event.episode_id, False):
+            return None
+        self._fired[event.episode_id] = True
+        return FailureRisk(
+            event.episode_id,
+            event.step_id,
+            min(1.0, score),
+            "goal_drift",
+            f"behavior diverged from healthy baseline (score {score:.2f})",
+            event.timestamp,
+        )
+
+    def _drift_score(self, episode_id: str, baseline: BaselineProfile) -> float:
+        live = self._live[episode_id]
+        cfg = self._cfg
+        contributions: list[float] = []
+        for name, tb in live.tools.items():
+            ref = baseline.tools.get(name)
+            if ref is None:
+                # A tool that never ran in the healthy baseline is suspicious.
+                contributions.append(0.6)
+                continue
+            err_drift = max(
+                0.0, tb.error_rate - (ref.error_rate + cfg.goal_drift_error_tolerance)
+            )
+            if err_drift > 0:
+                contributions.append(min(1.0, err_drift * 2.0))
+            # Latency drift: compare live mean to the healthy mean. Floor the
+            # reference spread so a zero-variance baseline (all identical healthy
+            # latencies) does not treat any tiny deviation as infinite z.
+            if tb.mean_latency > 0 and ref.mean_latency > 0:
+                spread = max(ref.std_latency, 0.05 * ref.mean_latency, 1.0)
+                z = (tb.mean_latency - ref.mean_latency) / spread
+                if z > cfg.goal_drift_latency_k:
+                    contributions.append(
+                        min(1.0, (z - cfg.goal_drift_latency_k) / 10.0)
+                    )
+        if not contributions:
+            return 0.0
+        return min(1.0, sum(contributions))
+
+    def reset(self, episode_id: str) -> None:
+        self._live.pop(episode_id, None)
+        self._fired.pop(episode_id, None)
+
+    def dump_state(self) -> dict[str, Any]:
+        # snapshot_items: a concurrent ingest meeting a new episode must not
+        # change the key set mid-comprehension (issue #231).
+        return {
+            "live": {ep: p.to_dict() for ep, p in snapshot_items(self._live)},
+            "fired": dict(self._fired),
+        }
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        # Build both maps into locals before publishing either: a malformed
+        # payload (e.g. a non-dict "fired") must leave the prior live state
+        # intact so Monitor.restore_dict's "malformed ... ignored" containment
+        # is truthful (issue #417). Assigning self._live first would strand it
+        # against a stale self._fired if the second comprehension raised.
+        live = {
+            ep: BaselineProfile.from_dict(raw)
+            for ep, raw in state.get("live", {}).items()
+        }
+        fired = {ep: bool(v) for ep, v in state.get("fired", {}).items()}
+        self._live = live
+        self._fired = fired

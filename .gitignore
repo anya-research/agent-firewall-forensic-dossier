@@ -1,0 +1,39 @@
+# OS artifacts
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Python & testing cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+*.egg-info/
+dist/
+build/
+
+# Tooling and temporary worktrees
+.worktrees/
+.claude/worktrees/
+.opencode/
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Provenance Git Backups (the standalone verification bundles are in provenance_bundles/)
+*.git_backup
+.git_backup

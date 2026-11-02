@@ -1,0 +1,230 @@
+UNDER RESEARCH STRICT PROPRIETARY SOFTWARE LICENSE
+AND GLOBAL RESTRICTIVE COVENANT
+=============================================================
+
+Copyright (c) 2026 Under Research.
+Maintainer and Authorized Licensor: Cyrax321
+Official Repository: https://github.com/Cyrax321/SNAGLINE
+Official Contact: research@underresearch.com
+
+ALL RIGHTS STRICTLY RESERVED WORLDWIDE.
+
+LEGAL NOTICE:
+THIS IS A BINDING PROPRIETARY LEGAL AGREEMENT AND GLOBAL RESTRICTIVE
+COVENANT. ACCESSING, DOWNLOADING, CLONING, FORKING, VIEWING, INSPECTING,
+COMPILING, EXECUTING, OR USING ANY PORTION OF THIS SOFTWARE CONSTITUTES
+YOUR UNCONDITIONAL ACCEPTANCE OF ALL TERMS, COVENANTS, AND RESTRICTIONS
+CONTAINED HEREIN. IF YOU DO NOT AGREE TO THESE TERMS, YOU ARE STRICTLY
+PROHIBITED FROM ACCESSING, COPYING, OR USING THIS SOFTWARE IN ANY MANNER,
+ANYWHERE IN THE WORLD.
+
+
+1. EXCLUSIVE PROPRIETARY OWNERSHIP & SCOPE
+------------------------------------------
+The Software—including, without limitation, all source code, object code,
+byte code, logic, architectures, algorithms, heuristics, signatures, detectors,
+framework adapters, security policies, test fixtures, documentation, interfaces,
+and associated intellectual property assets (collectively, the "Software")—is
+the exclusive proprietary work, trade secret, and confidential property of
+Under Research ("Licensor").
+
+Under Research retains full, complete, exclusive, and unencumbered copyright,
+title, ownership, and all intellectual property rights in and to the Software
+in all countries and territories across the globe. Nothing in this License
+grants, transfers, conveys, or assigns any ownership, title, or proprietary
+interest to you or to any third party.
+
+
+2. ABSOLUTE PROHIBITION OF UNAUTHORIZED ACTS
+--------------------------------------------
+Except strictly to the extent required by mandatory, non-waivable statutory
+provisions of applicable law (such as non-derogable fair dealing provisions
+under Section 52 of the Indian Copyright Act, 1957, or mandatory reverse
+engineering provisions under Article 5(3) and Article 6 of EU Directive 2009/24/EC
+that cannot be contractually altered), NO PERMISSION, LICENSE, IMMUNITY, OR
+AUTHORIZATION (WHETHER EXPRESS, IMPLIED, BY ESTOPPEL, OR OTHERWISE) IS GRANTED.
+
+Under Research expressly prohibits any individual, company, organization,
+governmental entity, or third party from performing any of the following acts
+without prior, express, written authorization executed by Under Research:
+
+  (a) COPYING & REPRODUCTION: You shall not copy, duplicate, reproduce, clone,
+      fork, mirror, snapshot, store, archive, scrape, or cache the Software, or
+      any portion, file, class, function, method, AST, or line of code thereof,
+      in any physical, digital, cloud, or virtual medium.
+
+  (b) MODIFICATION & DERIVATIVE WORKS: You shall not modify, adapt, alter, edit,
+      patch, translate, refactor, enhance, combine, or prepare derivative works
+      based upon the Software or any portion thereof.
+
+  (c) DISTRIBUTION & DISSEMINATION: You shall not distribute, publish, broadcast,
+      circulate, share, transmit, transfer, convey, publicly display, publicly
+      perform, or communicate the Software to the public through any medium,
+      repository, package index, package manager, or network channel.
+
+  (d) COMMERCIAL EXPLOITATION & SUBLICENSING: You shall not sell, resell, lease,
+      rent, loan, sublicense, distribute, package, or commercially exploit the
+      Software, or provide access to its functionality as a service (SaaS),
+      managed service, cloud offering, or hosted solution.
+
+  (e) REBRANDING & REPACKAGING: You shall not repackage, rebrand, rename, or
+      redistribute the Software, or any derivative or subset thereof, under a
+      different name, moniker, trade name, organization, or corporate entity.
+
+  (f) REVERSE ENGINEERING: You shall not decompile, disassemble, reverse engineer,
+      or attempt to reconstruct or discover the source code, internal logic, or
+      underlying algorithms of any binary, byte-compiled, or obfuscated component,
+      except strictly where such prohibition is expressly invalid under
+      non-waivable statutory law.
+
+  (g) ARTIFICIAL INTELLIGENCE & MACHINE LEARNING INGESTION: You shall not use,
+      ingest, scrape, tokenize, or process the Software, its code, structure, or
+      documentation as training data, fine-tuning data, validation data, or
+      ground truth for any machine learning model, large language model (LLM),
+      code synthesis engine, neural network, or artificial intelligence system.
+
+  (h) SUPPRESSION OF NOTICES: You shall not remove, obscure, delete, or alter
+      any copyright notice, trademark, proprietary designation, disclaimer, or
+      Copyright Management Information (CMI) contained in or affixed to the
+      Software.
+
+
+3. MULTI-JURISDICTIONAL LEGAL ENFORCEMENT & RIGHT TO SUE
+--------------------------------------------------------
+Under Research actively audits and vigorously protects its intellectual property
+globally.
+
+Any unauthorized copying, cloning, forking, reproduction, extraction,
+distribution, modification, reverse engineering, commercial use, or infringement
+of this Software constitutes an intentional, willful violation of applicable
+intellectual property and computer protection laws across jurisdictions, including:
+
+  (i)   INTERNATIONAL TREATIES & CONVENTIONS:
+        - The Berne Convention for the Protection of Literary and Artistic Works;
+        - The WIPO Copyright Treaty (WCT);
+        - The Universal Copyright Convention (UCC); and
+        - The Agreement on Trade-Related Aspects of Intellectual Property Rights
+          (TRIPS Agreement).
+
+  (ii)  INDIA:
+        - Section 51 and Section 55 of the Indian Copyright Act, 1957 (Infringement
+          and Civil Remedies);
+        - Sections 73 and 74 of the Indian Contract Act, 1872 (Breach of Contract);
+        - Specific Relief Act, 1963 (Injunctions and Specific Enforcement); and
+        - Section 43 and Section 66 of the Information Technology Act, 2000
+          (Unauthorized copying, extraction, and downloading of computer data/code).
+
+  (iii) UNITED STATES:
+        - Title 17 of the United States Code (U.S. Copyright Act, 17 U.S.C. § 101
+          et seq., including § 501 Infringement);
+        - The Digital Millennium Copyright Act (17 U.S.C. § 1201 Anti-Circumvention
+          and § 1202 Integrity of Copyright Management Information);
+        - The Defend Trade Secrets Act of 2016 (DTSA, 18 U.S.C. § 1836 et seq.)
+          and applicable state Uniform Trade Secrets Acts (UTSA); and
+        - The Computer Fraud and Abuse Act (CFAA, 18 U.S.C. § 1030).
+
+  (iv)  UNITED KINGDOM & COMMONWEALTH:
+        - The Copyright, Designs and Patents Act 1988 (CDPA 1988);
+        - The Computer Misuse Act 1990;
+        - The Australian Copyright Act 1968; and
+        - The Singapore Copyright Act 2021.
+
+  (v)   EUROPEAN UNION:
+        - Directive 2009/24/EC on the legal protection of computer programs;
+        - Directive 2001/29/EC (InfoSoc Directive);
+        - Directive (EU) 2016/943 on the protection of undisclosed know-how and
+          business information (Trade Secrets Directive); and
+        - Directive (EU) 2019/790 on copyright in the Digital Single Market.
+
+IN THE EVENT OF ANY INFRINGEMENT OR BREACH, UNDER RESEARCH RESERVES ALL RIGHTS
+TO INITIATE IMMEDIATE CIVIL LITIGATION AND PURSUE ALL REMEDIES AVAILABLE AT LAW
+AND IN EQUITY IN ANY COURT OF COMPETENT JURISDICTION, INCLUDING:
+
+  (a) IMMEDIATE INJUNCTIVE RELIEF: The user acknowledges that unauthorized
+      copying, disclosure, or distribution causes immediate, irreversible, and
+      irreparable harm to Under Research for which monetary damages alone are
+      inadequate. Under Research shall be entitled to seek and obtain immediate
+      ex-parte temporary restraining orders (TROs), preliminary injunctions,
+      interlocutory injunctions, permanent injunctions, search and seizure orders
+      (including Anton Piller orders), asset-freezing orders (Mareva injunctions),
+      and John Doe / Ashok Kumar orders from any competent court worldwide
+      without the necessity of proving actual monetary damages or posting a bond.
+
+  (b) ACTUAL DAMAGES, STATUTORY DAMAGES & DISGORGEMENT OF PROFITS: Under
+      Research shall be entitled to seek and recover all actual economic damages
+      suffered, statutory damages where provided by applicable law (such as under
+      17 U.S.C. § 504), full restitution, and an accounting and disgorgement of
+      all revenues, gross profits, and commercial advantages derived by the
+      infringing party from the unauthorized handling of the Software.
+
+  (c) LEGAL FEES & INVESTIGATION COSTS: To the fullest extent permitted under
+      applicable law, the infringing party shall be strictly liable to reimburse
+      Under Research for all attorney's fees, advocate fees, court costs, expert
+      witness fees, and forensic/investigative expenses incurred in identifying,
+      halting, and litigating the infringement.
+
+  (d) IMPOUNDMENT, SEIZURE & DESTRUCTION: Under Research shall be entitled to an
+      order mandating the immediate impoundment, delivery up, deletion, and
+      irreversible destruction of all infringing copies, forks, mirrors, and
+      derivative works, together with all storage media holding the same.
+
+
+4. TRADEMARKS AND BRANDING
+--------------------------
+"SNAGLINE", "Under Research", the Under Research emblems, and all associated
+product names, logos, and stylizations are exclusive proprietary trademarks of
+Under Research. No license, right, or permission to use any trademark, service
+mark, trade name, or brand is granted under this License.
+
+
+5. DISCLAIMER OF WARRANTIES
+---------------------------
+TO THE MAXIMUM EXTENT PERMITTED UNDER APPLICABLE LAW:
+THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY,
+CONDITION, OR REPRESENTATION OF ANY KIND, EITHER EXPRESS, IMPLIED, STATUTORY,
+OR OTHERWISE. UNDER RESEARCH EXPRESSLY DISCLAIMS ALL WARRANTIES, INCLUDING,
+WITHOUT LIMITATION, ANY IMPLIED WARRANTIES OF TITLE, NON-INFRINGEMENT,
+MERCHANTABILITY, SATISFACTORY QUALITY, ACCURACY, SYSTEM INTEGRATION, QUIET
+ENJOYMENT, OR FITNESS FOR A PARTICULAR PURPOSE.
+
+
+6. LIMITATION OF LIABILITY
+--------------------------
+TO THE FULLEST EXTENT PERMITTED BY APPLICABLE LAW:
+IN NO EVENT SHALL UNDER RESEARCH, CYRAX321, OR ITS AUTHORIZED REPRESENTATIVES
+BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE
+DAMAGES ARISING OUT OF OR IN CONNECTION WITH THE ACCESS, USE, OR INABILITY TO
+USE THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+
+7. GOVERNING LAW, JURISDICTION & WORLDWIDE ENFORCEMENT
+------------------------------------------------------
+This License, and all claims, disputes, or proceedings arising out of or
+relating to this Software, its unauthorized copying, or its intellectual property,
+shall be governed by, interpreted, and construed in accordance with the
+substantive laws of India, including the Indian Copyright Act, 1957, the Indian
+Contract Act, 1872, and the Specific Relief Act, 1963, without regard to conflict
+of law rules.
+
+Subject to mandatory statutory provisions, the courts of competent jurisdiction
+in India shall have primary jurisdiction over disputes arising hereunder.
+Notwithstanding the foregoing, Under Research reserves the irrevocable,
+unrestricted right to commence legal proceedings, file lawsuits, and seek
+injunctive relief, asset freezing, search orders, and enforcement of judgments
+in any court of competent jurisdiction worldwide where the infringing party
+resides, is incorporated, does business, operates computer systems, maintains
+servers, or holds assets.
+
+
+8. AUTHORIZATION AND COMMERCIAL LICENSING INQUIRIES
+---------------------------------------------------
+Any use, deployment, commercialization, reproduction, or distribution of this
+Software beyond the terms explicitly stated herein requires a prior, formal,
+written commercial license agreement duly executed by Under Research.
+
+For all licensing inquiries, enterprise permissions, or legal notices, contact:
+
+  Under Research
+  Authorized Representative: Cyrax321
+  Email: research@underresearch.com
+  GitHub: https://github.com/Cyrax321

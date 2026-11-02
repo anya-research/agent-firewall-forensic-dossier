@@ -1,0 +1,664 @@
+"""Phase 6 recovery-correctness scenarios.
+
+Each scenario exercises one stress condition against the real recovery
+machinery (engine, validator, checkpoints, ledger, adapter funnel) and asserts
+the system behaves safely. They are plain callables taking a ``ScenarioContext``
+so they run both under pytest and the standalone benchmark script without
+depending on a test framework.
+"""
+
+from __future__ import annotations
+
+import time
+import types
+from dataclasses import replace
+from typing import Any, NoReturn
+
+from continuum.actions.ledger import ActionLedger
+from continuum.adapters import recover, register_adapter
+from continuum.adapters.base import AgentAdapter
+from continuum.benchmark.phase6.harness import ScenarioContext, ScenarioFn
+from continuum.checkpoint import CheckpointManager
+from continuum.concurrency import InMemoryLeaseCoordinator
+from continuum.environment import StaticProvider, capture
+from continuum.events import EventType
+from continuum.models import (
+    EnvironmentSnapshot,
+    EnvResource,
+    RecoveryContract,
+    RecoveryMode,
+    RecoverySafety,
+    Run,
+    SemanticState,
+    StateStatus,
+)
+from continuum.recovery import (
+    DependencyGraph,
+    MemoryLedgerBackend,
+    RecoveryEngine,
+    RecoveryLedger,
+)
+from continuum.recovery.ledger import LedgerLockError
+from continuum.recovery.risk import ingest_risk, ingest_risk_json_line
+from continuum.storage import SQLiteStorage
+from continuum.testing import environment_fixture
+
+__all__ = [
+    "ALL_SCENARIOS",
+    "env_multi",
+    "scenario_adapter_failure_across_environments",
+    "scenario_checkpoint_rollback_correctness",
+    "scenario_concurrent_recovery_safety",
+    "scenario_external_edit_drift",
+    "scenario_human_verdict_honored",
+    "scenario_large_state_recovery_latency",
+    "scenario_ledger_tamper_detected",
+    "scenario_missing_dependency_graph_fallback",
+    "scenario_multi_dependency_corruption",
+    "scenario_out_of_scope_side_effect",
+    "scenario_plan_aware_resume_skips_completed_units",
+    "scenario_recovery_lease_exhaustion",
+    "scenario_risk_fail_open_resilience",
+    "scenario_risk_loop_replan",
+    "scenario_risk_meltdown_rollback",
+    "scenario_risk_side_effect_abort",
+    "scenario_scoped_attempt_budget",
+    "scenario_single_dependency_corruption",
+    "scenario_transient_network_failure_on_install",
+    "seed_two",
+]
+
+
+def _new_store() -> SQLiteStorage:
+    storage = SQLiteStorage(":memory:")
+    storage.create_run(Run(run_id="run_1", goal="scenario"))
+    storage.append_event("run_1", EventType.RUN_STARTED, {"goal": "scenario", "total": 10})
+    return storage
+
+
+def env_multi(**versions: str) -> EnvironmentSnapshot:
+    """Build an environment snapshot from resource name to version pairs."""
+    return capture(
+        "run_1",
+        StaticProvider(
+            resources={
+                name: EnvResource(name=name, version=value) for name, value in versions.items()
+            }
+        ),
+    )
+
+
+def seed_two(store: SQLiteStorage) -> None:
+    """Two dependencies, each with its own evidence and finding."""
+    store.append_event(
+        "run_1", EventType.DEPENDENCY_DECLARED, {"resource": "dataset", "version": "v3"}
+    )
+    store.append_event(
+        "run_1", EventType.DEPENDENCY_DECLARED, {"resource": "other", "version": "v3"}
+    )
+    store.append_event(
+        "run_1",
+        EventType.EVIDENCE_ADDED,
+        {"evidence_id": "ev_a", "summary": "a", "source": "dataset"},
+    )
+    store.append_event(
+        "run_1",
+        EventType.EVIDENCE_ADDED,
+        {"evidence_id": "ev_b", "summary": "b", "source": "other"},
+    )
+    store.append_event(
+        "run_1", EventType.FINDING_ADDED, {"finding_id": "f_a", "claim": "A", "evidence": ["ev_a"]}
+    )
+    store.append_event(
+        "run_1", EventType.FINDING_ADDED, {"finding_id": "f_b", "claim": "B", "evidence": ["ev_b"]}
+    )
+    CheckpointManager(store).checkpoint("run_1", environment=env_multi(dataset="v3", other="v3"))
+
+
+def _state(store: SQLiteStorage) -> SemanticState:
+    return CheckpointManager(store).restore("run_1").state
+
+
+def _contract(version: int = 0) -> RecoveryContract:
+    return RecoveryContract(
+        run_id="run_1", checkpoint_version=version, recovery_status=RecoverySafety.REQUIRES_REPAIR
+    )
+
+
+# --- scenarios ------------------------------------------------------------- #
+
+
+def scenario_single_dependency_corruption(ctx: ScenarioContext) -> None:
+    """One stale dependency invalidates only its own subtree."""
+    with environment_fixture(dependencies=("dataset", "other")) as fx:
+        decision = fx.engine.assess(
+            fx.run_id, current_environment=fx.capture(dataset="v2"), scope={"dataset"}
+        )
+    assert "dataset" in str(decision.contract.invalidated)
+    other = decision.state.dependency("other")
+    assert other is not None and other.status is StateStatus.VALID
+
+
+def scenario_multi_dependency_corruption(ctx: ScenarioContext) -> None:
+    """Stale dependencies are each reported invalid."""
+    with environment_fixture(dependencies=("dataset", "other")) as fx:
+        decision = fx.engine.assess(
+            fx.run_id, current_environment=fx.capture(dataset="v2", other="v2")
+        )
+    assert "dataset" in str(decision.contract.invalidated)
+    assert "other" in str(decision.contract.invalidated)
+
+
+def scenario_external_edit_drift(ctx: ScenarioContext) -> None:
+    """An external edit after anchoring reports drift on reconcile."""
+    store = _new_store()
+    seed_two(store)
+    decision = RecoveryEngine(store).assess(
+        "run_1", current_environment=env_multi(dataset="v4", other="v3"), scope={"dataset"}
+    )
+    ledger = RecoveryLedger(MemoryLedgerBackend())
+    ledger.append_decision("run_1", decision.contract, anchor=True)
+    behind = types.SimpleNamespace(version=decision.contract.checkpoint_version - 1)
+    report = ledger.reconcile("run_1", behind)
+    assert report.drift is True
+
+
+def scenario_ledger_tamper_detected(ctx: ScenarioContext) -> None:
+    """A tampered ledger entry fails verification at its index."""
+    backend = MemoryLedgerBackend()
+    ledger = RecoveryLedger(backend)
+    ledger.append_decision("run_1", _contract(0))
+    ledger.append_decision("run_1", _contract(1))
+    entries = ledger.entries("run_1")
+    tampered = replace(entries[0], note="hacked")
+    backend.replace("run_1", [tampered, entries[1]])
+    ok, broken_at = ledger.verify("run_1")
+    assert ok is False and broken_at == 0
+
+
+def scenario_recovery_lease_exhaustion(ctx: ScenarioContext) -> None:
+    """Exhausted recovery attempts require a human."""
+    ledger = RecoveryLedger(MemoryLedgerBackend())
+    for _ in range(3):
+        ledger.record_attempt("run_1")
+    ctx.attempts = ledger.attempts("run_1")
+    assert ledger.attempts("run_1") == 3
+    assert ledger.requires_human("run_1", max_attempts=3) is True
+
+
+def scenario_scoped_attempt_budget(ctx: ScenarioContext) -> None:
+    """A noisy dependency cannot spend another dependency's budget (#744).
+
+    The counterpart to ``recovery_lease_exhaustion``: the same three attempts,
+    this time attributable, gate only the dependency that earned them.
+    """
+    ledger = RecoveryLedger(MemoryLedgerBackend())
+    for _ in range(3):
+        ledger.record_attempt("run_1", scope="dataset", max_attempts=3)
+    ctx.attempts = ledger.attempts("run_1", scope="dataset")
+    assert ledger.requires_human("run_1", scope="dataset", max_attempts=3) is True
+
+    # The point of the budget: "other" keeps its full allowance and its own
+    # account, so a safe repair path for it stays open.
+    assert ledger.requires_human("run_1", scope="other", max_attempts=3) is False
+    assert ledger.record_attempt("run_1", scope="other") == 1
+
+    # An ownership-less query still escalates, through the scoped marker rather
+    # than a count: unknown ownership must not read a known escalation as clean.
+    assert ledger.requires_human("run_1", max_attempts=3) is True
+
+    # Conflicting ownership opens no private budget: the attempt charges the
+    # run-wide bucket, which the escalation above already gates.
+    ledger.record_attempt("run_1", scope=["dataset", "other"])
+    assert ledger.attempts("run_1") == 1
+    assert ledger.attempts("run_1", scope="other") == 1
+
+    # The contract carries the scope and what is left of it to a reader.
+    store = _new_store()
+    seed_two(store)
+    decision = RecoveryEngine(store, ledger=ledger).assess(
+        "run_1", current_environment=env_multi(dataset="v4", other="v3"), scope={"dataset"}
+    )
+    assert any(
+        str(e).startswith("recovery budget:") and "scope dataset" in str(e)
+        for e in decision.contract.evidence
+    )
+
+
+def scenario_out_of_scope_side_effect(ctx: ScenarioContext) -> None:
+    """An uncertain side effect tagged outside the repair scope must not block."""
+    store = _new_store()
+    seed_two(store)
+    ledger = ActionLedger(store, "run_1")
+    ledger.claim("model.push", {"x": 1}, dep_scope="other")
+    decision = RecoveryEngine(store).assess(
+        "run_1", current_environment=env_multi(dataset="v4", other="v3"), scope={"dataset"}
+    )
+    assert decision.mode is RecoveryMode.REPAIR_AND_RESUME
+    assert decision.uncertain_actions == ()
+
+    # Conservative counterpart: an untagged action still blocks the scoped call.
+    ledger.claim("notify.slack", {"x": 2})
+    rescope = RecoveryEngine(store).assess(
+        "run_1", current_environment=env_multi(dataset="v4", other="v3"), scope={"dataset"}
+    )
+    assert rescope.mode is not RecoveryMode.RESUME
+    assert len(rescope.uncertain_actions) == 1
+
+
+def scenario_adapter_failure_across_environments(ctx: ScenarioContext) -> None:
+    """An adapter failure during recovery surfaces instead of being swallowed."""
+
+    class FailingAdapter(AgentAdapter):
+        """Test double whose every capability raises."""
+
+        def __init__(self, storage: object, **kwargs: Any) -> None:
+            self._storage = storage
+
+        def capture_state(self, *a: Any, **k: Any) -> NoReturn:
+            """Raise instead of capturing state."""
+            raise NotImplementedError
+
+        def restore_state(self, *a: Any, **k: Any) -> NoReturn:
+            """Raise instead of restoring state."""
+            raise NotImplementedError
+
+        def intercept_action(self, *a: Any, **k: Any) -> NoReturn:
+            """Raise instead of intercepting an action."""
+            raise NotImplementedError
+
+        def resume(
+            self,
+            run_id: str,
+            *,
+            current_environment: Any = None,
+            expected_model: Any = None,
+            replay: bool = True,
+        ) -> NoReturn:
+            """Raise instead of resuming the run."""
+            raise RuntimeError("adapter failure across environment")
+
+    register_adapter("fail_p6", lambda: FailingAdapter)
+    try:
+        recover("fail_p6", "x", SQLiteStorage(":memory:"))
+        ctx.fail("adapter failure was swallowed instead of surfaced")
+    except RuntimeError:
+        pass
+
+
+def scenario_checkpoint_rollback_correctness(ctx: ScenarioContext) -> None:
+    """Restoring without replay returns the checkpointed version."""
+    store = _new_store()
+    seed_two(store)
+    mgr = CheckpointManager(store)
+    target = mgr.restore("run_1").state.version
+    store.append_event("run_1", EventType.WORK_COMPLETED, {})
+    store.append_event("run_1", EventType.WORK_COMPLETED, {})
+    rolled_back = mgr.restore("run_1", replay=False)
+    assert rolled_back.checkpoint is not None
+    assert rolled_back.state.version == target
+    assert len(rolled_back.state.external_dependencies) == 2
+
+
+def scenario_concurrent_recovery_safety(ctx: ScenarioContext) -> None:
+    """A second holder cannot append while the lease is held."""
+    coordinator = InMemoryLeaseCoordinator()
+    assert coordinator.acquire("run_1", "holder-A")
+    ledger = RecoveryLedger(MemoryLedgerBackend(), lock=coordinator, holder_id="holder-B")
+    try:
+        ledger.append_decision("run_1", _contract(0))
+        ctx.fail("second holder appended while the lease was held")
+    except LedgerLockError:
+        pass
+    coordinator.release("run_1", "holder-A")
+    ledger.append_decision("run_1", _contract(0))
+    assert len(ledger.entries("run_1")) == 1
+
+
+def scenario_large_state_recovery_latency(ctx: ScenarioContext) -> None:
+    """Assessing a hundred dependencies stays within the latency budget."""
+    store = _new_store()
+    n = 100
+    for i in range(n):
+        store.append_event(
+            "run_1", EventType.DEPENDENCY_DECLARED, {"resource": f"dep{i}", "version": "v1"}
+        )
+        store.append_event(
+            "run_1",
+            EventType.EVIDENCE_ADDED,
+            {"evidence_id": f"e{i}", "summary": "x", "source": f"dep{i}"},
+        )
+        store.append_event(
+            "run_1",
+            EventType.FINDING_ADDED,
+            {"finding_id": f"f{i}", "claim": "x", "evidence": [f"e{i}"]},
+        )
+    base = {f"dep{i}": EnvResource(name=f"dep{i}", version="v1") for i in range(n)}
+    CheckpointManager(store).checkpoint(
+        "run_1", environment=capture("run_1", StaticProvider(resources=base))
+    )
+    current = capture(
+        "run_1", StaticProvider(resources={**base, "dep0": EnvResource(name="dep0", version="v2")})
+    )
+    start = time.perf_counter()
+    RecoveryEngine(store).assess("run_1", current_environment=current)
+    elapsed = (time.perf_counter() - start) * 1000
+    ctx.metrics["assess_ms"] = round(elapsed, 3)
+    assert elapsed < 1000.0
+
+
+def scenario_missing_dependency_graph_fallback(ctx: ScenarioContext) -> None:
+    """Assessment without a dependency graph still yields a decision."""
+    store = _new_store()
+    seed_two(store)
+    decision = RecoveryEngine(store).assess("run_1", current_environment=env_multi(other="v3"))
+    assert decision is not None and decision.mode is not None
+    impacted = DependencyGraph(_state(store)).impacted_by(set())
+    assert impacted.all_items == frozenset()
+
+
+def scenario_human_verdict_honored(ctx: ScenarioContext) -> None:
+    """An approved human gate clears the pending gate."""
+    ledger = RecoveryLedger(MemoryLedgerBackend())
+    ledger.append_decision("run_1", _contract(0), gate="required")
+    assert ledger.pending_gate("run_1") is not None
+    ledger.record_gate("run_1", "approved")
+    assert ledger.pending_gate("run_1") is None
+
+
+def scenario_plan_aware_resume_skips_completed_units(ctx: ScenarioContext) -> None:
+    """Plan-aware resume does zero duplicate work for completed units (#468).
+
+    Starts a 5-unit linear plan via PLAN_UPSERT, completes 2 units, then
+    reprojects from the log the way a post-crash resume would. Units 1-2
+    must not be re-executed while 3-5 remain. Mirrors examples/plan_milestones.py.
+    """
+    from continuum.state.semantic import project
+
+    store = _new_store()
+    units = [
+        {
+            "id": f"u{i}",
+            "title": f"milestone {i}",
+            "status": "pending",
+            "depends_on": [f"u{i - 1}"] if i > 1 else [],
+        }
+        for i in range(1, 6)
+    ]
+    store.append_event("run_1", EventType.PLAN_UPSERT, {"plan_id": "p1", "units": units})
+    store.append_event(
+        "run_1",
+        EventType.PLAN_UPSERT,
+        {
+            "plan_id": "p1",
+            "units": [
+                {"id": "u1", "title": "milestone 1", "status": "done", "depends_on": []},
+                {
+                    "id": "u2",
+                    "title": "milestone 2",
+                    "status": "done",
+                    "depends_on": ["u1"],
+                },
+            ],
+        },
+    )
+    # Post-crash resume reads the log fresh rather than trusting memory.
+    # Both lists derive from the full projected plan in one pass: the metric
+    # must be able to fire on its own, not inherit an already-filtered list.
+    resumed = project("run_1", store.read_events("run_1"))
+    completed = [u.step_id for u in resumed.plan if u.status.value == "completed"]
+    remaining = [u.step_id for u in resumed.plan if u.status.value != "completed"]
+    assert remaining == ["u3", "u4", "u5"], remaining
+    scheduled = set(remaining)
+    duplicates = [c for c in completed if c in scheduled]
+    ctx.metrics["duplicate_completed_units"] = len(duplicates)
+    ctx.metrics["remaining_units"] = remaining
+    assert not duplicates, f"completed units would re-execute: {duplicates}"
+
+
+def scenario_transient_network_failure_on_install(ctx: ScenarioContext) -> None:
+    """A vanished dependency keeps the run unsafe to resume."""
+    store = _new_store()
+    store.append_event(
+        "run_1", EventType.DEPENDENCY_DECLARED, {"resource": "libx", "version": "v1"}
+    )
+    store.append_event(
+        "run_1", EventType.EVIDENCE_ADDED, {"evidence_id": "ev_x", "summary": "x", "source": "libx"}
+    )
+    current = env_multi()
+    decision = RecoveryEngine(store).assess("run_1", current_environment=current)
+    assert decision.mode is not None
+    assert decision.safe is False
+
+
+# --- continuous-monitoring fault injection (#1426) ------------------------- #
+#
+# Four scenarios that inject mid-run RISK_OBSERVED events into a live
+# trajectory. Each asserts the recovery engine picks the mode the risk policy
+# demands and that the surrounding machinery (checkpoint, action ledger,
+# fail-open ingestion) holds, so a risk-informed policy can be measured against
+# regressions instead of only unit-mocked.
+
+
+def _seed_plan(store: SQLiteStorage, unit_ids: tuple[str, ...]) -> None:
+    """Upsert a linear plan whose unit ids are ``unit_ids``, in order."""
+    units = [
+        {
+            "id": uid,
+            "title": uid,
+            "status": "pending",
+            "depends_on": [unit_ids[i - 1]] if i else [],
+        }
+        for i, uid in enumerate(unit_ids)
+    ]
+    store.append_event("run_1", EventType.PLAN_UPSERT, {"plan_id": "p1", "units": units})
+
+
+def _record_accuracy(ctx: ScenarioContext, expected: RecoveryMode, actual: RecoveryMode) -> None:
+    """Record the decision-accuracy metric for one policy expectation.
+
+    Accuracy is 1.0 when the engine chose the mode the policy demands for the
+    injected trigger and 0.0 otherwise, so a suite run averages a real number
+    across scenarios rather than counting passes.
+    """
+    ctx.metrics["expected_mode"] = expected.value
+    ctx.metrics["actual_mode"] = actual.value
+    ctx.metrics["decision_accuracy"] = 1.0 if actual is expected else 0.0
+
+
+def scenario_risk_loop_replan(ctx: ScenarioContext) -> None:
+    """A repeating-tool-action signal drives REPLAN with located guidance.
+
+    The risk feed reports the same tool actions repeating on two plan steps.
+    The engine must propose replan rather than resume, and the decision has to
+    name the steps to avoid so a replanning agent gets something actionable:
+    a verdict that says only "loop" leaves it re-deriving which unit to drop.
+    A step the feed never flagged must stay out of the guidance.
+    """
+    store = _new_store()
+    _seed_plan(store, ("ingest", "analyze", "report"))
+    seed_two(store)
+    clean = env_multi(dataset="v3", other="v3")
+    # Baseline: with no risk signal the run is safe to resume, so the REPLAN
+    # below is attributable to the injected signal alone.
+    baseline = RecoveryEngine(store).assess("run_1", current_environment=clean)
+    assert baseline.mode is RecoveryMode.RESUME, baseline.rationale
+
+    # Four observations across two repeating steps: repetition is the signal,
+    # and the duplicate must not turn into four pieces of guidance.
+    start = time.perf_counter()
+    for step in ("analyze", "report", "analyze", "report"):
+        assert ingest_risk(store, "run_1", {"trigger": "loop", "step_id": step, "score": 0.9})
+    ctx.metrics["ingest_ms_per_step"] = round((time.perf_counter() - start) * 1000 / 4, 3)
+
+    decision = RecoveryEngine(store).assess("run_1", current_environment=clean)
+    _record_accuracy(ctx, RecoveryMode.REPLAN, decision.mode)
+    assert decision.mode is RecoveryMode.REPLAN, decision.rationale
+    assert decision.contract.recovery_status is RecoverySafety.REQUIRES_REVALIDATION
+    assert "risk loop triggers replan" in decision.contract.reason
+    # Located guidance: the two repeating steps in first-seen order, and the
+    # untouched step absent.
+    assert "repeating steps to avoid: analyze, report" in decision.contract.reason
+    assert "ingest" not in decision.contract.reason
+    # The contract pins the events that produced the verdict.
+    assert len(decision.contract.triggering_risks) == 4
+    ctx.metrics["duplicate_side_effects"] = 0
+
+
+def scenario_risk_meltdown_rollback(ctx: ScenarioContext) -> None:
+    """An error cascade with a meltdown on top rolls back to verified facts.
+
+    Meltdown is the more cautious trigger, so it must outrank error_cascade's
+    WAIT even though the cascade was observed first. The rollback target is the
+    checkpoint taken after the verified fact gathering, so evidence collected
+    before the meltdown survives the verdict.
+    """
+    store = _new_store()
+    _seed_plan(store, ("gather", "analyze"))
+    seed_two(store)
+    clean = env_multi(dataset="v3", other="v3")
+    verified = CheckpointManager(store).restore("run_1")
+    assert verified.checkpoint is not None, "scenario needs a checkpoint to roll back to"
+    gathered = {e.evidence_id for e in verified.state.evidence}
+    assert gathered == {"ev_a", "ev_b"}
+
+    # Mid-trajectory cascade, then a meltdown: order must not matter, severity
+    # does.
+    assert ingest_risk(store, "run_1", {"trigger": "error_cascade", "score": 0.8})
+    assert ingest_risk(store, "run_1", {"trigger": "meltdown", "score": 0.99})
+
+    decision = RecoveryEngine(store).assess("run_1", current_environment=clean)
+    _record_accuracy(ctx, RecoveryMode.ROLLBACK, decision.mode)
+    assert decision.mode is RecoveryMode.ROLLBACK, decision.rationale
+    assert decision.contract.recovery_status is RecoverySafety.BLOCKED
+    assert "risk meltdown triggers rollback" in decision.contract.reason
+    # A meltdown carries no step_id, so the guidance stays unlocated.
+    assert "repeating steps to avoid" not in decision.contract.reason
+    # The rollback lands on the verified fact-gathering checkpoint and the
+    # evidence gathered before it is still in scope.
+    rolled_back = decision.restored
+    assert rolled_back.checkpoint is not None
+    assert rolled_back.checkpoint.version == verified.checkpoint.version
+    assert gathered <= {e.evidence_id for e in decision.state.evidence}
+    ctx.metrics["duplicate_side_effects"] = 0
+
+
+def scenario_risk_fail_open_resilience(ctx: ScenarioContext) -> None:
+    """Corrupted and torn risk-feed lines never disturb a running trajectory.
+
+    Ingestion is fail-open, so a noisy or broken probe drops its line instead
+    of blocking the run. Every line must be classified without raising, the
+    well-formed ones must land as RISK_OBSERVED events, and the run must still
+    reach a verdict with its verified state intact afterwards.
+    """
+    store = _new_store()
+    seed_two(store)
+    clean = env_multi(dataset="v3", other="v3")
+    # A torn observation: the feed split one record across two reads. Each
+    # half is unusable on its own; only the reassembled whole lands.
+    torn_a = '{"trigger": "latency_anomaly", "step_id": "anal'
+    torn_b = 'yze", "score": 0.4}'
+    feed: list[tuple[str, bool]] = [
+        ('{"trigger": "loop", "step_id": "analyze", "score": 0.9}', True),
+        ("", False),  # a blank read is not a signal
+        ("{not json", False),  # corrupt payload
+        ('{"trigger": ""}', False),  # present but empty trigger
+        ('{"trigger": "latency_anomaly"}', True),  # annotate-only, still recorded
+        ("null", False),  # valid JSON, not an object
+        ("[1, 2, 3]", False),  # array, not an object
+        ('{"trigger": null}', False),  # absent trigger
+        (torn_a, False),  # torn read, first half
+        (torn_b, False),  # torn read, second half
+        (torn_a + torn_b, True),  # reassembled and retried
+    ]
+    start = time.perf_counter()
+    landed = 0
+    for line, expected_ok in feed:
+        accepted = ingest_risk_json_line(store, "run_1", line)
+        assert accepted is expected_ok, (
+            f"line {line!r}: accepted {accepted}, expected {expected_ok}"
+        )
+        landed += accepted
+    ctx.metrics["lines_fed"] = len(feed)
+    ctx.metrics["lines_landed"] = landed
+    ctx.metrics["ingest_ms_per_step"] = round((time.perf_counter() - start) * 1000 / len(feed), 3)
+    assert landed == 3, f"expected 3 well-formed lines to land, got {landed}"
+
+    # Zero crashes: the run still assesses, and its verified state is untouched
+    # by the noise on the feed.
+    decision = RecoveryEngine(store).assess("run_1", current_environment=clean)
+    _record_accuracy(ctx, RecoveryMode.REPLAN, decision.mode)
+    assert decision.mode is RecoveryMode.REPLAN, decision.rationale
+    for name in ("dataset", "other"):
+        dep = decision.state.dependency(name)
+        assert dep is not None and dep.status is StateStatus.VALID, name
+    ctx.metrics["duplicate_side_effects"] = 0
+
+
+def scenario_risk_side_effect_abort(ctx: ScenarioContext) -> None:
+    """A duplicate side-effect signal aborts and settles without a second run.
+
+    The feed reports a side effect firing twice. The engine must choose ABORT,
+    the most cautious mode, and the action ledger must settle the repeated
+    claim against the already-completed record rather than opening a second
+    slot: one action, one result, zero duplicate executions.
+    """
+    store = _new_store()
+    seed_two(store)
+    clean = env_multi(dataset="v3", other="v3")
+    ledger = ActionLedger(store, "run_1")
+    first = ledger.claim("notify.slack", {"channel": "#incidents"})
+    assert first.fresh
+    ledger.complete(first.key, external_id="msg-1", result={"ok": True})
+
+    assert ingest_risk(
+        store,
+        "run_1",
+        {
+            "trigger": "side_effect_duplicate",
+            "score": 1.0,
+            # Structured diagnostics, the shape the risk schema expects: the
+            # feed describes what it saw, and ingestion is fail-open either way.
+            "detail": {"action": "notify.slack", "observed": 2},
+        },
+    )
+
+    decision = RecoveryEngine(store).assess("run_1", current_environment=clean)
+    _record_accuracy(ctx, RecoveryMode.ABORT, decision.mode)
+    assert decision.mode is RecoveryMode.ABORT, decision.rationale
+    assert decision.contract.recovery_status is RecoverySafety.UNSAFE
+    assert "risk side_effect_duplicate triggers abort" in decision.contract.reason
+    assert decision.contract.next_allowed_action is None
+
+    # Settlement: the repeated claim resolves to the completed record instead
+    # of executing again.
+    repeat = ledger.claim("notify.slack", {"channel": "#incidents"})
+    assert repeat.fresh is False
+    assert repeat.result == {"ok": True}
+    records = ledger.all()
+    assert len(records) == 1, [a.action_id for a in records]
+    assert records[0].external_id == "msg-1"
+    ctx.metrics["duplicate_side_effects"] = len(records) - 1
+
+
+ALL_SCENARIOS: list[tuple[str, ScenarioFn]] = [
+    ("single_dependency_corruption", scenario_single_dependency_corruption),
+    ("multi_dependency_corruption", scenario_multi_dependency_corruption),
+    ("external_edit_drift", scenario_external_edit_drift),
+    ("ledger_tamper_detected", scenario_ledger_tamper_detected),
+    ("recovery_lease_exhaustion", scenario_recovery_lease_exhaustion),
+    ("scoped_attempt_budget", scenario_scoped_attempt_budget),
+    ("out_of_scope_side_effect", scenario_out_of_scope_side_effect),
+    ("adapter_failure_across_environments", scenario_adapter_failure_across_environments),
+    ("checkpoint_rollback_correctness", scenario_checkpoint_rollback_correctness),
+    ("concurrent_recovery_safety", scenario_concurrent_recovery_safety),
+    ("large_state_recovery_latency", scenario_large_state_recovery_latency),
+    ("missing_dependency_graph_fallback", scenario_missing_dependency_graph_fallback),
+    ("human_verdict_honored", scenario_human_verdict_honored),
+    ("transient_network_failure_on_install", scenario_transient_network_failure_on_install),
+    ("plan_aware_resume_skips_completed_units", scenario_plan_aware_resume_skips_completed_units),
+    ("risk_loop_replan", scenario_risk_loop_replan),
+    ("risk_meltdown_rollback", scenario_risk_meltdown_rollback),
+    ("risk_fail_open_resilience", scenario_risk_fail_open_resilience),
+    ("risk_side_effect_abort", scenario_risk_side_effect_abort),
+]

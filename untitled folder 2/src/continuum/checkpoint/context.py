@@ -1,0 +1,500 @@
+"""Bounded recovery context.
+
+When an agent resumes, it needs to be told what it was doing, but handing it
+the transcript defeats the purpose. This module renders the *minimum sufficient
+context*: what the goal is, what is verified, what is no longer trustworthy, and
+what it is allowed to do next.
+
+Two rules shape the output:
+
+**Stale state is shown, not hidden.** A recovered agent that is not told its
+dataset changed will confidently continue with invalid assumptions. Doubt is
+part of the context.
+
+**It fits in a budget.** Sections are rendered in priority order and truncated
+from the least important end, so a large run degrades by dropping detail rather
+than by blowing the context window.
+
+Token counts here are *estimates* from a character heuristic, not a tokenizer.
+CONTINUUM does not depend on a model provider, and pulling in a tokenizer for a
+size hint would be a poor trade. The estimate is labelled as such everywhere it
+appears, and the benchmark will measure real tokens when it measures anything.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+
+from continuum.models import (
+    ApprovalStatus,
+    SemanticState,
+    StateStatus,
+)
+from continuum.state.semantic import (
+    account_pins_in_context,
+    pin_markers_for_state,
+)
+
+__all__ = [
+    "RecoveryContext",
+    "ContextSection",
+    "build_recovery_context",
+    "estimate_tokens",
+]
+
+#: Rough characters-per-token. English prose sits near 4; structured text with
+#: many short tokens sits lower. Used only for budgeting, never for billing.
+_CHARS_PER_TOKEN = 4
+
+_TERMINAL = frozenset(
+    {StateStatus.INVALID, StateStatus.PARTIAL, StateStatus.STALE, StateStatus.CONFLICTED}
+)
+
+#: Sections that survive budget truncation unconditionally, by exact title. The
+#: stale state must reach a resuming agent even if nothing else does.
+_NEVER_DROPPED = frozenset(
+    {
+        "CURRENT GOAL",
+        "VERIFIED PROGRESS",
+        "STALE STATE: DO NOT RELY ON",
+    }
+)
+
+
+def estimate_tokens(text: str) -> int:
+    """Approximate token count. A heuristic, not a tokenizer."""
+    return max(1, round(len(text) / _CHARS_PER_TOKEN)) if text else 0
+
+
+@dataclass(frozen=True, slots=True)
+class ContextSection:
+    """One titled block of the recovery context."""
+
+    title: str
+    lines: tuple[str, ...]
+    priority: int
+    """Lower is more important; high-priority sections survive truncation."""
+
+    def render(self) -> str:
+        """Format the section as a titled text block with indented lines.
+
+        Returns an empty string if ``lines`` is empty, otherwise returns the
+        title followed by each line indented by two spaces.
+        """
+        if not self.lines:
+            return ""
+        body = "\n".join(f"  {line}" for line in self.lines)
+        return f"{self.title}\n{body}"
+
+    @property
+    def estimated_tokens(self) -> int:
+        """Approximate token count for the rendered section.
+
+        Uses the characters-per-token heuristic from :func:`estimate_tokens`
+        for budget calculations without requiring an external tokenizer.
+        """
+        return estimate_tokens(self.render())
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryContext:
+    """The reconstructed briefing handed to a resuming agent."""
+
+    run_id: str
+    sections: tuple[ContextSection, ...] = ()
+    dropped_sections: tuple[str, ...] = ()
+    truncated: bool = False
+    notes: tuple[str, ...] = field(default=())
+    # When truncated, whether the notice lists the dropped titles. It is set
+    # False only when that list would not fit the budget (issue #1350); the
+    # dropped_sections field always carries the full list for programmatic
+    # callers regardless.
+    detail_notice: bool = True
+
+    def render(self) -> str:
+        """Render the complete briefing text across all populated sections.
+
+        Joins non-empty rendered sections with double newlines. If sections were
+        omitted to satisfy a token budget, appends a truncation notice; the
+        notice names the dropped section titles unless that list would not fit
+        the budget, in which case a compact notice is used instead.
+        """
+        blocks = [section.render() for section in self.sections if section.lines]
+        text = "\n\n".join(blocks)
+        if self.truncated:
+            if self.detail_notice and self.dropped_sections:
+                dropped = ", ".join(self.dropped_sections)
+                text += f"\n\n[context truncated to fit budget; omitted: {dropped}]"
+            else:
+                text += "\n\n[context truncated to fit budget]"
+        return text
+
+    @property
+    def estimated_tokens(self) -> int:
+        """Approximate token count for the complete rendered briefing.
+
+        Evaluates the full rendered text against the characters-per-token
+        heuristic to check compliance with context-window budgets.
+        """
+        return estimate_tokens(self.render())
+
+    def __str__(self) -> str:
+        return self.render()
+
+
+def _pins_section(state: SemanticState) -> ContextSection:
+    """Active constraint pins with hash-tagged markers (issue #418).
+
+    Each active pin emits a marker like [pin:constraint_id:abc12345] where
+    abc12345 is the first 8 chars of the sha256. The marker is the source
+    of truth for accounting, not a summarizer's self-report.
+    """
+    if not state.pins:
+        return ContextSection("ACTIVE CONSTRAINTS", (), priority=1)
+    # Markers come from the shared public emitter, so the section and the
+    # accounting that reads it agree on how a pin is spelled (issue #1099).
+    markers = dict(zip(state.pins, pin_markers_for_state(state), strict=True))
+    lines = [
+        f"{pin.constraint_id}:{pin.sha256[:8]} {markers[pin.constraint_id]}"
+        for pin in sorted(state.pins.values(), key=lambda p: p.constraint_id)
+    ]
+    return ContextSection("ACTIVE CONSTRAINTS", tuple(lines), priority=1)
+
+
+def _goal_section(state: SemanticState) -> ContextSection:
+    origin = state.goal.provenance.origin.value
+    seq = state.goal.provenance.source_sequence
+    tag = f" [provenance: {origin} seq:{seq}]" if seq is not None else f" [provenance: {origin}]"
+    lines = [f"{state.goal.description}  (goal v{state.goal.version}){tag}"]
+    lines += [f"constraint: {c}" for c in state.goal.constraints]
+    return ContextSection("CURRENT GOAL", tuple(lines), priority=0)
+
+
+def _progress_section(state: SemanticState) -> ContextSection:
+    p = state.progress
+    total = "unknown" if p.total is None else str(p.total)
+    origin = p.provenance.origin.value
+    seq = p.provenance.source_sequence
+    tag = f" [provenance: {origin} seq:{seq}]" if seq is not None else f" [provenance: {origin}]"
+    line = f"{p.completed} completed, {p.pending} pending, {p.failed} failed (of {total}){tag}"
+    lines = [line, f"derived from events 1..{state.source_sequence}"]
+    return ContextSection("VERIFIED PROGRESS", tuple(lines), priority=1)
+
+
+def _stale_section(state: SemanticState) -> ContextSection:
+    """Everything the agent must not rely on. Highest priority after the goal."""
+    lines: list[str] = []
+    for decision in state.decisions:
+        if decision.status in _TERMINAL:
+            reason = decision.invalidated_reason or "no reason recorded"
+            origin = decision.provenance.origin.value
+            seq = decision.provenance.source_sequence
+            tag = (
+                f" [provenance: {origin} seq:{seq}]"
+                if seq is not None
+                else f" [provenance: {origin}]"
+            )
+            lines.append(f"[{decision.status}] decision {decision.decision_id}: {reason}{tag}")
+    for finding in state.findings:
+        if finding.status in _TERMINAL:
+            origin = finding.provenance.origin.value
+            seq = finding.provenance.source_sequence
+            tag = (
+                f" [provenance: {origin} seq:{seq}]"
+                if seq is not None
+                else f" [provenance: {origin}]"
+            )
+            lines.append(f"[{finding.status}] finding {finding.finding_id}: {finding.claim}{tag}")
+    for dependency in state.external_dependencies:
+        if dependency.status in _TERMINAL:
+            lines.append(
+                f"[{dependency.status}] dependency {dependency.resource} "
+                f"(recorded version {dependency.version})"
+            )
+    for approval in state.approvals:
+        if approval.status in (ApprovalStatus.EXPIRED, ApprovalStatus.REVOKED):
+            lines.append(f"[{approval.status}] approval {approval.approval_id}: {approval.subject}")
+
+    dangling = sorted(state.dangling_evidence())
+    if dangling:
+        lines.append(f"evidence cited but unavailable: {', '.join(dangling)}")
+
+    return ContextSection("STALE STATE: DO NOT RELY ON", tuple(lines), priority=2)
+
+
+def _review_section(state: SemanticState) -> ContextSection:
+    """Inferred or unverified state that a human or a check must confirm."""
+    lines = [
+        f"[{d.status}] decision {d.decision_id}: {d.decision} [provenance: {d.provenance.origin.value} seq:{d.provenance.source_sequence}]"
+        for d in state.decisions
+        if d.status is StateStatus.REQUIRES_REVIEW
+    ]
+    lines += [
+        f"[{f.status}] finding {f.finding_id}: {f.claim} [provenance: {f.provenance.origin.value} seq:{f.provenance.source_sequence}]"
+        for f in state.findings
+        if f.status is StateStatus.REQUIRES_REVIEW
+    ]
+    if state.model and state.model.model_specific_state:
+        lines += [
+            f"model-specific: {item.description} ({item.required_validation})"
+            for item in state.model.model_specific_state
+        ]
+    return ContextSection("REQUIRES REVIEW", tuple(lines), priority=3)
+
+
+def _decisions_section(state: SemanticState, limit: int) -> ContextSection:
+    valid = state.valid_decisions()
+    lines = [
+        f"{d.decision_id}: {d.decision} [provenance: {d.provenance.origin.value} seq:{d.provenance.source_sequence}]"
+        for d in valid[:limit]
+    ]
+    if len(valid) > limit:
+        lines.append(f"... and {len(valid) - limit} more valid decisions")
+    return ContextSection("VALID DECISIONS", tuple(lines), priority=4)
+
+
+def _pending_section(state: SemanticState, limit: int) -> ContextSection:
+    work = state.open_work()
+    lines = [
+        f"{w.task_id}: {w.description} [provenance: {w.provenance.origin.value} seq:{w.provenance.source_sequence}]"
+        for w in work[:limit]
+    ]
+    if len(work) > limit:
+        lines.append(f"... and {len(work) - limit} more pending tasks")
+    return ContextSection("PENDING TASKS", tuple(lines), priority=5)
+
+
+def _findings_section(state: SemanticState, limit: int) -> ContextSection:
+    usable = [f for f in state.findings if f.status is StateStatus.VALID]
+    ranked = sorted(usable, key=lambda f: (-f.confidence, f.finding_id))
+    lines = [
+        f"{f.finding_id} ({f.confidence:.2f}): {f.claim} [provenance: {f.provenance.origin.value} seq:{f.provenance.source_sequence}]"
+        for f in ranked[:limit]
+    ]
+    if len(ranked) > limit:
+        lines.append(f"... and {len(ranked) - limit} more findings")
+    return ContextSection("RELEVANT FINDINGS", tuple(lines), priority=6)
+
+
+def _dependencies_section(state: SemanticState) -> ContextSection:
+    lines = [
+        f"{d.resource}: {d.version or 'unversioned'} [{d.status}]"
+        for d in state.external_dependencies
+        if d.status not in _TERMINAL
+    ]
+    return ContextSection("EXTERNAL DEPENDENCIES", tuple(lines), priority=7)
+
+
+def _provenance_map_section(state: SemanticState) -> ContextSection:
+    """Per-fact origin map that survives compaction (issue #294).
+
+    Each line names a durable fact, its origin, and the hash-chained source
+    position it was asserted at. The map is the compaction output's audit
+    trail: a consumer that only sees the briefing still sees per-fact trust
+    instead of a single summary-level level, and each reference stays
+    resolvable to its original chain entry via sequence/event_id.
+    """
+    lines: list[str] = []
+    origin = state.goal.provenance.origin.value
+    seq = state.goal.provenance.source_sequence
+    eid = state.goal.provenance.source_event_id
+    tag = (
+        f"seq:{seq} id:{eid[:12] if eid else '-'}"
+        if seq is not None
+        else f"id:{eid[:12] if eid else '-'}"
+    )
+    lines.append(f"goal: {origin} {tag}")
+    p = state.progress
+    origin = p.provenance.origin.value
+    seq = p.provenance.source_sequence
+    eid = p.provenance.source_event_id
+    tag = (
+        f"seq:{seq} id:{eid[:12] if eid else '-'}"
+        if seq is not None
+        else f"id:{eid[:12] if eid else '-'}"
+    )
+    lines.append(f"progress: {origin} {tag}")
+    for d in sorted(state.decisions, key=lambda x: x.decision_id):
+        origin = d.provenance.origin.value
+        seq = d.provenance.source_sequence
+        eid = d.provenance.source_event_id
+        tag = (
+            f"seq:{seq} id:{eid[:12] if eid else '-'}"
+            if seq is not None
+            else f"id:{eid[:12] if eid else '-'}"
+        )
+        lines.append(f"decision {d.decision_id}: {origin} {tag}")
+    for f in sorted(state.findings, key=lambda x: x.finding_id):
+        origin = f.provenance.origin.value
+        seq = f.provenance.source_sequence
+        eid = f.provenance.source_event_id
+        tag = (
+            f"seq:{seq} id:{eid[:12] if eid else '-'}"
+            if seq is not None
+            else f"id:{eid[:12] if eid else '-'}"
+        )
+        lines.append(f"finding {f.finding_id}: {origin} {tag}")
+    for e in sorted(state.evidence, key=lambda x: x.evidence_id):
+        origin = e.provenance.origin.value
+        seq = e.provenance.source_sequence
+        eid = e.provenance.source_event_id
+        tag = (
+            f"seq:{seq} id:{eid[:12] if eid else '-'}"
+            if seq is not None
+            else f"id:{eid[:12] if eid else '-'}"
+        )
+        lines.append(f"evidence {e.evidence_id}: {origin} {tag}")
+    for pin in sorted(state.pins.values(), key=lambda x: x.constraint_id):
+        origin = pin.provenance.origin.value
+        seq = pin.provenance.source_sequence
+        eid = pin.provenance.source_event_id
+        tag = (
+            f"seq:{seq} id:{eid[:12] if eid else '-'}"
+            if seq is not None
+            else f"id:{eid[:12] if eid else '-'}"
+        )
+        lines.append(f"pin {pin.constraint_id}: {origin} {tag}")
+    return ContextSection(
+        "PROVENANCE MAP - per-fact origin (hash-chained)", tuple(lines), priority=8
+    )
+
+
+def build_recovery_context(
+    state: SemanticState,
+    *,
+    token_budget: int | None = None,
+    max_items: int = 10,
+    next_action: str | None = None,
+    environment_changes: Sequence[str] = (),
+    pin_grace_seconds: int | None = None,
+    pin_strict: bool = False,
+) -> RecoveryContext:
+    """Assemble a bounded briefing for a resuming agent.
+
+    Sections are dropped from the least important end when a budget is given.
+    The goal, verified progress and stale state are never dropped: an agent that
+    resumes without knowing what it must distrust is worse than one that does
+    not resume at all.
+    """
+    sections = [
+        _goal_section(state),
+        _pins_section(state),
+        _progress_section(state),
+        _stale_section(state),
+        _review_section(state),
+        _decisions_section(state, max_items),
+        _pending_section(state, max_items),
+        _findings_section(state, max_items),
+        _dependencies_section(state),
+        _provenance_map_section(state),
+    ]
+
+    if environment_changes:
+        sections.append(
+            ContextSection("ENVIRONMENT CHANGES", tuple(environment_changes), priority=2)
+        )
+    if next_action:
+        sections.append(ContextSection("NEXT SAFE ACTION", (next_action,), priority=0))
+
+    populated = [s for s in sections if s.lines]
+    populated.sort(key=lambda s: s.priority)
+
+    if token_budget is None:
+        ctx = RecoveryContext(run_id=state.run_id, sections=tuple(populated))
+        # Accounting: check if any active pin is absent past grace
+        if state.pins:
+            rendered = ctx.render()
+            accounting = account_pins_in_context(
+                state, rendered, grace_seconds=pin_grace_seconds, strict=pin_strict
+            )
+            flags = [info["flag"] for info in accounting.values() if info["flag"]]
+            if flags:
+                # Advisory flag: add to notes, strict escalation is handled by caller
+                ctx = RecoveryContext(
+                    run_id=ctx.run_id,
+                    sections=ctx.sections,
+                    dropped_sections=ctx.dropped_sections,
+                    truncated=ctx.truncated,
+                    notes=tuple(list(ctx.notes) + flags),
+                )
+        return ctx
+
+    kept: list[ContextSection] = []
+    dropped: list[str] = []
+    # The goal, verified progress and stale state are never sacrificed, regardless
+    # of where they land in the priority sort. Protection is by section identity so
+    # that an injected higher-priority section (e.g. NEXT SAFE ACTION at priority 0)
+    # cannot push STALE STATE out of the protected set.
+    never_dropped = _NEVER_DROPPED
+
+    def _tokens(
+        kept_sections: list[ContextSection], dropped_titles: list[str], *, detail: bool
+    ) -> int:
+        # Measure as the context will actually render, notice included. The
+        # pre-#1350 loop built each candidate with the default truncated=False,
+        # so the truncation notice -- part of the output, and growing with every
+        # dropped title -- never entered the fit decision, and the returned
+        # context overflowed the budget by exactly that notice.
+        return RecoveryContext(
+            run_id=state.run_id,
+            sections=tuple(kept_sections),
+            dropped_sections=tuple(dropped_titles),
+            truncated=bool(dropped_titles),
+            detail_notice=detail,
+        ).estimated_tokens
+
+    # Reserve only the compact-notice cost while deciding what to keep: the
+    # compact form is the minimum we can always fall back to, so charging just
+    # that keeps the most content. The detailed (title-listing) notice is
+    # restored afterward only if it still fits.
+    for section in populated:
+        if section.title in never_dropped:
+            kept.append(section)
+            continue
+        if _tokens([*kept, section], dropped, detail=False) <= token_budget:
+            kept.append(section)
+        else:
+            dropped.append(section.title)
+
+    # Dropping the section that overflowed enlarges the notice, which can push
+    # an already-kept section back over the budget. Converge: while the
+    # assembled context still exceeds the budget, drop the lowest-priority
+    # droppable section and re-measure. never_dropped sections are exempt, so
+    # this terminates once only protected sections remain -- the contract
+    # promises a fit only when they fit (#1350).
+    while dropped and _tokens(kept, dropped, detail=False) > token_budget:
+        droppable = [s for s in kept if s.title not in never_dropped]
+        if not droppable:
+            break
+        victim = droppable[-1]
+        kept = [s for s in kept if s is not victim]
+        dropped.append(victim.title)
+
+    # Keep the detailed notice when it fits; otherwise drop to the compact form.
+    detail_notice = (not dropped) or _tokens(kept, dropped, detail=True) <= token_budget
+
+    ctx = RecoveryContext(
+        run_id=state.run_id,
+        sections=tuple(kept),
+        dropped_sections=tuple(dropped),
+        truncated=bool(dropped),
+        detail_notice=detail_notice,
+    )
+    # Accounting for budgeted context
+    if state.pins:
+        rendered = ctx.render()
+        accounting = account_pins_in_context(
+            state, rendered, grace_seconds=pin_grace_seconds, strict=pin_strict
+        )
+        flags = [info["flag"] for info in accounting.values() if info["flag"]]
+        if flags:
+            ctx = RecoveryContext(
+                run_id=ctx.run_id,
+                sections=ctx.sections,
+                dropped_sections=ctx.dropped_sections,
+                truncated=ctx.truncated,
+                notes=tuple(list(ctx.notes) + flags),
+                detail_notice=ctx.detail_notice,
+            )
+    return ctx

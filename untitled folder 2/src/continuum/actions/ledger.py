@@ -1,0 +1,1873 @@
+"""The action ledger: remembering external side effects.
+
+Storage gives durability for *state*. It cannot give exactly-once semantics for
+effects on other systems, because the effect and the record of it are two
+separate writes with a gap between them. The ledger's job is to make that gap
+observable rather than invisible.
+
+The protocol
+------------
+
+::
+
+    key = ledger.claim(...)      # 1. write intent  (STARTED)
+    result = do_the_thing()      # 2. perform the effect
+    ledger.complete(key, ...)    # 3. record the outcome (COMPLETED)
+
+A crash can land anywhere:
+
+* **before 1**: nothing happened. Retry is safe.
+* **between 1 and 2**: intent recorded, effect may or may not have occurred.
+  On recovery the action is ``STARTED`` with no result: **the effect is of
+  unknown status.** The ledger refuses to guess.
+* **between 2 and 3**: the effect definitely happened but was never recorded.
+  Indistinguishable from the previous case *from the ledger alone*, which is
+  precisely why it must not be resolved by assumption.
+* **after 3**: fully recorded. A repeat call returns the stored result.
+
+Why not just retry?
+-------------------
+
+Retrying an unrecorded action is only safe if the operation is naturally
+idempotent. Creating a GitHub issue, charging a card and sending an email are
+not. Retrying duplicates them; skipping may drop them. Neither default is
+correct, so the ledger raises ``UnknownSideEffect`` and requires the caller to
+supply a reconciler, usually a cheap read against the external system that can
+answer "did this actually happen?".
+
+This is honest at-least-once with mandatory reconciliation, not exactly-once.
+The distinction is documented rather than marketed away.
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
+from datetime import timedelta
+from functools import wraps
+from heapq import merge
+from pathlib import Path
+from typing import Any, Concatenate, NamedTuple, ParamSpec, TypeVar
+
+from continuum.actions.grants import GrantDenied, normalize_grant, scan_grants
+from continuum.actions.idempotency import (
+    IdempotencyKey,
+    arguments_hash,
+    idempotency_key,
+    identity_tokens,
+    leaf_tokens,
+    location_tokens,
+    locations_agree,
+    resolve_authorization_id,
+)
+from continuum.budgets import (
+    DEFAULT_BUDGETS_PATH,
+    BudgetConfigError,
+    ensure_authorization_entry,
+    increment,
+    load_budgets,
+    save_budgets,
+    would_refuse,
+)
+from continuum.concurrency.lease import LeaseCoordinator
+from continuum.events import Event, EventType
+from continuum.models import Action, ActionStatus, ConsumedInputs, Origin, UnknownSideEffect, utcnow
+from continuum.security.hashing import canonical_sanitize, stable_hash
+from continuum.storage.base import Storage
+
+_ACTION_EVENT_TYPES = (
+    EventType.ACTION_RECORDED,
+    EventType.ACTION_RECONCILED,
+    EventType.ACTION_COMPENSATED,
+)
+
+
+def fold_action_events(events: Any) -> dict[str, Action]:
+    """Fold action events into ``{key: Action}``, last write per key wins.
+
+    Shared by :meth:`ActionLedger._replay` and the cross-run scan behind
+    unscoped claims so both read the log with identical semantics.
+    """
+    actions: dict[str, Action] = {}
+    for event in events:
+        if event.type not in _ACTION_EVENT_TYPES:
+            continue
+        payload = dict(event.payload)
+        key = str(payload.get("key", ""))
+        if not key:
+            continue
+        actions[key] = Action.model_validate(payload["action"])
+    return actions
+
+
+__all__ = [
+    "ActionLedger",
+    "ActionOutcome",
+    "ClaimResolution",
+    "LedgerError",
+    "ClaimLockError",
+    "fold_action_events",
+    "forensic_join_across_runs",
+]
+
+
+class ClaimResolution(NamedTuple):
+    """How :meth:`ActionLedger.claim` would resolve a claim, without recording.
+
+    The retry-budget gate needs the answer a claim *would* give before it
+    decides whether to allow one, so the two share this read-only resolution
+    rather than each keeping its own (issue #1080).
+    """
+
+    key: IdempotencyKey
+    existing: Action | None
+    foreign: Action | None
+
+    @property
+    def opens_slot(self) -> bool:
+        """Whether ``claim`` would record a new attempt slot for this resolution.
+
+        Nothing is opened when a record already answers (COMPLETED, returned as
+        a stored result) or waits on reconciliation (UNKNOWN, raised as
+        UnknownSideEffect), nor while another run is mid-flight on the same
+        unscoped identity (STARTED, foreign or local). A fresh key, and a
+        settled FAILED or COMPENSATED record whose effect may legitimately be
+        performed again, all open one. That set, and only it, is what a retry
+        budget may gate (issue #309).
+        """
+        # A record held by another run settles an unscoped claim the same way a
+        # local one does, so it gates the same way: only the run-local lookup
+        # having missed is what sent the resolution looking abroad.
+        record = self.existing if self.existing is not None else self.foreign
+        return record is None or record.status in (
+            ActionStatus.FAILED,
+            ActionStatus.COMPENSATED,
+        )
+
+
+def _stem(token: str) -> str:
+    """The basename-stem of a token, used to recognise derived spellings.
+
+    ``INV-001.sent`` and ``INV-001`` are the same resource rendered more or less
+    verbosely, so the matcher treats the former as derived from the latter. A
+    token without an extension returns itself, which keeps plain words and ids
+    self-derived.
+    """
+    stem, _ = os.path.splitext(token)
+    return stem
+
+
+# Extensions accepted as genuine file suffixes for the stem-derivation rule
+# (issue #67, option 2). A dotted extra token is only treated as derived from
+# its basename when its extension looks like a real file suffix, so a handle
+# such as ``alice.smith`` is not collapsed into ``alice`` while legitimate
+# renderings like ``INV-001.sent`` or ``report.csv`` still deduplicate.
+_KNOWN_SUFFIXES = frozenset(
+    {
+        "csv",
+        "tsv",
+        "json",
+        "jsonl",
+        "ndjson",
+        "parquet",
+        "pq",
+        "avro",
+        "orc",
+        "xlsx",
+        "xls",
+        "pdf",
+        "txt",
+        "md",
+        "html",
+        "htm",
+        "xml",
+        "yaml",
+        "yml",
+        "toml",
+        "ini",
+        "cfg",
+        "conf",
+        "png",
+        "jpg",
+        "jpeg",
+        "gif",
+        "svg",
+        "webp",
+        "zip",
+        "gz",
+        "tar",
+        "tgz",
+        "bz2",
+        "rar",
+        "7z",
+        "db",
+        "sqlite",
+        "sql",
+        "arrow",
+        "feather",
+        "pkl",
+        "pickle",
+        "bin",
+        "log",
+        "dat",
+        "out",
+        "tmp",
+        "part",
+        "bak",
+        "old",
+        "eml",
+        "msg",
+        "wav",
+        "mp3",
+        "mp4",
+        "mov",
+        "sent",
+    }
+)
+
+
+def _superset_derives_from_subset(subset: frozenset[str], superset: frozenset[str]) -> bool:
+    """True when every token present only in ``superset`` is a stem-extended form
+    of a token in ``subset`` whose extension looks like a genuine file suffix.
+
+    Containment alone is not enough: a completed action folds its ``external_id``
+    and any optional descriptive argument into its token set, so the stored set
+    is a *superset* of a sparser re-claim even when the two are genuinely
+    different work. The only safe superset is one whose extra tokens are derived
+    from the shared ones (``INV-001.sent`` from ``INV-001``), never unrelated
+    values like a one-off ``message`` or the effect's ``external_id``.
+
+    The derivation also requires the extension to be a known file suffix
+    (``_KNOWN_SUFFIXES``): ``alice.smith`` shares the stem ``alice`` but its
+    ``.smith`` extension is not a real suffix, so it is treated as distinct work
+    rather than a rendering of ``alice`` (issue #67).
+    """
+    extra = superset - subset
+    if not extra:
+        return True
+    stems = {_stem(token).lower() for token in subset}
+    for token in extra:
+        stem = _stem(token).lower()
+        if stem not in stems:
+            return False
+        _, ext = os.path.splitext(token)
+        if ext.lstrip(".").lower() not in _KNOWN_SUFFIXES:
+            return False
+    return True
+
+
+def _normalize_consumed_inputs(
+    consumed: ConsumedInputs | Mapping[str, Any] | None,
+) -> ConsumedInputs | None:
+    """Validate and normalize caller-supplied consumed_inputs.
+
+    Accepts a ``ConsumedInputs`` instance, a plain mapping with
+    ``checkpoint_seq``, ``event_positions``, ``action_ids``, or None.
+    Returns a validated ``ConsumedInputs`` or None when nothing was
+    supplied. Invalid shapes raise ``ValueError`` so the caller learns
+    at the boundary rather than storing an un-auditable commitment.
+    """
+    if consumed is None:
+        return None
+    if isinstance(consumed, ConsumedInputs):
+        return consumed
+    if isinstance(consumed, Mapping):
+        return ConsumedInputs.model_validate(dict(consumed))
+    raise ValueError("consumed_inputs must be a mapping or ConsumedInputs")
+
+
+def _settle_result(result: Mapping[str, Any]) -> tuple[Mapping[str, Any], str]:
+    """The stored form and hash of a caller-reported action result.
+
+    ``complete`` and ``reconcile`` settle an outcome *after* the side effect
+    has already run, so the write must not hinge on the shape of the value the
+    caller reports back. ``stable_hash`` canonicalizes the result and raises
+    for types it has no rule for, and an ordinary tool return can contain one:
+    a ``Decimal`` amount, a ``set`` of ids, any object without ``model_dump``.
+    Raising there would leave a successful effect recorded as STARTED forever,
+    with a retry on the same key refused as ``UnknownSideEffect``, so the
+    effect happened exactly once but the ledger could neither complete nor
+    repeat it (issue #1394).
+
+    A canonical result is stored and hashed unchanged. A result that cannot be
+    canonicalized is stored sanitized, its non-canonical parts replaced by
+    their repr, which is what the durable record holds either way: the event
+    payload is ``model_dump(mode="json")`` and JSON has no ``Decimal``, so the
+    action read back from the log already carries the JSON-native form.
+    Sanitizing at write time makes the in-memory record agree with it, so a
+    replay returns the same value before and after a reload.
+    """
+    try:
+        return result, stable_hash(result)
+    except (TypeError, ValueError):
+        sanitized = canonical_sanitize(result)
+        return sanitized, stable_hash(sanitized)
+
+
+class LedgerError(RuntimeError):
+    """The ledger was used in a way that cannot be made safe."""
+
+
+class ClaimLockError(LedgerError):
+    """The run's lease is held elsewhere, so this ledger must not write.
+
+    Raised instead of proceeding, because the alternative -- claiming anyway --
+    is the duplicate side effect this ledger exists to prevent. A caller seeing
+    this should back off and retry, not force the write: another agent owns the
+    run right now, and whatever it is claiming may be the very action this
+    caller wanted.
+    """
+
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _single_writer(
+    method: Callable[Concatenate[ActionLedger, _P], _R],
+) -> Callable[Concatenate[ActionLedger, _P], _R]:
+    """Run a mutating ledger method while holding the run's lease.
+
+    Every method that folds the log and then appends to it is a
+    read-modify-write, so every one of them races. Marking them declaratively
+    keeps that list honest: a new mutator without this decorator is visibly
+    missing something, whereas a forgotten ``with self._locked()`` deep inside a
+    hundred-line body is not.
+
+    A ledger built without a lease is unaffected, which is what keeps the
+    single-process path exactly as it was.
+    """
+
+    @wraps(method)
+    def wrapper(self: ActionLedger, /, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        """Acquire the ledger lease lock before invoking the mutating method."""
+        with self._locked():
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+@dataclass(frozen=True, slots=True)
+class ActionOutcome:
+    """What a claim returned.
+
+    ``fresh`` distinguishes "go ahead and perform this" from "already done,
+    here is the previous result"; the single most important bit for callers.
+    """
+
+    key: IdempotencyKey
+    action: Action
+    fresh: bool
+
+    @property
+    def already_completed(self) -> bool:
+        """True when the claim hit an existing already-completed action."""
+        return not self.fresh and self.action.status is ActionStatus.COMPLETED
+
+    @property
+    def result(self) -> Mapping[str, Any] | None:
+        """The recorded result dictionary from the underlying action, if any."""
+        return self.action.result
+
+    @property
+    def external_id(self) -> str | None:
+        """The external system identifier associated with the action, if known."""
+        return self.action.external_id
+
+
+class ActionLedger:
+    """Durable record of external side effects, keyed by idempotency.
+
+    Actions are stored as events, so the ledger inherits the event log's
+    ordering, durability and tamper-evidence rather than inventing its own.
+
+    Single-writer per run. Deduplication is a claim-then-check against the
+    folded log, not an atomic compare-and-set, so two processes claiming the
+    same key at the same instant both read "no prior slot" and both open one.
+    The ``docs/multi_agent_isolation.md`` ownership model applies: one run, one
+    owner at a time.
+
+    Pass ``lease`` to have the ledger enforce that itself. Every mutating
+    method then acquires the run's lease for ``holder_id`` before it folds the
+    log, and releases it after the append, so concurrent claimants on one key
+    collapse to a single winner; the losers raise :class:`ClaimLockError`
+    rather than opening a parallel slot. ``holder_id`` is required alongside a
+    lease and must be a stable agent identity, not a shared constant: a default
+    would make every process look like the same holder and quietly disable the
+    protection it was passed to provide.
+
+    The lease is reentrant for its own holder, so the documented pattern of a
+    caller acquiring the run lease and *then* using the ledger still works --
+    the ledger recognises the lease as already its own, and leaves releasing it
+    to whoever acquired it.
+
+    Without ``lease`` the behaviour is exactly as before: unsynchronised, and
+    only as strong as the caller's own serialization. That remains the default
+    because the single-process path has nothing to serialise against.
+
+    Two limits are worth stating rather than implying. The lease is scoped to
+    one ``run_id``, so an unscoped claim (``scoped_to_run=False``) racing the
+    same key from *another* run is not covered by this run's lease; both
+    claimants would need to agree on a lease to be safe. And the claim is still
+    not atomic in storage, so a caller that mixes leased and unleased ledgers on
+    one run gets the weaker guarantee.
+    """
+
+    def __init__(
+        self,
+        storage: Storage,
+        run_id: str,
+        *,
+        lease: LeaseCoordinator | None = None,
+        holder_id: str | None = None,
+        ttl: timedelta | None = None,
+        source: Origin = Origin.DETERMINISTIC,
+    ) -> None:
+        """Bind this ledger to a run.
+
+        ``source`` stamps the action records this ledger writes
+        (issue #612): the writer, not the derivation. Callers whose
+        claims are asserted by an autonomous agent about its own work
+        pass ``Origin.EXTERNAL_AGENT`` so the validator holds the run
+        for review. Denial records stay ``DETERMINISTIC``: they are the
+        ledger's own verdicts, not caller assertions.
+        """
+        if lease is not None and not holder_id:
+            raise ValueError(
+                "holder_id is required when a lease is supplied: a shared default "
+                "would make two processes appear to be the same lease holder and "
+                "silently defeat the serialization. Pass a stable agent identity."
+            )
+        self.storage = storage
+        self.run_id = run_id
+        self._source = source
+        self._lease = lease
+        self._holder_id = holder_id or ""
+        self._ttl = ttl
+
+    # -- single-writer ---------------------------------------------------- #
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Hold the run's lease for the duration of one mutating call.
+
+        Reentrant for the lease's own holder. A caller that already acquired the
+        run lease (the pattern ``docs/multi_agent_isolation.md`` describes, and
+        the one ``continuum serve`` follows) passes straight through, and the
+        lease is left for that caller to release. Without this, the ledger would
+        fail every claim made by an agent that had correctly taken ownership of
+        the run first, which is precisely the well-behaved caller.
+        """
+        if self._lease is None:
+            yield
+            return
+        if self._lease.is_held(self.run_id, self._holder_id):
+            # Already ours. Do not release on the way out: the outer holder owns
+            # the lease's lifetime and may still need it.
+            yield
+            return
+        if not self._lease.acquire(self.run_id, self._holder_id, self._ttl):
+            raise ClaimLockError(
+                f"run {self.run_id!r} is leased to {self._lease.holder(self.run_id)!r}; "
+                f"{self._holder_id!r} must not write to the action ledger while another "
+                f"agent owns the run. Retry once the lease is free."
+            )
+        try:
+            yield
+        finally:
+            self._lease.release(self.run_id, self._holder_id)
+
+    # -- budget drawdown (issue #413) ------------------------------------- #
+
+    def _budget_path(self) -> Path:
+        """Registry path, overridable for tests via env."""
+        return Path(os.environ.get("CONTINUUM_BUDGETS_PATH", DEFAULT_BUDGETS_PATH))
+
+    def _budget_authorization_id(
+        self,
+        action_type: str,
+        key: str | None,
+        arguments: Mapping[str, Any] | None,
+        volatile: Sequence[str],
+    ) -> str | None:
+        """Stable authorization bucket for this operation, or None when unbound.
+
+        For budgets the bucket must survive fresh-key rotation (issue #390):
+        two attempts with different idempotency keys but the same resource
+        tokens (e.g. same invoice id) are the same authorization and must
+        draw down the same counter.  Passing the explicit key would give
+        each fresh key its own bucket and defeat the cap-amplification fix
+        (#413), so the helper ignores an explicit key and derives from
+        resource tokens alone. Ledger anchoring is not used here so a
+        prior failed attempt does not make a retry look unbound.
+
+        ``arguments`` are caller-supplied, which is the other half of the same
+        problem: a token derived from every argument follows the noise as much
+        as the resource, so padding one throwaway field (a ``trace_id``, a
+        request id) moved each retry into a fresh bucket at its full allowance
+        and the cap never bound (issue #1052). The caller therefore passes the
+        arguments of the record the claim defers to when there is one: those
+        name the operation the ledger has already decided this attempt *is*, and
+        they are what the settlement paths derive from too. Minting a fresh key
+        alongside fresh noise presents no identity the ledger can see and stays
+        on the incoming-argument fallback, which is the documented residual
+        rather than something a ``volatile`` declaration could close -- a caller
+        that wants around the cap simply forgets to declare the field.
+        """
+        try:
+            return resolve_authorization_id(
+                action_type, None, arguments, volatile=volatile, ledger=None
+            )
+        except Exception:
+            return None
+
+    def _settlement_authorization_id(self, action: Action) -> str | None:
+        """The bucket a settlement of ``action`` draws from.
+
+        The claim that opened the slot pinned its bucket onto the record
+        (issue #1052), so the settlement reads it back and the two share one
+        counter whatever the caller sends between them. A record written before
+        the field existed carries ``None`` and is re-derived from its stored
+        arguments with no volatile declaration, which is the pre-#1052 rule.
+        """
+        if action.budget_authorization_id is not None:
+            return action.budget_authorization_id
+        return self._budget_authorization_id(action.action_type, None, dict(action.arguments), ())
+
+    def _budget_refuse_if_exhausted(
+        self,
+        action_type: str,
+        authorization_id: str,
+    ) -> None:
+        """Refuse an over-cap attempt before anything is recorded (issue #413).
+
+        The gate half of the claim drawdown, and it must stay ahead of
+        ``_record``: an attempt beyond the cap must never reach the event log.
+        Fail closed here: an unreadable or malformed registry refuses the claim
+        rather than letting it proceed with no accounting.
+
+        The counter is left untouched by this half. It is advanced by
+        ``_budget_commit_claim`` once the ACTION_RECORDED event is durable, so
+        a claim rejected by validation after this point consumes no slot and
+        the counter and the log agree on how many attempts exist (issue #1168).
+
+        When the registry file does not exist, budgets are treated as
+        unconfigured and no refusal happens. This keeps runs and tests
+        without authorization data byte-identical to today while still
+        enforcing caps once an operator creates the file.
+        """
+        path = self._budget_path()
+        if not path.exists():
+            return
+        try:
+            raw = load_budgets(path)
+        except BudgetConfigError as exc:
+            raise LedgerError(f"budget registry invalid: {exc}") from exc
+        entry = ensure_authorization_entry(raw, action_type, authorization_id)
+        refused, reason = would_refuse(raw, action_type, authorization_id)
+        if refused:
+            remaining = 0
+            try:
+                from continuum.budgets import get_remaining as _get_rem
+
+                remaining = _get_rem(raw, action_type, authorization_id) or 0
+            except Exception:
+                remaining = 0
+            counter = int(entry.get("counter", 0))
+            max_attempts = int(entry.get("max_attempts", 0))
+            raise LedgerError(
+                f"budget exhausted for {action_type!r} / {authorization_id!r} "
+                f"({counter} of {max_attempts} used, {remaining} remaining; "
+                f"{reason})"
+            )
+
+    def _budget_commit_claim(
+        self,
+        action_type: str,
+        authorization_id: str,
+    ) -> None:
+        """Advance the counter once the attempt is durably recorded (issue #1168).
+
+        The complement to ``_budget_refuse_if_exhausted``, and the mirror of
+        the settlement drawdown, which also records first and counts
+        afterwards. By the time this runs an ACTION_RECORDED event is already
+        in the log, so a failure to increment or save must not surface to the
+        caller: the event is the audit record and the counter is accounting
+        that follows it, never the other way round. Losing the accounting is
+        bad; losing a claim the ledger has already recorded is worse, so this
+        half is fail-open where the gate half is fail-closed.
+
+        A claim refused at the gate, or rejected by validation before this
+        point, never reaches here and consumes no slot.
+        """
+        path = self._budget_path()
+        if not path.exists():
+            return
+        try:
+            raw = load_budgets(path)
+            ensure_authorization_entry(raw, action_type, authorization_id)
+            increment(raw, action_type, authorization_id)
+            save_budgets(path, raw)
+        except Exception:
+            # The attempt is already recorded; the accounting is best effort.
+            pass
+
+    def _budget_consume_settlement(
+        self,
+        action_type: str,
+        authorization_id: str,
+    ) -> None:
+        """Consume one slot for a confirmation/settlement event.
+
+        Settlements share the same per-authorization counter as claims, so a
+        completed confirmation visibly draws down the budget and a rapid
+        complete/re-claim cannot amplify the cap. Failures to read or write
+        the registry are swallowed here: a settlement must land even if the
+        budget file is momentarily unreadable, otherwise the ledger would
+        refuse to record that an effect happened.
+        """
+        path = self._budget_path()
+        if not path.exists():
+            return
+        try:
+            raw = load_budgets(path)
+        except Exception:
+            return
+        try:
+            ensure_authorization_entry(raw, action_type, authorization_id)
+        except Exception:
+            return
+        try:
+            increment(raw, action_type, authorization_id)
+        except Exception:
+            return
+        try:
+            save_budgets(path, raw)
+        except Exception:
+            return
+
+    # -- reading ---------------------------------------------------------- #
+
+    def _merged_events(self) -> Iterator[Event]:
+        """The run's archive and live streams, merged in sequence order.
+
+        Compaction (issue #239) moves events into the archive rather than
+        deleting them, so any read of a run's history has to merge both
+        streams or a claim settled before compaction vanishes. Shared by the
+        fold and by the rendered-key index so both see the same history.
+        """
+        return merge(
+            self.storage.read_archived_events(self.run_id),
+            self.storage.read_events(self.run_id),
+            key=lambda e: e.sequence,
+        )
+
+    def _replay(self) -> dict[str, Action]:
+        """Rebuild the ledger by folding action events. Cheap and verifiable.
+
+        Archived events (compaction, issue #239) fold too: a claim settled
+        before compaction must keep protecting afterwards, or exactly-once
+        would quietly reset at the anchor boundary and a month-old side
+        effect could fire a second time. Both streams are already sequence-
+        sorted, so they merge linearly instead of paying a re-sort on this
+        hot path.
+        """
+        return fold_action_events(self._merged_events())
+
+    def folded(self) -> dict[str, Action]:
+        """Public view of the ``key -> newest action`` fold, archive included."""
+        return self._replay()
+
+    def _foreign_action(self, key: str) -> Action | None:
+        """Find ``key`` in another run's ledger, for unscoped claims.
+
+        An unscoped idempotency key carries no run prefix, so the same key is
+        directly comparable across runs. When a claim declares itself
+        run-global (``scoped_to_run=False``), honouring that promise requires
+        looking at every other run in the store before opening a fresh slot,
+        not just this run's log. Returns the most recent action recorded under
+        ``key`` outside this run, or None.
+
+        Engines that maintain the action index (issue #216) answer this as an
+        indexed read; the rest pay the historical scan, O(total logged
+        events), only on the unscoped path after the local lookup missed.
+        """
+        if getattr(self.storage, "supports_action_index", False):
+            return self.storage.foreign_action(key, exclude_run=self.run_id)
+        found: Action | None = None
+        for run in self.storage.list_runs():
+            if run.run_id == self.run_id:
+                continue
+            folded = fold_action_events(self.storage.read_all_events(run.run_id))
+            candidate = folded.get(key)
+            if candidate is not None:
+                found = candidate
+        return found
+
+    def get(self, key: str) -> Action | None:
+        """Return the current action state for ``key``, or ``None`` if unclaimed."""
+        return self._replay().get(key)
+
+    def _rendered_key_index(self) -> dict[str, set[str]]:
+        """Map each recorded rendered key to the stored key(s) it hashed to.
+
+        ``claim`` hashes the key a caller supplies, so the ledger is keyed by
+        the digest while every human-facing string names the pre-hash original:
+        the gate's deny text, the claim response, ``continuum actions`` and the
+        log all print it. That original rides along on the ACTION_RECORDED
+        payload as ``rendered_key``, which the forensic join already reads back.
+        This index is the same join from the other direction, so a caller
+        holding a printed key can reach the action it named.
+
+        Scans the merged stream rather than the fold because the fold keeps only
+        the hashed key. Only claim records carry a ``rendered_key``, so
+        settlement events contribute nothing, and the archive matters for the
+        same reason it matters to :meth:`_replay`: a claim made before
+        compaction must stay resolvable afterwards.
+
+        Returns a set per rendered key because the digest mixes in the action
+        type and scope, so one rendered string can name genuinely different
+        actions. :meth:`resolve_key` only accepts an unambiguous mapping.
+        """
+        index: dict[str, set[str]] = {}
+        for event in self._merged_events():
+            if event.type not in _ACTION_EVENT_TYPES:
+                continue
+            payload = event.payload or {}
+            rendered = payload.get("rendered_key")
+            stored = payload.get("key")
+            if not rendered or not stored:
+                continue
+            index.setdefault(str(rendered), set()).add(str(stored))
+        return index
+
+    def resolve_key(self, identifier: str) -> str | None:
+        """The ledger key for ``identifier``: a key, an ``action_id``, or the
+        rendered key every message prints.
+
+        The ledger is keyed by idempotency key, but almost everything a caller
+        reads back is keyed by ``action_id``: ``Action.action_id`` itself, the
+        recovery plan's ``reconcile_action:<target>`` steps, the contract's
+        ``required_actions``, and the rendered report. So the identifier a
+        recovering caller has in hand is usually the one the settle methods did
+        not accept, and the two are indistinguishable by shape (issue #367).
+
+        Resolving all of them here rather than at one call site means every
+        settle method inherits it, and the recovery guidance that names an
+        ``action_id`` becomes executable as written instead of needing to be
+        rewritten in terms of an identifier no output exposes.
+
+        The third space is the rendered key, the pre-hash original the gate
+        hands back in its deny message and instructs the caller to claim. It is
+        the identifier an agent following the printed instructions actually
+        holds, and before this fallback the claim it was told to make was the
+        one thing it could not then settle: claim accepted the rendered key and
+        hashed it, while the settle methods resolved only the digest or the
+        ``action_id``, so the loop the product is built on dead-ended and the
+        action stayed STARTED forever.
+
+        The mapping is unambiguous: one key holds one action, and a re-claim
+        after FAILED or COMPENSATED copies the existing action, so
+        ``action_id`` stays with its key rather than being reissued. The
+        rendered space is not: the digest mixes in the action type and scope,
+        so one rendered string can name several actions. Those are left
+        unresolved rather than guessed at, because settling is a claim about
+        the outside world and picking the wrong record would record it as done.
+        Returns ``None`` when no space matches, or when the rendered key is
+        ambiguous.
+        """
+        folded = self._replay()
+        if identifier in folded:
+            return identifier
+        for stored_key, action in folded.items():
+            if action.action_id == identifier:
+                return stored_key
+        candidates = self._rendered_key_index().get(identifier)
+        if candidates and len(candidates) == 1:
+            return next(iter(candidates))
+        return None
+
+    def resolve_claim(
+        self,
+        action_type: str,
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        volatile: Sequence[str] = (),
+        scoped_to_run: bool = True,
+        key: str | None = None,
+    ) -> ClaimResolution:
+        """What :meth:`claim` would find, resolved without recording anything.
+
+        A claim decision is read by two places: ``claim`` itself, and the
+        run-level retry budget gate in the MCP intercept handler, which has to
+        refuse a new attempt *before* one is recorded rather than after. The
+        gate once ran its own exact-key-only lookup, so it could gate a state
+        ``claim`` would have answered with a stored result, and an exhausted
+        budget suppressed the dedup and reconciliation paths a recovering agent
+        depends on instead of letting the ledger speak (issue #1080). Both
+        readers now go through here, which is what keeps them from drifting
+        apart again.
+
+        The resolution order is :meth:`claim`'s own, and each later step runs
+        only when the earlier one found nothing: the exact argument-hash key,
+        then another run holding the same unscoped key, then drift-tolerant
+        identity matching. Identity matching is skipped when the foreign record
+        already answers or refuses the claim, so a claim that returns or raises
+        never resolves to a different key than it would have on its own.
+
+        ``opens_slot`` reports whether ``claim`` would record a new attempt slot
+        for this resolution, which is exactly the condition under which a retry
+        budget may gate it. Re-claiming an action that already completed, and an
+        interrupted attempt awaiting reconciliation, both leave the record where
+        it is and open nothing (issue #309).
+        """
+        explicit_key = key is not None
+        resolved = idempotency_key(
+            action_type,
+            arguments,
+            scope=self.run_id if scoped_to_run else None,
+            volatile=volatile,
+            key=key,
+        )
+        existing = self.get(resolved)
+        foreign: Action | None = None
+        if existing is None and not scoped_to_run:
+            foreign = self._foreign_action(resolved)
+        # A foreign record that completed, or that another run is still
+        # mid-flight on, already settles this claim. A foreign failure only
+        # means nothing stands in the way of this run's own slot, so the
+        # drift-tolerant lookup still gets its turn.
+        foreign_settles = foreign is not None and foreign.status not in (
+            ActionStatus.FAILED,
+            ActionStatus.COMPENSATED,
+        )
+        if existing is None and not explicit_key and not foreign_settles:
+            matched = self._identity_match(action_type, arguments, volatile)
+            if matched is not None:
+                # The caller reports completion or failure against the key in
+                # the outcome, so it must be the stored key of the record being
+                # deferred to, not the freshly-derived one.
+                return ClaimResolution(matched[0], matched[1], foreign)
+        return ClaimResolution(resolved, existing, foreign)
+
+    def resolve_prior(
+        self,
+        action_type: str,
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        volatile: Sequence[str] = (),
+        scoped_to_run: bool = True,
+        key: str | None = None,
+    ) -> tuple[IdempotencyKey, Action] | None:
+        """The record a claim for these inputs would defer to, or None.
+
+        The three lookups :meth:`claim` performs, extracted so a gate that runs
+        *before* claim answers the same question claim will act on. The run-level
+        retry budget (issue #240) is evaluated at the intercept site, before
+        claim opens a slot; resolving under the derived key while claim answers
+        from another one let an exhausted budget suppress the very dedup and
+        reconciliation answers the gate exists to pass through (issue #1080).
+
+        In order: the exact idempotency key; then, for an unscoped claim, another
+        run's record under the same run-global key (issue 34); then, only when the
+        caller asserted no identity of its own, the drift-tolerant
+        :meth:`_identity_match`. An explicit key *is* the identity, so the
+        fallbacks are skipped for it: no drift is possible, and the derived key is
+        the stored key.
+
+        Returns ``(stored_key, action)``. For an identity match the key is the
+        *stored* key rather than the freshly-derived one, because that is the key
+        claim records and the caller settles against. None when nothing
+        identifies a prior attempt, which is the only case a fresh slot opens.
+        """
+        explicit_key = key is not None
+        idem = idempotency_key(
+            action_type,
+            arguments,
+            scope=self.run_id if scoped_to_run else None,
+            volatile=volatile,
+            key=key,
+        )
+        existing = self.get(idem)
+        if existing is not None:
+            return IdempotencyKey(idem), existing
+
+        foreign: Action | None = None
+        if not scoped_to_run:
+            # The local log has no such action, but an unscoped key claims
+            # global identity, so another run may already hold it.
+            foreign = self._foreign_action(idem)
+        # A foreign record that completed, or that another run is still
+        # mid-flight on, already settles this claim. A foreign failure only
+        # means nothing stands in the way of this run's own slot, so the
+        # drift-tolerant lookup still gets its turn.
+        foreign_settles = foreign is not None and foreign.status not in (
+            ActionStatus.FAILED,
+            ActionStatus.COMPENSATED,
+        )
+        if foreign is not None and foreign_settles:
+            return IdempotencyKey(idem), foreign
+        if not explicit_key:
+            matched = self._identity_match(action_type, arguments, volatile)
+            if matched is not None:
+                return matched
+        return None
+
+    def _identity_match(
+        self,
+        action_type: str,
+        arguments: Mapping[str, Any] | None,
+        volatile: Sequence[str],
+    ) -> tuple[IdempotencyKey, Action] | None:
+        """Defensive recognition of an already-recorded action despite argument drift.
+
+        The idempotency key hashes arguments verbatim, so an agent that renames
+        an argument field (``target`` vs ``outbox_file``) or reformats a path
+        between sessions computes a different key and the exact lookup misses.
+        As a fallback, when the caller supplied no explicit key, a completed or
+        interrupted action of the same type is recognised by shared identity
+        tokens (scalar values plus path basenames and external ids) rather than
+        by the full argument shape.
+
+        Recognition requires one token set to *contain* the other, not merely to
+        intersect it, and it compares leaf tokens so a path counts as its
+        basename rather than its full spelling (see ``leaf_tokens``). Drift makes
+        a description more or less verbose about the same resource, so the
+        sparser set is a subset of the richer one (``{INV-001}`` inside
+        ``{INV-001, INV-001.sent}``). Two genuinely different resources each
+        carry a leaf the other lacks, which is what keeps two tickets that merely
+        share ``urgent`` from collapsing into one. Under mere intersection the
+        second side effect would be silently swallowed -- the exact failure this
+        ledger exists to prevent.
+
+        Leaf comparison alone was not enough either, for the same reason in a
+        different disguise: two files with the same name in different directories
+        share every leaf, so ``/tenants/acme/report.csv`` matched
+        ``/tenants/globex/report.csv`` and globex was never notified (issue #365).
+        A match therefore also requires the *locations* to agree, which
+        ``locations_agree`` decides by suffix rather than equality so the drift
+        case that motivated leaf comparison (``invoices/INV-5.pdf`` for
+        ``/data/invoices/INV-5.pdf``) still matches. A side carrying no path at
+        all makes no claim about location and so contradicts nothing.
+
+        Containment on its own is still too loose: a completed action folds its
+        outcome ``external_id`` and any optional descriptive argument into its
+        token set, so the stored set is a *superset* of a sparser re-claim even
+        when the two are different work. The superset is therefore only accepted
+        when every token it carries beyond the subset is *derived* from the
+        subset -- a path stem (``INV-001.sent`` from ``INV-001``), not an
+        unrelated value such as a one-off ``message``. The outcome ``external_id``
+        is excluded from the comparison entirely, because it is recorded by
+        ``complete()`` and never present on the incoming claim, so it could only
+        ever manufacture a false superset (issue #64).
+
+        Returns ``(key, action)`` for the unique same-type match, or ``None``
+        when nothing is distinctive enough to be confident. ``None`` is also
+        returned when several actions share a token, because guessing which one
+        the caller means is exactly the quiet failure mode this exists to avoid.
+        """
+        # The run id rides along inside arguments as ``continuum_run_id`` and is
+        # common to every claim in the run, so it must never count as a
+        # resource token when deciding whether two claims are the same work.
+        plumbing = leaf_tokens(identity_tokens(external_id=self.run_id))
+        incoming_all = identity_tokens(arguments, volatile=volatile)
+        incoming = leaf_tokens(incoming_all) - plumbing
+        incoming_where = location_tokens(incoming_all)
+        if not incoming:
+            return None
+
+        completed: list[tuple[IdempotencyKey, Action]] = []
+        uncertain: list[tuple[IdempotencyKey, Action]] = []
+        for stored_key, action in self._replay().items():
+            if action.action_type != action_type:
+                continue
+            # The ``external_id`` is an *outcome* recorded by ``complete()`` and
+            # is never present on the incoming claim, so folding it into ``known``
+            # would make the stored set a systematic superset of every sparser
+            # re-claim. It is therefore excluded from the comparison (issue #64).
+            # ``volatile`` is applied here too: a field the caller declares
+            # volatile must be stripped from *both* sides, or a volatile strong
+            # token surviving only on the stored side makes ``known`` a spurious
+            # superset, ``_identity_match`` returns None, and the side effect
+            # fires a second time (issue #1346).
+            known_all = identity_tokens(action.arguments, volatile=volatile)
+            known = leaf_tokens(known_all) - plumbing
+            # An empty ``known`` is contained in everything; treat a stored
+            # action with no identity of its own as unrecognisable, not as a
+            # match for every claim of the same type.
+            if not known:
+                continue
+            # Same leaves, different directories, is different work (issue #365).
+            if not locations_agree(incoming_where, location_tokens(known_all)):
+                continue
+            if incoming <= known:
+                # The stored action carries more tokens than the claim. That is
+                # only safe when the extra tokens are derived from the shared
+                # ones (a path stem, an ``external_id`` shape), never unrelated
+                # optional arguments.
+                if not _superset_derives_from_subset(incoming, known):
+                    continue
+            elif known <= incoming:
+                if not _superset_derives_from_subset(known, incoming):
+                    continue
+            else:
+                continue
+            if action.status in (ActionStatus.STARTED, ActionStatus.UNKNOWN):
+                uncertain.append((IdempotencyKey(stored_key), action))
+            elif action.status is ActionStatus.COMPLETED:
+                completed.append((IdempotencyKey(stored_key), action))
+
+        if len(completed) == 1:
+            return completed[0]
+        if len(completed) > 1:
+            return None
+        if len(uncertain) == 1:
+            return uncertain[0]
+        return None
+
+    def all(self) -> Sequence[Action]:
+        """Return all action records currently in the folded ledger."""
+        return list(self._replay().values())
+
+    def pending(self) -> Sequence[Action]:
+        """Actions whose real-world outcome is not known.
+
+        These are exactly the actions a recovering agent must reconcile before
+        it is safe to continue.
+        """
+        return [
+            action
+            for action in self._replay().values()
+            if action.status in (ActionStatus.STARTED, ActionStatus.UNKNOWN)
+        ]
+
+    # -- writing ---------------------------------------------------------- #
+
+    def _record(
+        self,
+        key: str,
+        action: Action,
+        event_type: EventType = EventType.ACTION_RECORDED,
+        pinning: dict[str, str] | None = None,
+        grant: dict[str, str] | None = None,
+        origin_digest: str | None = None,
+        rendered_key: str | None = None,
+    ) -> Action:
+        payload: dict[str, Any] = {
+            "key": key,
+            "action_id": action.action_id,
+            "action_type": action.action_type,
+            "status": action.status.value,
+            "external_id": action.external_id,
+            "action": action.model_dump(mode="json"),
+        }
+        if pinning:
+            # Issue #241: caller-asserted environment hashes ride on the
+            # STARTED record so drift is diffable per attempt. Settlements
+            # omit it; the fold keeps the newest non-empty anyway.
+            payload["pinning"] = dict(pinning)
+        if grant:
+            # Issue #269: single-use authority reference attached at claim
+            # time; terminal records inherit it via the shared payload keys,
+            # so scan_grants can mark consumption from either event type.
+            payload["grant"] = dict(grant)
+        if origin_digest is not None or action.origin_digest is not None:
+            # Origin digest (issue #304, #566): hash of the originating
+            # observation that motivated this write. Stored both top-level
+            # for forensic filtering and inside the action for round-trip.
+            digest = origin_digest if origin_digest is not None else action.origin_digest
+            if digest is not None:
+                payload["origin_digest"] = digest
+        if rendered_key is not None:
+            payload["rendered_key"] = rendered_key
+        elif action.arguments and "record_key" in action.arguments:
+            # Fallback for callers that supplied record_key via arguments
+            # rather than explicit key; keep forensic searchable.
+            with suppress(Exception):
+                payload["rendered_key"] = str(action.arguments.get("record_key"))
+        self.storage.append_event(self.run_id, event_type, payload, source=self._source)
+        return action
+
+    @staticmethod
+    def _count_claim() -> None:
+        """Increment the process-wide claim counter (#1032).
+
+        Best effort by design: a metrics failure must never change whether an
+        action is claimable, so collection errors are swallowed rather than
+        propagated into a safety-critical return path.
+        """
+        with suppress(Exception):
+            from continuum.observability import ACTIONS_CLAIMED, get_metrics
+
+            get_metrics().increment(ACTIONS_CLAIMED)
+
+    @staticmethod
+    def _count_complete() -> None:
+        """Increment the process-wide completion counter (#1032), best effort."""
+        with suppress(Exception):
+            from continuum.observability import ACTIONS_COMPLETED, get_metrics
+
+            get_metrics().increment(ACTIONS_COMPLETED)
+
+    @_single_writer
+    def claim(
+        self,
+        action_type: str,
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        volatile: Sequence[str] = (),
+        scoped_to_run: bool = True,
+        key: str | None = None,
+        on_unknown: Callable[[Action], ActionOutcome | None] | None = None,
+        dep_scope: str | None = None,
+        pinning: dict[str, str] | None = None,
+        grant: Mapping[str, str] | None = None,
+        origin_digest: str | None = None,
+    ) -> ActionOutcome:
+        """Register intent to perform an action, or report it already happened.
+
+        ``pinning`` (issue #241) is an optional validated dict of environment
+        hashes/ids recorded verbatim in the ACTION_RECORDED payload so replay
+        correctness can diff the agent's moving parts across a run.
+
+        ``grant`` (issue #269) attaches a single-use authority reference,
+        ``{"id": ..., "scope": ...}``, to this attempt. A grant whose attempt
+        reached a terminal status counts as consumed: a later claim carrying
+        it is refused with GrantDenied and an audited GRANT_DENIED event,
+        which is what stops a restored agent from resurrecting spent
+        authority (the Authority Resurrection attack class). A live mid-flight
+        retry under the same key and grant is untouched.
+
+        Returns ``fresh=True`` when the caller should go ahead. Returns
+        ``fresh=False`` with the stored result when the action already
+        completed.
+
+        With ``scoped_to_run=False`` the key carries no run prefix and is
+        honoured store-wide: a completed record in any run deduplicates the
+        claim, and an unresolved attempt in another run raises
+        ``UnknownSideEffect`` rather than opening a parallel slot (issue 34).
+
+        Raises ``UnknownSideEffect`` when a previous attempt was interrupted and
+        its real-world outcome cannot be determined, unless ``on_unknown``
+        resolves it.
+        """
+        _explicit_rendered = key
+        target_key = key
+        if target_key is None:
+            target_key = idempotency_key(
+                action_type,
+                arguments,
+                scope=self.run_id if scoped_to_run else None,
+                volatile=volatile,
+                key=key,
+            )
+
+        with self.storage.atomic_claim(self.run_id, key=target_key):
+            # The resolution is shared with the retry-budget gate in the MCP
+            # intercept handler, which has to decide *before* a slot is opened
+            # whether to allow it. Doing the lookup twice in two places let the two
+            # readers disagree about what a claim would find (issue #1080).
+            resolved = self.resolve_claim(
+                action_type,
+                arguments,
+                volatile=volatile,
+                scoped_to_run=scoped_to_run,
+                key=key,
+            )
+            key = resolved.key
+            rendered_key = _explicit_rendered
+            existing = resolved.existing
+            foreign = resolved.foreign
+
+            if existing is None and foreign is not None:
+                # The local log has no such action, but an unscoped key claims
+                # global identity: another run may already hold it (issue 34).
+                if foreign.status is ActionStatus.COMPLETED:
+                    # The effect already happened under this identity, wherever
+                    # it happened. Report it instead of duplicating it.
+                    return ActionOutcome(key=key, action=foreign, fresh=False)
+                if foreign.status in (ActionStatus.STARTED, ActionStatus.UNKNOWN):
+                    # Another run is mid-flight on the same identity and this
+                    # ledger cannot reconcile a foreign record (its outcome
+                    # belongs to that run's log), so refuse rather than guess.
+                    raise UnknownSideEffect(
+                        f"action {foreign.action_type!r} (key {key[:12]}...) has an "
+                        f"unresolved attempt recorded by another run; reconcile "
+                        f"that run before claiming the same unscoped identity."
+                    )
+                # FAILED or COMPENSATED elsewhere means no live effect stands
+                # in the way; this run may open its own slot.
+
+            # Single-use grants (#269): refuse resurrection of spent authority
+            # before anything fires. A live attempt carrying the same grant under
+            # the same key is an ordinary mid-flight retry and passes through.
+            grant_clean = normalize_grant(grant)
+            authority_history: Sequence[Event] | None = None
+            if grant_clean is not None:
+                authority_history = self.storage.read_all_events(self.run_id)
+                spent, grants_by_key = scan_grants(authority_history)
+                prior = spent.get(grant_clean["id"])
+                live_match = (
+                    existing is not None
+                    and existing.status is ActionStatus.STARTED
+                    and grants_by_key.get(key, {}).get("id") == grant_clean["id"]
+                )
+                if prior is not None and not live_match:
+                    denied = GrantDenied(grant_clean["id"], prior, key)
+                    self.storage.append_event(
+                        self.run_id,
+                        EventType.GRANT_DENIED,
+                        {
+                            "grant_id": grant_clean["id"],
+                            "scope": grant_clean["scope"],
+                            "prior_action_id": prior.action_id,
+                            "prior_status": prior.status,
+                            "attempted_key": key,
+                            "attempted_action_type": action_type,
+                        },
+                    )
+                    raise denied
+
+            # Authority resurrection via AUTHORITY_CONSUMED (issue #289b): a
+            # consumed authority must not be reused even with a fresh key or
+            # drifted arguments. The check mirrors the grant check but scans
+            # AUTHORITY_CONSUMED events. A live retry under the same key and
+            # authority is allowed, mirroring the grant live_match rule.
+            from continuum.gate import collect_consumed_authorities, find_consumed_authority
+
+            authority_id = None
+            prior_ev = None
+            if grant_clean is not None:
+                authority_id = grant_clean["id"]
+                if authority_history is None:
+                    authority_history = self.storage.read_all_events(self.run_id)
+                prior_ev = collect_consumed_authorities(authority_history).get(authority_id)
+            elif isinstance(arguments, Mapping):
+                # Detection is value-based and shape-agnostic (issue #1074): a spent
+                # authority nested inside the argument structure -- {"payment":
+                # {"auth_token": ...}}, an ordinary shape for a credentials tool --
+                # must be caught, not only one sitting under four hard-coded
+                # top-level field names, which the old scan missed. The scan is the
+                # shared helper the gate and gateway use, so the three enforcers
+                # cannot disagree about depth.
+                if authority_history is None:
+                    authority_history = self.storage.read_all_events(self.run_id)
+                authority_id, prior_ev = find_consumed_authority(
+                    arguments, collect_consumed_authorities(authority_history)
+                )
+            if authority_id is not None and prior_ev is not None:
+                # Allow live retry under same key with same authority
+                live_auth_match = (
+                    existing is not None
+                    and existing.status is ActionStatus.STARTED
+                    and prior_ev is not None
+                    and prior_ev.payload.get("via_action_id") == existing.action_id
+                )
+                if prior_ev is not None and not live_auth_match:
+                    self.storage.append_event(
+                        self.run_id,
+                        EventType.GRANT_DENIED,
+                        {
+                            "grant_id": authority_id,
+                            "scope": prior_ev.payload.get("consumer_run_id", ""),
+                            "prior_action_id": prior_ev.payload.get("via_action_id", ""),
+                            "prior_status": "consumed",
+                            "attempted_key": key,
+                            "attempted_action_type": action_type,
+                            "authority_id": authority_id,
+                            "consumed_at_seq": prior_ev.sequence,
+                        },
+                    )
+                    raise LedgerError(
+                        f"Authority {authority_id!r} consumed at seq {prior_ev.sequence} by run {prior_ev.payload.get('consumer_run_id')!r}. Obtain a fresh authority."
+                    )
+
+            # Authorization-bound budget (issue #413): derive the stable
+            # authorization bucket for this attempt. Unbound (None) means no
+            # budget to enforce, which keeps runs without authorization data
+            # byte-identical to today. The bucket is token-derived and
+            # ledger-anchored, so distinct fresh idempotency keys for the same
+            # resource (same invoice id) share the same counter and cannot
+            # bypass the cap by minting new keys (the #390 amplification fix).
+            #
+            # The bucket follows the identity the ledger has already decided this
+            # claim *is* (issue #1052). When this attempt defers to an existing
+            # record -- the caller held the idempotency key fixed, or the token
+            # fallback recognised a prior attempt -- the operation's identity is
+            # what was recorded at first claim, so the bucket is derived from
+            # that record's arguments rather than the incoming ones. Deriving it
+            # from the incoming arguments instead would make the bucket follow
+            # caller-controlled noise: one throwaway ``trace_id`` moved every
+            # retry into a fresh bucket at its full allowance, and the cap never
+            # bound.
+            #
+            # The resolved id is then *persisted* on the record rather than
+            # re-derived, because token derivation also reads the caller's
+            # ``volatile`` declaration, and a retry that changes either the
+            # arguments or that declaration would compute a different bucket from
+            # the same stored record. Pinning it once means a retry, its
+            # confirmation and its reconciliation all draw from one counter by
+            # construction, whatever the caller sends later. Records written
+            # before the field existed carry None and are re-derived here, which
+            # pins them at the first claim that sees them.
+            budget_arguments = existing.arguments if existing is not None else arguments
+            budget_auth_id = existing.budget_authorization_id if existing is not None else None
+            if budget_auth_id is None:
+                budget_auth_id = self._budget_authorization_id(
+                    action_type, None, budget_arguments, volatile
+                )
+
+            if existing is None:
+                # Refuse an over-cap attempt before anything is recorded, then
+                # count it only once the record is durable: a claim rejected by
+                # the digest check below must consume no slot, or the counter and
+                # the log disagree on how many attempts exist (issue #1168).
+                if budget_auth_id is not None:
+                    self._budget_refuse_if_exhausted(action_type, budget_auth_id)
+                # Origin digest (issue #566): optional 64 hex, validated by Action.
+                # Fail closed on bad digest rather than storing garbage that
+                # forensic joins would then misattribute.
+                if origin_digest is not None:
+                    import re as _re
+
+                    if not _re.fullmatch(r"[0-9a-f]{64}", origin_digest):
+                        raise LedgerError(
+                            f"origin_digest must be 64 lowercase hex, got {origin_digest!r}"
+                        )
+                action = Action(
+                    run_id=self.run_id,
+                    action_type=action_type,
+                    dep_scope=dep_scope,
+                    arguments=dict(arguments or {}),
+                    arguments_hash=arguments_hash(arguments, volatile=volatile),
+                    status=ActionStatus.STARTED,
+                    started_at=utcnow(),
+                    origin_digest=origin_digest,
+                    budget_authorization_id=budget_auth_id,
+                )
+                self._record(
+                    key,
+                    action,
+                    pinning=pinning,
+                    grant=grant_clean,
+                    origin_digest=origin_digest,
+                    rendered_key=rendered_key,
+                )
+                if budget_auth_id is not None:
+                    self._budget_commit_claim(action_type, budget_auth_id)
+                self._count_claim()
+                return ActionOutcome(key=key, action=action, fresh=True)
+
+            if existing.status is ActionStatus.COMPLETED:
+                return ActionOutcome(key=key, action=existing, fresh=False)
+
+            if existing.status is ActionStatus.COMPENSATED:
+                # The effect was undone, so performing it again is legitimate.
+                # Same ordering as a fresh claim: refuse first, count once the
+                # record is durable (issue #1168).
+                if budget_auth_id is not None:
+                    self._budget_refuse_if_exhausted(action_type, budget_auth_id)
+                action = existing.model_copy(
+                    update={
+                        "status": ActionStatus.STARTED,
+                        "started_at": utcnow(),
+                        "result": None,
+                        "result_hash": None,
+                        "external_id": None,
+                        "budget_authorization_id": budget_auth_id,
+                    }
+                )
+                self._record(key, action)
+                if budget_auth_id is not None:
+                    self._budget_commit_claim(action_type, budget_auth_id)
+                self._count_claim()
+                return ActionOutcome(key=key, action=action, fresh=True)
+
+            if existing.status is ActionStatus.FAILED:
+                if budget_auth_id is not None:
+                    self._budget_refuse_if_exhausted(action_type, budget_auth_id)
+                action = existing.model_copy(
+                    update={
+                        "status": ActionStatus.STARTED,
+                        "started_at": utcnow(),
+                        "budget_authorization_id": budget_auth_id,
+                    }
+                )
+                self._record(key, action)
+                if budget_auth_id is not None:
+                    self._budget_commit_claim(action_type, budget_auth_id)
+                self._count_claim()
+                return ActionOutcome(key=key, action=action, fresh=True)
+
+            # STARTED or UNKNOWN: a previous attempt was interrupted.
+            if on_unknown is not None:
+                resolved_outcome = on_unknown(existing)
+                if resolved_outcome is not None:
+                    # The resolution is a real decision and must outlive this call:
+                    # persist it so the next claim (or intercept_action) and
+                    # ledger.pending() reflect it instead of re-raising UnknownSideEffect.
+                    self._record(
+                        resolved_outcome.key, resolved_outcome.action, EventType.ACTION_RECONCILED
+                    )
+                    return resolved_outcome
+
+            uncertain = existing.model_copy(
+                update={"status": ActionStatus.UNKNOWN, "side_effect_uncertain": True}
+            )
+            self._record(key, uncertain)
+            raise UnknownSideEffect(
+                f"action {existing.action_type!r} (key {key[:12]}...) was interrupted before its "
+                f"outcome was recorded; the side effect may or may not have occurred. "
+                f"Reconcile it before retrying.",
+                # The caller is being told to reconcile, so it needs the identity to
+                # reconcile *with*. Truncating it into the message was the only place
+                # it appeared, which left a recovering session unable to act on its
+                # own instruction (issue #367).
+                action_key=str(key),
+                action_id=uncertain.action_id,
+            )
+
+    @_single_writer
+    def complete(
+        self,
+        key: str,
+        *,
+        external_id: str | None = None,
+        result: Mapping[str, Any] | None = None,
+        consumed_inputs: ConsumedInputs | Mapping[str, Any] | None = None,
+    ) -> Action:
+        """Record that the effect succeeded.
+
+        Settles a claim that is still in flight. Re-reporting an action that is
+        already ``COMPLETED`` is allowed, because a caller repeating itself after
+        a dropped response is not asserting anything new.
+
+        Every other status is refused (issue #366). Those are not settlements, they
+        are corrections of a recorded outcome, and correcting an outcome needs
+        evidence about the outside world that this method neither takes nor
+        records. ``UNKNOWN`` is the case that matters: the action reached that
+        status precisely because nobody could say whether the effect happened, and
+        completing it here erased the recovery blocker, wrote no note, and left an
+        ``ACTION_RECORDED`` event indistinguishable from an ordinary first-time
+        success. An auditor could not tell that an uncertain charge had been
+        resolved by assertion.
+
+        :meth:`reconcile` is the supported route for all of them. It takes the
+        same decision, demands the caller stand behind it, and records
+        ``ACTION_RECONCILED`` with a note so the correction is visible in the log.
+
+        Omitted arguments never erase what is on record. A caller repeating a
+        completion after a dropped response usually sends only the key, and
+        overwriting ``external_id`` and ``result`` with ``None`` would destroy the
+        receipt proving the effect happened. Same invariant :meth:`reconcile`
+        already documents, and a no-op on a first completion, where there is
+        nothing yet to preserve.
+        """
+        key, existing = self._require(key)
+        if existing.status not in (ActionStatus.STARTED, ActionStatus.COMPLETED):
+            raise LedgerError(
+                f"action {existing.action_type!r} is {existing.status.value}, not in flight, so "
+                f"completing it would assert an outcome nothing has verified. "
+                f"Check the external system, then call reconcile(occurred=True) "
+                f"(continuum_reconcile_action over MCP), which records the evidence "
+                f"and the note alongside the correction."
+            )
+        settled_external = external_id if external_id is not None else existing.external_id
+        settled_result = dict(result) if result is not None else existing.result
+        normalized = _normalize_consumed_inputs(consumed_inputs)
+        settled_consumed = normalized if normalized is not None else existing.consumed_inputs
+        if settled_result is not None:
+            # A result the ledger cannot canonicalize (issue #1394) is stored
+            # sanitized rather than failing the write after the effect ran.
+            settled_result, settled_hash = _settle_result(settled_result)
+        else:
+            settled_hash = None
+        action = existing.model_copy(
+            update={
+                "status": ActionStatus.COMPLETED,
+                "external_id": settled_external,
+                "result": dict(settled_result) if settled_result is not None else None,
+                "result_hash": settled_hash,
+                "completed_at": utcnow(),
+                "side_effect_uncertain": False,
+                "consumed_inputs": settled_consumed,
+            }
+        )
+        recorded = self._record(key, action)
+        # Both the completion counter and the settlement drawdown belong to a
+        # genuine settlement of an in-flight claim, so both are gated on the
+        # pre-call status being STARTED. Re-reporting an already ``COMPLETED``
+        # action asserts nothing new (see the docstring), so it must move
+        # neither: the sibling ``claim`` counter is likewise skipped when a
+        # claim defers to a COMPLETED record rather than opening a new one
+        # (issue #1032). The claim pinned the settlement id onto the record
+        # (issue #1052), so read it back rather than re-deriving: token
+        # derivation reads the caller's ``volatile`` declaration, and a claim
+        # that declared one while this method always derives with none would put
+        # the confirmation in a different bucket from the attempt it settles.
+        # Records written before the field existed are re-derived as before.
+        if existing.status is ActionStatus.STARTED:
+            self._count_complete()
+            auth_settle = self._settlement_authorization_id(existing)
+            if auth_settle is not None:
+                self._budget_consume_settlement(existing.action_type, auth_settle)
+        return recorded
+
+    @_single_writer
+    def fail(self, key: str, error: str, *, certain: bool = True) -> Action:
+        """Record that the effect did not happen.
+
+        ``certain=False`` is for failures where the effect may still have landed,
+        a timeout after the request was sent for instance. Those become
+        ``UNKNOWN`` rather than ``FAILED``, because a timeout is not evidence of
+        absence.
+
+        Only in-flight statuses settle here (issue #733). Re-reporting a
+        ``FAILED`` action is allowed, because a caller repeating itself after a
+        dropped response is not asserting anything new. Every other status is
+        refused, mirroring :meth:`complete` (issue #366): a late ``fail`` on a
+        ``COMPLETED`` action used to flip it to ``FAILED`` while its recorded
+        result stayed on the books, which reopened the key and let the next
+        claim re-fire a side effect that had already happened. ``UNKNOWN`` is
+        refused for the same reason ``complete`` refuses it: resolving an
+        uncertain outcome is a correction that needs evidence, which is what
+        :meth:`reconcile` records.
+        """
+        key, existing = self._require(key)
+        if existing.status not in (ActionStatus.STARTED, ActionStatus.FAILED):
+            raise LedgerError(
+                f"action {existing.action_type!r} is {existing.status.value}, not in flight, so "
+                f"failing it would erase a recorded outcome. If a check confirmed "
+                f"the effect did not happen, call reconcile(occurred=False) "
+                f"(continuum_reconcile_action over MCP), which records the evidence "
+                f"and the note alongside the correction."
+            )
+        action = existing.model_copy(
+            update={
+                "status": ActionStatus.FAILED if certain else ActionStatus.UNKNOWN,
+                "last_error": error,
+                "side_effect_uncertain": not certain,
+                "completed_at": utcnow() if certain else None,
+            }
+        )
+        return self._record(key, action)
+
+    def _authority_for_action(self, action: Action) -> str | None:
+        """Extract authority_id linked to an action, if any."""
+        if action.arguments and isinstance(action.arguments, Mapping):
+            for _k in ("authority_id", "authority", "token", "approval_id"):
+                if _k in action.arguments and isinstance(action.arguments[_k], str):
+                    return str(action.arguments[_k]).strip()
+        return None
+
+    @_single_writer
+    def reconcile(
+        self,
+        key: str,
+        *,
+        occurred: bool,
+        external_id: str | None = None,
+        result: Mapping[str, Any] | None = None,
+        note: str = "",
+        consumed_inputs: ConsumedInputs | Mapping[str, Any] | None = None,
+    ) -> Action:
+        """Resolve an uncertain action using evidence from the outside world.
+
+        ``occurred=True`` means a check confirmed the effect exists; the action
+        becomes ``COMPLETED`` and will never be repeated. ``occurred=False``
+        means it confirmed absence; the action becomes ``FAILED`` and may be
+        retried, and its now-falsified ``external_id`` and ``result`` are
+        cleared (issue #29) so no reader trusts evidence of a completion the
+        system has just decided never happened.
+
+        Reconciling an already-COMPLETED action is deliberately permitted: an
+        agent that optimistically called :meth:`complete` may be contradicted by
+        a later probe, and correcting that record is the point of this method.
+        The caller is trusted to have real evidence, because nothing here can
+        check the outside world on its behalf.
+
+        What is *not* permitted is losing evidence by omission. ``occurred=True``
+        keeps any ``external_id`` and ``result`` already on record when the
+        caller does not supply replacements, so confirming an effect happened can
+        never erase the receipt proving it did.
+        """
+        key, existing = self._require(key)
+        if occurred:
+            # Fall back to what is already recorded rather than overwriting with
+            # None. Confirming an effect occurred must never be the reason its
+            # receipt disappears; a caller replacing the evidence passes it.
+            settled_external = external_id if external_id is not None else existing.external_id
+            settled_result = dict(result) if result is not None else existing.result
+            normalized = _normalize_consumed_inputs(consumed_inputs)
+            settled_consumed = normalized if normalized is not None else existing.consumed_inputs
+            if settled_result is not None:
+                # Same guard as complete: a reconciliation that confirms the
+                # effect happened must not fail on the shape of the evidence
+                # (issue #1394).
+                settled_result, settled_hash = _settle_result(settled_result)
+            else:
+                settled_hash = None
+            action = existing.model_copy(
+                update={
+                    "status": ActionStatus.COMPLETED,
+                    "external_id": settled_external,
+                    "result": dict(settled_result) if settled_result is not None else None,
+                    "result_hash": settled_hash,
+                    "completed_at": utcnow(),
+                    "side_effect_uncertain": False,
+                    "last_error": note or existing.last_error,
+                    "consumed_inputs": settled_consumed,
+                }
+            )
+        else:
+            action = existing.model_copy(
+                update={
+                    "status": ActionStatus.FAILED,
+                    "external_id": None,
+                    "result": None,
+                    "result_hash": None,
+                    "side_effect_uncertain": False,
+                    "last_error": note or "reconciliation found no external effect",
+                    "consumed_inputs": ConsumedInputs(),
+                }
+            )
+        recorded = self._record(key, action, EventType.ACTION_RECONCILED)
+        # Settlement drawdown (issue #413): the claim pinned the bucket onto
+        # this record, so settle against the same one (issue #1052). Two guards
+        # narrow it to the one case that actually settles a landed effect:
+        #  - Draw only when the effect is confirmed present. occurred=False
+        #    resolves the record to FAILED -- the same terminal state fail()
+        #    produces, and fail() draws no settlement -- so charging the bucket
+        #    for an effect a check proved absent mis-bills the cap for a landing
+        #    that never happened, starving later claims for no reason.
+        #  - Guard on the *pre-call* status exactly as complete() does
+        #    (issue #1370): the drawdown fires once, on the transition out of an
+        #    in-flight state (STARTED or the uncertain UNKNOWN that only reconcile
+        #    can settle). Reconciling an already-terminal record -- the
+        #    deliberately-permitted complete->reconcile correction, or an
+        #    idempotent reconcile retry after a dropped MCP response -- must not
+        #    re-consume the bucket, or one logical effect would draw the cap
+        #    twice.
+        if occurred and existing.status in (ActionStatus.STARTED, ActionStatus.UNKNOWN):
+            auth_settle = self._settlement_authorization_id(existing)
+            if auth_settle is not None:
+                self._budget_consume_settlement(existing.action_type, auth_settle)
+        return recorded
+
+    @_single_writer
+    def compensate(self, key: str, *, note: str = "", by: str | None = None) -> Action:
+        """Record that a completed effect was deliberately undone.
+
+        Only completed effects can be compensated (issue #1387). Re-reporting a
+        COMPENSATED action is allowed, matching the idempotency of complete()
+        and fail(). Interrupted or uncertain actions (STARTED, UNKNOWN) cannot
+        be compensated, because there is no verified outcome to undo; resolving
+        them belongs to reconcile().
+        """
+        key, existing = self._require(key)
+        if existing.status not in (ActionStatus.COMPLETED, ActionStatus.COMPENSATED):
+            raise LedgerError(
+                f"action {existing.action_type!r} is {existing.status.value}, not a completed "
+                f"effect, so there is nothing verified to undo. Resolve an interrupted or "
+                f"uncertain action with reconcile() before compensating it."
+            )
+        action = existing.model_copy(
+            update={
+                "status": ActionStatus.COMPENSATED,
+                "compensated_by": [*existing.compensated_by, by] if by else existing.compensated_by,
+                "last_error": note or existing.last_error,
+                "side_effect_uncertain": False,
+            }
+        )
+        return self._record(key, action, EventType.ACTION_COMPENSATED)
+
+    @_single_writer
+    def flag_for_review(self, key: str, reason: str) -> Action:
+        """Escalate an action a human must judge."""
+        key, existing = self._require(key)
+        action = existing.model_copy(
+            update={"status": ActionStatus.REQUIRES_REVIEW, "last_error": reason}
+        )
+        return self._record(key, action)
+
+    def forensic_lookup(self, record_key: str) -> list[dict[str, Any]]:
+        """Find actions whose rendered key contains ``record_key``.
+
+        Scans this run's ledger for memory writes whose stored
+        ``rendered_key`` contains the given substring. For each hit, also
+        resolves the originating observation event by ``origin_digest`` when
+        present. This is the poisoning forensics join: given a bad record,
+        walk back to what caused it, then enumerate siblings from the same
+        contaminated origin.
+
+        Returns a list of ``{"action": Action, "rendered_key": str,
+        "origin_digest": str | None, "observation_event": Event | None}``
+        entries. Empty when nothing matches. Searches only this run; for
+        store-global enumeration use :func:`forensic_join_across_runs`.
+        """
+        hits: list[dict[str, Any]] = []
+        # Map observation digest to event for this run
+        obs_by_digest: dict[str, Any] = {}
+        try:
+            from continuum.security.hashing import stable_hash as _sh
+
+            for ev in self.storage.read_all_events(self.run_id):
+                if ev.type == EventType.PERCEPTION_OBSERVED:
+                    try:
+                        digest = _sh(dict(ev.payload))
+                    except Exception:
+                        continue
+                    obs_by_digest[digest] = ev
+                    # Also index by content_hash if present
+                    ch = ev.payload.get("content_hash")
+                    if isinstance(ch, str):
+                        obs_by_digest[ch] = ev
+        except Exception:
+            obs_by_digest = {}
+        for ev in self.storage.read_all_events(self.run_id):
+            if ev.type not in _ACTION_EVENT_TYPES:
+                continue
+            payload = dict(ev.payload)
+            rendered = payload.get("rendered_key") or payload.get("key") or ""
+            # The stored key is hashed, so check rendered_key first, then
+            # fallback to substring search inside action arguments or key.
+            match = False
+            if isinstance(rendered, str) and record_key in rendered:
+                match = True
+            else:
+                # Fallback: check action arguments for record_key
+                try:
+                    act = payload.get("action") or {}
+                    args = act.get("arguments") or {}
+                    if record_key in str(args):
+                        match = True
+                    if record_key in str(payload.get("key", "")):
+                        match = True
+                except Exception:
+                    pass
+            if not match:
+                continue
+            try:
+                action = Action.model_validate(payload["action"])
+            except Exception:
+                continue
+            digest = payload.get("origin_digest") or action.origin_digest  # type: ignore[assignment]
+            obs_ev = obs_by_digest.get(digest) if isinstance(digest, str) else None
+            hits.append(
+                {
+                    "action": action,
+                    "rendered_key": rendered,
+                    "origin_digest": digest,
+                    "observation_event": obs_ev,
+                }
+            )
+        return hits
+
+    def _require(self, key: str) -> tuple[str, Action]:
+        """Resolve ``key`` to its stored key and action, or explain what is wrong.
+
+        Returns the *resolved* key alongside the action, because the caller has
+        to record its settlement under the key the fold uses, not under whatever
+        identifier the caller happened to hold (issue #367).
+
+        The message names every identifier space. The previous wording,
+        ``no action recorded for key <prefix>...``, left a caller that had passed
+        a perfectly valid ``action_id`` with no way to tell that it had reached
+        for the wrong identifier rather than a nonexistent action. The rendered
+        key the gate instructs a caller to claim is accepted too, so a miss now
+        genuinely means nothing was recorded under it; an ambiguous rendered key,
+        one naming several actions, says so and points at the ``action_id``
+        instead of reading like a typo.
+        """
+        resolved = self.resolve_key(key)
+        if resolved is None:
+            ambiguous = self._rendered_key_index().get(key)
+            if ambiguous and len(ambiguous) > 1:
+                raise LedgerError(
+                    f"the rendered key {key!r} names {len(ambiguous)} different "
+                    f"actions in run {self.run_id!r}, which hashed to separate "
+                    f"ledger keys, so it cannot settle one of them. Pass the "
+                    f"action_id instead: `continuum actions {self.run_id}` lists them."
+                )
+            known = len(self._replay())
+            raise LedgerError(
+                f"no action in run {self.run_id!r} matches {key[:16]!r} as either an "
+                f"idempotency key or an action_id, or as the rendered key the gate "
+                f"told you to claim ({known} action(s) recorded). "
+                f"List them with `continuum actions {self.run_id}` or "
+                f"continuum_list_actions, and pass the action_key or action_id from there."
+            )
+        return resolved, self._replay()[resolved]
+
+
+def forensic_join_across_runs(storage: Storage, record_key: str) -> list[dict[str, Any]]:
+    """Store-global forensic join: record_key -> originating observations.
+
+    Scans every run in ``storage`` for memory actions whose rendered key
+    contains ``record_key``, returning the same shape as
+    :meth:`ActionLedger.forensic_lookup` but across all runs. This powers
+    enumeration for poisoning forensics where a contaminated origin may have
+    produced sibling writes in different runs.
+
+    Each hit includes ``run_id``, ``action``, ``rendered_key``,
+    ``origin_digest`` and ``observation_event`` (or None when the digest
+    has no matching PERCEPTION_OBSERVED in that run).
+    """
+    from continuum.security.hashing import stable_hash as _sh
+
+    hits: list[dict[str, Any]] = []
+    for run in storage.list_runs():
+        run_id = run.run_id
+        # Build per-run observation index
+        obs_by_digest: dict[str, Any] = {}
+        try:
+            for ev in storage.read_all_events(run_id):
+                if ev.type == EventType.PERCEPTION_OBSERVED:
+                    try:
+                        digest = _sh(dict(ev.payload))
+                    except Exception:
+                        continue
+                    obs_by_digest[digest] = ev
+                    ch = ev.payload.get("content_hash")
+                    if isinstance(ch, str):
+                        obs_by_digest[ch] = ev
+        except Exception:
+            obs_by_digest = {}
+        try:
+            events = storage.read_all_events(run_id)
+        except Exception:
+            continue
+        for ev in events:
+            if ev.type not in _ACTION_EVENT_TYPES:
+                continue
+            payload = dict(ev.payload)
+            rendered = payload.get("rendered_key") or ""
+            match = isinstance(rendered, str) and record_key in rendered
+            if not match:
+                try:
+                    act = payload.get("action") or {}
+                    args = act.get("arguments") or {}
+                    if record_key in str(args):
+                        match = True
+                except Exception:
+                    pass
+            if not match:
+                continue
+            try:
+                action = Action.model_validate(payload["action"])
+            except Exception:
+                continue
+            digest = payload.get("origin_digest") or getattr(action, "origin_digest", None)  # type: ignore[assignment]
+            obs_ev = obs_by_digest.get(digest) if isinstance(digest, str) else None
+            hits.append(
+                {
+                    "run_id": run_id,
+                    "action": action,
+                    "rendered_key": rendered,
+                    "origin_digest": digest,
+                    "observation_event": obs_ev,
+                }
+            )
+    return hits

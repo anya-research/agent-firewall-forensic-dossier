@@ -1,0 +1,130 @@
+"""PagerDuty sink -- trigger PagerDuty Events API v2 incidents.
+
+Zero dependency (stdlib ``urllib.request``). Posts a ``trigger`` event with a
+mapped severity so on-call gets paged. Optional ``min_severity`` filter. The
+``timeout`` is a wall-clock deadline on the whole POST (see
+``bounded_post``), not just a per-socket-operation hint, so a stuck endpoint
+pages nothing but also stalls nothing. Redirects are refused rather than
+followed, so an auth redirect from an expired routing key surfaces as a logged
+failure instead of a silent success (issue #389).
+
+Privacy: only ``FailureRisk`` fields are transmitted, never raw content
+(project.md §11).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import urllib.request
+from typing import Any
+
+from snagline.risk import (
+    SEVERITY_CRITICAL,
+    SEVERITY_INFO,
+    SEVERITY_WARNING,
+    FailureRisk,
+)
+from snagline.sinks.base import (
+    _MAX_SINK_RESPONSE_BYTES,
+    bounded_post,
+    describe_failure,
+    format_sink_repr,
+    make_post_pool,
+)
+
+logger = logging.getLogger("snagline")
+
+_EVENTS_API = "https://events.pagerduty.com/v2/enqueue"
+
+_SEVERITY_ORDER = {
+    SEVERITY_INFO: 0,
+    SEVERITY_WARNING: 1,
+    SEVERITY_CRITICAL: 2,
+}
+
+# PagerDuty's severity vocabulary is a subset of ours.
+_PD_SEVERITY = {
+    SEVERITY_CRITICAL: "critical",
+    SEVERITY_WARNING: "warning",
+    SEVERITY_INFO: "info",
+}
+
+
+def _order(severity: str) -> int:
+    return _SEVERITY_ORDER.get(severity, 1)
+
+
+class PagerDutySink:
+    """Trigger a PagerDuty incident for each ``FailureRisk``."""
+
+    def __init__(
+        self,
+        routing_key: str,
+        timeout: float = 2.0,
+        source: str = "snagline",
+        min_severity: str | None = None,
+    ) -> None:
+        self._key = routing_key
+        self._timeout = timeout
+        self._source = source
+        self._min = min_severity
+        # A private in-flight pool: a stalled PagerDuty must only exhaust its
+        # own delivery budget, not the one every other network sink draws from
+        # (issue #559).
+        self._post_pool = make_post_pool()
+
+    def __repr__(self) -> str:
+        """Repr without the routing key, which is a credential (#390)."""
+        return format_sink_repr(
+            "PagerDutySink",
+            source=self._source,
+            timeout=self._timeout,
+            min_severity=self._min,
+        )
+
+    def emit(self, risk: FailureRisk) -> None:
+        if self._min is not None and _order(risk.severity) < _order(self._min):
+            return
+        pd_sev = _PD_SEVERITY.get(risk.severity, "warning")
+        # ``custom_details`` is a member of the ``payload`` object in the
+        # Events API v2, not a top-level field: PagerDuty ignores unknown
+        # top-level keys, so nesting it here is what carries episode_id/step_id
+        # into the incident instead of silently dropping them.
+        payload: dict[str, Any] = {
+            "routing_key": self._key,
+            "event_action": "trigger",
+            "payload": {
+                "summary": f"[{risk.severity}] {risk.trigger}: {risk.detail}",
+                "source": self._source,
+                "severity": pd_sev,
+                "custom_details": {
+                    "episode_id": risk.episode_id,
+                    "step_id": risk.step_id,
+                    "score": risk.score,
+                    "trigger": risk.trigger,
+                },
+            },
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            _EVENTS_API,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            bounded_post(
+                req, self._timeout, _MAX_SINK_RESPONSE_BYTES, pool=self._post_pool
+            )
+        except Exception as exc:
+            # The routing key is the credential and it rides in the body, not
+            # the URL -- but a ``URLError`` embeds the destination in its
+            # reason for some failures, and ``logger.exception`` writes it into
+            # the log through the traceback. Webhook and Slack already name the
+            # failure by class only for this reason; this matches them, so the
+            # escalation path logs the same shape everywhere (issue #390).
+            logger.error(
+                "snagline PagerDuty sink POST failed (%s); ignoring (fail-open)",
+                describe_failure(exc),
+            )

@@ -1,0 +1,441 @@
+"""Concrete GenericAgentAdapter for standard Python agent loops."""
+
+from __future__ import annotations
+
+import contextlib
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from continuum.models import RecoveryContract
+    from continuum.recovery.ledger import RecoveryLedger
+
+from continuum.actions.ledger import ActionLedger, ActionOutcome
+from continuum.adapters.actions import format_action_error
+from continuum.adapters.base import AgentAdapter
+from continuum.checkpoint.manager import CheckpointManager
+from continuum.events import Event, EventType
+from continuum.models import (
+    EnvironmentSnapshot,
+    Origin,
+    Run,
+    SemanticState,
+    StateCheckpoint,
+)
+from continuum.recovery.engine import RecoveryDecision, RecoveryEngine
+from continuum.state.semantic import ProjectionError, project
+from continuum.storage.base import RunNotFound, Storage
+
+#: Key under which a non-dict action result is stored, since the ledger records
+#: results as mappings. A caller's own dict is wrapped in the same envelope when
+#: it contains this key, so the presence of the key in a stored result always
+#: means "envelope" and never "caller data".
+RESULT_ENVELOPE_KEY = "__return_value__"
+
+__all__ = ["GenericAgentAdapter", "RESULT_ENVELOPE_KEY"]
+
+
+class GenericAgentAdapter(AgentAdapter):
+    """Concrete adapter wrapping CONTINUUM primitives for generic Python agents.
+
+    Provides a clean, high-level API so caller code does not need to construct
+    or interact directly with storage handles, event log streams, or ledger objects.
+    """
+
+    def __init__(
+        self,
+        storage: Storage,
+        *,
+        engine: RecoveryEngine | None = None,
+        ledger: RecoveryLedger | None = None,
+        auto_file: str | None = None,
+        auto_total: int | None = None,
+    ) -> None:
+        self.storage = storage
+        self.manager = CheckpointManager(storage)
+        self.engine = engine or RecoveryEngine(storage, ledger=ledger)
+        self.ledger = ledger or getattr(self.engine, "ledger", None)
+        self.auto_file = auto_file
+        self.auto_total = auto_total
+
+    def start_run(
+        self,
+        goal: str,
+        *,
+        run_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> Run:
+        """Create a run and record the ``RUN_STARTED`` event that anchors it.
+
+        The run row and the ``RUN_STARTED`` event are separate facts: the row
+        is a lookup key, but projection, replay, and restore fold the event
+        log, and a log that never recorded ``RUN_STARTED`` has no goal to fold
+        (``SemanticStateBuilder._build`` raises ``ProjectionError``). A run
+        whose row exists without the event is therefore unresumable: ``resume``
+        finds no state to restore, and the run is indistinguishable from one
+        that crashed before writing anything. Recording both here keeps the
+        adapter's documented contract, that a caller "does not need to interact
+        directly with event log streams", honest.
+
+        The event is backfilled only when the log is empty. A non-empty log
+        whose first event is not ``RUN_STARTED`` is refused rather than
+        misordered: appending the run's start after events that supposedly
+        preceded it would make every state projected from that log quietly
+        wrong, which is worse than an error naming the problem. Mirrors
+        ``ContinuumMCP.ensure_run`` and ``OpenAIAgentAdapter._ensure_run_exists``.
+        """
+        run = (
+            Run(goal=goal, metadata=dict(metadata or {}))
+            if run_id is None
+            else Run(run_id=run_id, goal=goal, metadata=dict(metadata or {}))
+        )
+        try:
+            run = self.storage.get_run(run.run_id)
+        except RunNotFound:
+            run = self.storage.create_run(run)
+
+        archived = self.storage.read_archived_events(run.run_id)
+        if archived:
+            first: Event | None = archived[0]
+        else:
+            live = self.storage.read_events(run.run_id, upto=1)
+            if live:
+                first = live[0]
+            else:
+                all_live = self.storage.read_events(run.run_id)
+                first = all_live[0] if all_live else None
+
+        if not first:
+            self.storage.append_event(
+                run.run_id,
+                EventType.RUN_STARTED,
+                {"goal": run.goal},
+                source=Origin.DETERMINISTIC,
+            )
+        elif first.type is not EventType.RUN_STARTED:
+            raise ValueError(
+                f"run {run.run_id!r} does not begin with RUN_STARTED "
+                f"(first event is {first.type.value}). CONTINUUM cannot backfill "
+                "it after the fact without misordering the run's history; recreate "
+                "the run, or record RUN_STARTED before any other event."
+            )
+        return run
+
+    def capture_state(
+        self,
+        run_id: str,
+        state: SemanticState,
+        *,
+        environment: EnvironmentSnapshot | None = None,
+        reason: str = "",
+    ) -> StateCheckpoint:
+        """Capture semantic state and optionally pin its environment."""
+        # A snapshot alone cannot invalidate a checkpoint: the validator decides
+        # staleness per declared dependency and returns early when a state has
+        # none, so a checkpoint carrying only a snapshot would report
+        # safe_to_resume even after the resource underneath it moved. Declaring
+        # the pinned environment as dependencies is what gives drift something
+        # to invalidate. Mirrors the MCP server and serve sidecar (issue #25).
+        if environment is not None:
+            self._declare_dependencies(run_id, environment)
+        # Auto mode: the file is ground truth for progress. The derived events
+        # are appended before the checkpoint so the checkpoint captures them,
+        # and record_file_progress is a no-op when the count is unchanged.
+        if self.auto_file is not None and self.auto_total is not None:
+            from continuum.hooks import record_file_progress
+
+            record_file_progress(self.manager, run_id, self.auto_file, self.auto_total)
+            # Reproject so the checkpoint captures the derived progress. The fold
+            # needs the archive too: on a compacted run the live tail holds no
+            # RUN_STARTED, so a live-only read here would reject the checkpoint
+            # (and the appended TASK_UPDATED would not fold against the archived
+            # start).
+            state = project(run_id, self.storage.read_all_events(run_id))
+        return self.manager.checkpoint(
+            run_id,
+            state=state,
+            reason=reason or "adapter state capture",
+            environment=environment,
+        )
+
+    def _declare_dependencies(self, run_id: str, environment: EnvironmentSnapshot) -> None:
+        """Record a captured environment as declared dependencies of the run.
+
+        Stored as ``DEPENDENCY_DECLARED`` events (not written onto the
+        checkpoint state) so the declaration survives projection and restore, is
+        covered by the hash chain, and carries the same deterministic provenance
+        as the rest of the adapter's writes. Only new or re-pinned resources are
+        appended, so a scheduled checkpoint with an unchanged environment adds
+        nothing.
+        """
+        env_map = {name: str(res.version) for name, res in environment.resources.items()}
+        if not env_map:
+            return
+        # Projecting prior declarations is an optimization (skip re-pinning the
+        # same version). If the run has no goal yet, projection is impossible, so
+        # fall back to declaring everything; project folds duplicates later.
+        # The fold reads the full history: once a run has been compacted the
+        # goal-bearing prefix (and with it any earlier declaration) lives only in
+        # the archive, so a live-tail read raises ProjectionError and the fallback
+        # below would re-pin every resource on every checkpoint.
+        try:
+            declared = {
+                dependency.resource: dependency.version
+                for dependency in project(
+                    run_id, self.storage.read_all_events(run_id)
+                ).external_dependencies
+            }
+        except ProjectionError:
+            declared = {}
+        for name, version in env_map.items():
+            if declared.get(name) == version:
+                continue
+            self.storage.append_event(
+                run_id,
+                EventType.DEPENDENCY_DECLARED,
+                {"resource": name, "version": version},
+                source=Origin.DETERMINISTIC,
+            )
+
+    def restore_state(
+        self,
+        run_id: str,
+        *,
+        replay: bool = True,
+    ) -> SemanticState:
+        """Restore the latest checkpointed semantic state for a run."""
+        restored = self.manager.restore(run_id, replay=replay)
+        return restored.state
+
+    def intercept_action(
+        self,
+        run_id: str,
+        action_type: str,
+        action_fn: Callable[[], Any],
+        arguments: Mapping[str, Any] | None = None,
+        *,
+        volatile: Sequence[str] = (),
+        scoped_to_run: bool = True,
+        on_unknown: Callable[[Any], ActionOutcome | None] | None = None,
+        key: str | None = None,
+        dep_scope: str | None = None,
+    ) -> Any:
+        """Intercept and safely execute an external side effect.
+
+        1. Claims the action in the ActionLedger.
+        2. If already completed (fresh=False), returns the cached result without executing action_fn.
+        3. If fresh=True, executes action_fn().
+        4. If action_fn() succeeds, completes the ledger claim and returns the result.
+        5. If action_fn() raises, records the outcome as *uncertain* and re-raises.
+
+        ``key`` is an explicit, Stripe-style idempotency key (e.g. ``"notify:O-9"``)
+        that identifies the operation independently of its argument text. Prefer it
+        over argument-hash dedup whenever the caller (an LLM especially) may render
+        equivalent operations with drifting argument spellings, since a changed
+        argument string produces a different hash and silently defeats dedup.
+
+        Step 5 is deliberately conservative. An exception escaping an external
+        call does not prove the side effect failed to occur: a timeout or a
+        dropped connection means the request may already have landed. Recording
+        it as a definite failure would remove it from ``ledger.pending()``, hide
+        it from reconciliation, and let a later retry duplicate the effect,
+        exactly the hazard the ledger exists to prevent.
+
+        There is no exception type in this layer that reliably proves nothing
+        happened. ``action_fn`` is an opaque callable, so a ``ValueError`` may
+        equally come from argument validation *before* any network call or from
+        parsing a response *after* the server already acted. Distinguishing them
+        requires knowledge only the caller has, so the default is uncertainty
+        and the caller narrows it via ``reconcile_pending``.
+
+        Step 4 never fails on the shape of the result. A tool returning a value
+        the ledger cannot canonicalize (a ``Decimal`` amount, a ``set`` of ids,
+        any object without ``model_dump``) is completed all the same: completion
+        runs after the effect, and letting it raise would leave a successful
+        effect recorded as never-completed and unrepeatable (issue #1394). The
+        caller's own return value is untouched on the first call; the stored
+        copy, and therefore what a replay returns, is the JSON-native form the
+        durable record holds anyway, with any non-canonical part replaced by its
+        repr.
+        """
+        ledger = ActionLedger(self.storage, run_id)
+        outcome = ledger.claim(
+            action_type,
+            arguments=arguments,
+            volatile=volatile,
+            scoped_to_run=scoped_to_run,
+            on_unknown=on_unknown,
+            key=key,
+            dep_scope=dep_scope,
+        )
+
+        if not outcome.fresh:
+            res = outcome.result
+            # One level of unwrapping, matching the one level the fresh path
+            # below applies. A stored dict that carries the key is always an
+            # envelope, never a caller's own dict, because the fresh path wraps
+            # those too.
+            if isinstance(res, dict) and RESULT_ENVELOPE_KEY in res:
+                return res[RESULT_ENVELOPE_KEY]
+            return res
+
+        try:
+            val = action_fn()
+        except Exception as exc:
+            # certain=False: the effect may or may not have occurred. This keeps
+            # the action in ledger.pending() so recovery blocks until a probe
+            # settles it, rather than silently permitting a duplicate retry.
+            ledger.fail(outcome.key, format_action_error(exc), certain=False)
+            raise
+
+        # A non-dict has to be wrapped to be stored. So does a dict that happens
+        # to contain the envelope key: storing that one as-is would make the
+        # cached path unwrap the caller's own dict and return only that member,
+        # so a completed action would return a different value on its second
+        # call than on its first.
+        needs_envelope = not isinstance(val, dict) or RESULT_ENVELOPE_KEY in val
+        result_dict = {RESULT_ENVELOPE_KEY: val} if needs_envelope else val
+        ledger.complete(outcome.key, result=result_dict)
+        self._auto_progress(run_id)
+        return val
+
+    def _auto_progress(self, run_id: str) -> None:
+        """Fire the opt-in auto hooks after a turn without blocking the caller.
+
+        Mirrors the file into the log when the derived count changed (cheap:
+        one small read plus an event-log comparison), then lets the policy
+        decide whether a checkpoint write is due. The write itself goes to the
+        shared background executor, so the agent's turn is never blocked on
+        SQLite I/O. This is what makes durability automatic for every harness
+        using the adapter: no model tool call and no prompt mention of
+        CONTINUUM required (issue 191).
+        """
+        if self.auto_file is None or self.auto_total is None:
+            return
+        from continuum.hooks import make_async_file_derived_progress_hook
+
+        hook = make_async_file_derived_progress_hook(
+            self.manager, run_id, self.auto_file, self.auto_total
+        )
+        with contextlib.suppress(Exception):  # durability must never break the turn
+            hook()
+
+    def resume(
+        self,
+        run_id: str,
+        *,
+        current_environment: EnvironmentSnapshot | None = None,
+        expected_model: str | None = None,
+        replay: bool = True,
+        scope: Iterable[str] | None = None,
+        ledger: RecoveryLedger | None = None,
+        dependency_budgets: Mapping[str, Any] | None = None,
+    ) -> RecoveryDecision:
+        """Assess whether a run may safely resume under current conditions."""
+        return self.engine.assess(
+            run_id,
+            current_environment=current_environment,
+            expected_model=expected_model,
+            replay=replay,
+            scope=scope,
+            ledger=ledger or self.ledger,
+            dependency_budgets=dependency_budgets,
+        )
+
+    def record_attempt(
+        self,
+        run_id: str,
+        *,
+        note: str = "",
+        max_attempts: int | None = None,
+        dependency: str | None = None,
+        dependencies: Iterable[str] | None = None,
+        contract: RecoveryContract | None = None,
+        action: Any | None = None,
+        scope: Iterable[str] | None = None,
+        dependency_budgets: Mapping[str, Any] | None = None,
+    ) -> int:
+        """Record one recovery attempt via the underlying RecoveryEngine / RecoveryLedger."""
+        return self.engine.record_attempt(
+            run_id,
+            note=note,
+            max_attempts=max_attempts,
+            dependency=dependency,
+            dependencies=dependencies,
+            contract=contract,
+            action=action,
+            scope=scope,
+            dependency_budgets=dependency_budgets,
+        )
+
+    def requires_human(
+        self,
+        run_id: str,
+        *,
+        max_attempts: int = 3,
+        dependency: str | None = None,
+        dependencies: Iterable[str] | None = None,
+        contract: RecoveryContract | None = None,
+        action: Any | None = None,
+        scope: Iterable[str] | None = None,
+        dependency_budgets: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Check whether human intervention is required via the underlying RecoveryEngine / RecoveryLedger."""
+        return self.engine.requires_human(
+            run_id,
+            max_attempts=max_attempts,
+            dependency=dependency,
+            dependencies=dependencies,
+            contract=contract,
+            action=action,
+            scope=scope,
+            dependency_budgets=dependency_budgets,
+        )
+
+    def spawn_subagent(
+        self,
+        parent_run_id: str,
+        subagent_run_id: str,
+        task_description: str,
+    ) -> None:
+        """Record a SUBAGENT_SPAWNED event linking parent to subagent run."""
+        self.storage.append_event(
+            parent_run_id,
+            EventType.SUBAGENT_SPAWNED,
+            {
+                "subagent_run_id": subagent_run_id,
+                "task_description": task_description,
+            },
+        )
+
+    def complete_subagent(
+        self,
+        parent_run_id: str,
+        subagent_run_id: str,
+        *,
+        success: bool = True,
+        result_summary: str | None = None,
+    ) -> None:
+        """Record SUBAGENT_COMPLETED or SUBAGENT_FAILED for a subagent run."""
+        event_type = EventType.SUBAGENT_COMPLETED if success else EventType.SUBAGENT_FAILED
+        payload: dict[str, Any] = {"subagent_run_id": subagent_run_id}
+        if result_summary:
+            payload["result_summary"] = result_summary
+        self.storage.append_event(parent_run_id, event_type, payload)
+
+    def compact_context(
+        self,
+        run_id: str,
+        *,
+        retained_events: int,
+        compacted_events: int,
+        summary: str | None = None,
+    ) -> None:
+        """Record a PRECOMPACT_HOOK event marking context compaction."""
+        payload: dict[str, Any] = {
+            "retained_events": retained_events,
+            "compacted_events": compacted_events,
+        }
+        if summary:
+            payload["summary"] = summary
+        self.storage.append_event(run_id, EventType.PRECOMPACT_HOOK, payload)

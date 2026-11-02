@@ -1,0 +1,99 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-firewall1"
+version = "0.1.0"
+description = "A runtime security and governance layer that evaluates AI-agent tool requests before they execute."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Bipin583" }]
+keywords = [
+    "security",
+    "ai-agents",
+    "llm",
+    "guardrails",
+    "policy",
+    "firewall",
+    "mcp",
+    "claude-code",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pydantic>=2.5",
+    "PyYAML>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Bipin583/agent-firewall"
+Repository = "https://github.com/Bipin583/agent-firewall"
+Issues = "https://github.com/Bipin583/agent-firewall/issues"
+Changelog = "https://github.com/Bipin583/agent-firewall/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "SQLAlchemy[asyncio]>=2.0",
+    "aiosqlite>=0.19",
+]
+mcp = [
+    "mcp>=2.1,<3",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    "coverage>=7.3",
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "hypothesis>=6.90",
+    "httpx>=0.27",
+    "types-PyYAML",
+    "mcp>=2.1,<3",
+]
+
+[project.scripts]
+agent-firewall = "agent_firewall.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agent_firewall = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra -q"
+markers = [
+    "live: tests that require a live Claude Code install (skipped by default)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["agent_firewall"]
+mypy_path = "src"
+strict = true
+warn_unused_ignores = true
+ignore_missing_imports = true

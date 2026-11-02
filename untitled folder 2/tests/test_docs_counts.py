@@ -1,0 +1,680 @@
+"""Guard the documented pytest counts against silent drift (#630, #1109).
+
+README.md, the translated READMEs, CHANGELOG.md, docs/CONTRIBUTING_ONBOARDING.md,
+and every ``references/*.md`` doc can state the collected total. The guard
+asserts that every figure those files *do* state agrees with the others and
+with a live ``pytest --collect-only`` within tolerance. Skips vary by
+environment, so only collected totals are compared, never passed/skipped
+splits. Regenerate the figures with ``pytest --collect-only -q; pytest -q``.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+
+# Docs that must state the total. If one of these stopped stating it the guard
+# would lose its spine, so absence here is an error.
+REQUIRED_FILES = (
+    ROOT / "README.md",
+    ROOT / "docs" / "CONTRIBUTING_ONBOARDING.md",
+    ROOT / "CHANGELOG.md",
+    ROOT / "references" / "install.md",
+)
+
+# Docs that may state it. references/ and the translated READMEs are
+# user-facing and used to drift unnoticed (#1109, #1071): a doc that states no
+# total is skipped, a doc that states a wrong one fails. docs/index.html is not
+# markdown but states the figure three times, and drifted 234 tests behind the
+# suite without any markdown guard noticing (#1283).
+OPTIONAL_FILES = (
+    *sorted(ROOT.glob("README.*.md")),  # translated READMEs
+    *sorted(ROOT.joinpath("references").glob("*.md")),
+    ROOT / "docs" / "index.html",
+)
+
+COUNTED_FILES = (*REQUIRED_FILES, *OPTIONAL_FILES)
+# The collected total is stated as an approximation in the prose and shifts
+# whenever tests are added or removed, so it is compared within a band rather
+# than pinned exactly. This absorbs ordinary test growth while still failing on
+# the large drift the guard exists to catch.
+TOLERANCE = 250
+
+# The module and test-file counts drift by 1 for every file added or removed,
+# and the fault-suite count by however many cases the corpus gains. A PR that
+# adds one test file is doing exactly what it says, not rotting a doc, so these
+# are checked within a small band rather than pinned exactly.
+#
+# Pinning them exactly (#1068) meant every test-adding PR went red on a number
+# its author had no reason to be tracking, and four contributors independently
+# tried to renumber it (batch of #1687, #1666, #1670, #1667). Rot that this
+# guard exists to catch is much larger than one PR's worth of files: #1068 found
+# the prose at 161 test files against a tree of 169, and #316 and #630 moved the
+# collected total by the hundreds. Five absorbs a normal batch of test files
+# while still failing on drift of that size.
+TREE_COUNT_TOLERANCE = 5
+
+# Every prose form the docs use for the collected total (#664 review):
+# "~2,053 collected", "roughly 2,053 tests collected", "approximately 2,053
+# tests" (references/testing.md), "~2,053 tests". Passed/skipped figures are
+# deliberately unmatched: they vary by environment.
+# The `pytest -q` verify comment is listed last and reads every README
+# regardless of language: translations rephrase all the prose but keep that
+# code comment's shape, and its first number is always the collected total
+# (#1071). `.` cannot cross the newline, so the figure stays on that line.
+_COLLECTED_RES = (
+    re.compile(r"~([\d,]+)`?\s+collected"),
+    re.compile(r"roughly\s+([\d,]+)\s+tests\s+collected"),
+    re.compile(r"approximately\s+([\d,]+)\s+tests\b"),
+    re.compile(r"~([\d,]+)\s+tests\b"),
+    re.compile(r"\bwith\s+~?([\d,]+)\s+tests\b", re.IGNORECASE),
+    re.compile(
+        r"\bvalidated(?:\s+\w+){0,5}\s+and\s+~?([\d,]+)\s+tests\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bvalidado(?:\s+\w+){0,5}\s+y\s+~?([\d,]+)\s+tests\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bcerca\s+de\s+~?([\d,]+)\s+tests\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^pytest\s+-q\s+#.*?([\d,]+)", re.MULTILINE),
+    # docs/index.html is not markdown, so none of the prose forms above reach
+    # it. It states the figure three times -- the meta description, the hero
+    # banner, and the metrics card (#1283). Uppercase is deliberate: the master
+    # plan says "909 tests passing" about a long-ago snapshot and is not a
+    # counted file, but a case-insensitive flag would let it veto the real
+    # total.
+    re.compile(r"CLI commands,\s*([\d,]+)\s+tests"),
+    re.compile(r"([\d,]+)\s+TESTS\s+PASSING"),
+    re.compile(r'class="metric-value">([\d,]+)<span class="accent">\+'),
+)
+
+# "36 event types", "44 event types in v0.2": any count attached to the
+# vocabulary is a claim about ``len(EventType)`` (#1171).
+_EVENT_TYPES_RES = re.compile(r"(\d[\d,]*)\s+event types")
+
+
+def documented_total(path: Path) -> int | None:
+    """The collected total ``path`` states, or None if it states none.
+
+    Two different totals in one file is always an error, even for a doc that
+    is free to state none at all: a reader cannot tell which one to trust.
+    """
+    text = path.read_text(encoding="utf-8")
+    matches = [m for rx in _COLLECTED_RES for m in rx.findall(text)]
+    if not matches:
+        return None
+    totals = {int(m.replace(",", "")) for m in matches}
+    assert len(totals) == 1, f"{path} states inconsistent figures: {sorted(totals)}"
+    return totals.pop()
+
+
+def live_total() -> int:
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-p", "no:cacheprovider"],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        cwd=ROOT,
+    )
+    assert proc.returncode == 0, f"collect-only failed:\n{proc.stderr[-2000:]}"
+    match = re.search(r"(\d[\d,]*)\s+tests? collected", proc.stdout)
+    assert match, f"unparsable collect-only output:\n{proc.stdout[-500:]}"
+    return int(match.group(1).replace(",", ""))
+
+
+def _tree_module_count() -> int:
+    """``.py`` files under ``src/continuum`` minus the top ``__init__.py``.
+
+    The convention is not arbitrary: #1068 recovered it from the commit that
+    introduced the "124 modules" figure, running the same command there
+    returned 124, so this measures exactly what the prose describes. Package
+    markers in subpackages still count, only ``src/continuum/__init__.py``
+    itself is excluded.
+    """
+    top_init = ROOT / "src" / "continuum" / "__init__.py"
+    return len(
+        [
+            p
+            for p in (ROOT / "src" / "continuum").rglob("*.py")
+            if "__pycache__" not in p.parts and p != top_init
+        ]
+    )
+
+
+def _tree_test_file_count() -> int:
+    """``test_*.py`` files anywhere under ``tests/``."""
+    return len([p for p in (ROOT / "tests").rglob("test_*.py") if "__pycache__" not in p.parts])
+
+
+def test_readme_module_and_file_counts_match_the_tree() -> None:
+    """README's module and test-file counts track the tree (#1068).
+
+    Both figures had aged silently since the commit that wrote them, and the
+    collected-total guard never saw them because they are not test counts.
+
+    They used to be pinned exactly. That was defensible when the only PRs
+    touching them were large, but it made every one-test-file PR fail CI on a
+    number its author had no reason to be tracking, and four contributors
+    independently tried to renumber it (batch of #1687, #1666, #1670, #1667).
+    The tolerance is the same one the collected total uses, so real rot, which
+    moves these by the hundreds as in #316 and #630, still fails loudly.
+    """
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    modules = re.search(r"`src/continuum`, (\d+) modules", text)
+    assert modules, "README states no module count"
+    stated_modules = int(modules.group(1))
+    live_modules = _tree_module_count()
+    assert abs(live_modules - stated_modules) <= TREE_COUNT_TOLERANCE, (
+        f"README says {stated_modules} modules but the tree has "
+        f"{live_modules}: the count in README.md's module-map "
+        "sentence needs the figure from `_tree_module_count`"
+    )
+    test_files = re.search(r"(\d+) test files", text)
+    assert test_files, "README states no test-file count"
+    stated_tests = int(test_files.group(1))
+    live_tests = _tree_test_file_count()
+    assert abs(live_tests - stated_tests) <= TREE_COUNT_TOLERANCE, (
+        f"README says {stated_tests} test files but the tree has "
+        f"{live_tests}: the count in README.md's module-map "
+        "sentence needs the figure from `_tree_test_file_count`"
+    )
+
+
+#: Prose forms of the fault-injection suite's size ("7-fault", "7 fault").
+#: ``faults.py`` is the ground truth and it imports nothing from ``continuum``
+#: (``dataclasses`` only), so the guard reads the corpus directly instead of
+#: trusting the generated bench block: the block is regenerated on demand and
+#: the prose is what a reader meets first (#1389).
+_FAULT_SUITE_RES = re.compile(r"(\d[\d,]*)\s*[- ]\s*fault\b")
+
+
+def _fault_class_count() -> int:
+    """``len(FAULT_CLASSES)``, read without importing the library.
+
+    The corpus module is stdlib-only, but its package ``__init__`` pulls in the
+    benchmark stack, so importing it the usual way would couple a docs guard to
+    the library being importable. The other guards here already prefer static
+    reads over imports (``_tree_module_count`` walks the tree, ``live_total``
+    shells out), and a doc guard that itself cannot run when the library is
+    broken would be the one moment a stale figure slips through.
+    """
+    import importlib.util
+
+    path = ROOT / "benchmarks" / "fault_injection" / "faults.py"
+    spec = importlib.util.spec_from_file_location("_fi_faults", path)
+    assert spec and spec.loader, f"could not load {path}"
+    module = importlib.util.module_from_spec(spec)
+    # Register before exec: the corpus is dataclasses, and ``@dataclass`` looks
+    # up ``sys.modules[cls.__module__]`` on Python 3.11+.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return len(module.FAULT_CLASSES)
+
+
+def test_readme_fault_suite_count_matches_the_corpus() -> None:
+    """The README's fault-injection figures are pinned to ``FAULT_CLASSES``.
+
+    The prose called the suite 8-fault while ``faults.py`` defined 7 and the
+    README's own generated bench block printed "7 scenarios" (#1389): an
+    over-count that survived the suite settling at 7, invisible to the
+    collected-total guard because it is not a test count. The same class of
+    drift as #688, in the opposite direction.
+    """
+    expected = _fault_class_count()
+    # A translation is free to state no count at all; one that states a wrong
+    # one fails, the same convention as OPTIONAL_FILES.
+    scanned = [ROOT / "README.md", *sorted(ROOT.glob("README.*.md"))]
+    for path in scanned:
+        text = path.read_text(encoding="utf-8")
+        stated = {int(m.replace(",", "")) for m in _FAULT_SUITE_RES.findall(text)}
+        for count in stated:
+            assert count == expected, (
+                f"{path.name} describes a {count}-fault risk-injection suite, but "
+                f"benchmarks/fault_injection/faults.py defines {expected} "
+                "FAULT_CLASSES: re-sync the prose, and regenerate the bench "
+                "block if the corpus itself changed"
+            )
+
+    # The generated ``<!-- BENCH:START -->`` block prints the runtime count, so
+    # the prose and the block must agree even before the corpus is touched.
+    bench_block = re.search(
+        r"Fault-injection:\s*(\d[\d,]*)\s*scenarios",
+        (ROOT / "README.md").read_text(encoding="utf-8"),
+    )
+    assert bench_block, "README's generated bench block states no fault-injection count"
+    assert int(bench_block.group(1).replace(",", "")) == expected, (
+        f"README's generated bench block reports {bench_block.group(1)} "
+        f"fault-injection scenarios but faults.py defines {expected} "
+        "FAULT_CLASSES: regenerate the block (benchmarks/run.py) or re-sync "
+        "the corpus"
+    )
+
+
+def test_required_files_state_a_total() -> None:
+    stated = {f.name: documented_total(f) for f in REQUIRED_FILES}
+    missing = [name for name, total in stated.items() if total is None]
+    assert not missing, f"no collected-total figure in: {missing}"
+
+
+#: The landing page is the one user-facing surface the markdown guard never
+#: opened: it is HTML, and its headline drifted three times -- 9 tools / 14
+#: commands / 675 tests (#724), then a hand-resync that itself aged into 45
+#: commands and 2,163 tests against 46 and 2,323. Every fix corrected the
+#: figures by hand and nothing caught the next drift (#1283).
+_LANDING_META_RE = re.compile(r'<meta\s+name="description"\s+content="([^"]*)"')
+
+
+def _landing_meta() -> str:
+    """The site's meta description: the figure search engines and previews render."""
+    path = ROOT / "docs" / "index.html"
+    text = path.read_text(encoding="utf-8")
+    match = _LANDING_META_RE.search(text)
+    assert match, f"{path} declares no meta description for the guard to pin"
+    return match.group(1)
+
+
+def _cli_subcommand_count() -> int:
+    """Subcommands the CLI parser actually registers.
+
+    ``build_parser()`` is the ground truth and the only reliable one: the
+    subcommands are registered from a table plus a handful of explicit calls,
+    so counting ``add_parser`` in the source over- or under-counts depending
+    on how each one is registered.
+    """
+    from continuum.cli.main import build_parser
+
+    parser = build_parser()
+    # argparse's subparser holder is untyped, so read it as Any: the count is
+    # what the guard asserts, not the argparse internals' shape.
+    subparsers: Any = parser._subparsers  # noqa: SLF001
+    assert subparsers is not None, "build_parser() registered no subcommands"
+    groups = [a for a in subparsers._group_actions if hasattr(a, "choices")]  # noqa: SLF001
+    return sum(len(g.choices) for g in groups)
+
+
+def test_landing_page_meta_cli_count_matches_the_parser() -> None:
+    """The landing page's CLI command count is pinned to the parser (#1283).
+
+    The page's other two figures are already watched: the test count is pinned
+    to the docs' total by ``test_index_html_test_figure_matches_the_docs``
+    (#840), and the MCP tool count by
+    ``tests/test_mcp_docs.py::test_documented_tool_counts_match_the_server``,
+    which scans ``docs/*.html``. The CLI command count was the one figure with
+    no reader at all, and it aged from 46 to 45 to 52 while nothing looked at
+    it. This is that reader.
+
+    It is pinned exactly rather than within a tolerance: the count is a
+    deterministic property of ``build_parser()``, not an environment-dependent
+    one like the suite size.
+    """
+    meta = _landing_meta()
+    commands = re.search(r"(\d[\d,]*)\s+CLI commands", meta)
+    assert commands, "the landing page's meta states no CLI command count"
+
+    stated = int(commands.group(1).replace(",", ""))
+    actual = _cli_subcommand_count()
+    assert stated == actual, (
+        f"the landing page advertises {stated} CLI commands but build_parser() "
+        f"registers {actual}: re-sync the meta description in docs/index.html"
+    )
+
+
+def test_architecture_docs_cli_command_counts_match_the_parser() -> None:
+    """The architecture diagrams and HTML page pin their CLI counts to the parser (#1386)."""
+    expected = _cli_subcommand_count()
+
+    arch_md = ROOT / "docs" / "diagrams" / "architecture.md"
+    if arch_md.exists():
+        text = arch_md.read_text(encoding="utf-8")
+        matches = re.findall(r"CLI,\s*(\d+)\s*commands", text)
+        matches += re.findall(r"\|\s*CLI commands\s*\|\s*(\d+)\s*\|", text)
+        for count_str in matches:
+            assert int(count_str) == expected, (
+                f"{arch_md.name} states {count_str} CLI commands, but build_parser() "
+                f"registers {expected}"
+            )
+
+    arch_html = ROOT / "docs" / "architecture.html"
+    if arch_html.exists():
+        text = arch_html.read_text(encoding="utf-8")
+        matches = re.findall(r"CLI\s*-\s*(\d+)\s*commands", text)
+        for count_str in matches:
+            assert int(count_str) == expected, (
+                f"{arch_html.name} states {count_str} CLI commands, but build_parser() "
+                f"registers {expected}"
+            )
+
+
+def test_documented_counts_agree() -> None:
+    stated: dict[str, int] = {}
+    for f in COUNTED_FILES:
+        total = documented_total(f)
+        if total is not None:
+            stated[f.name] = total
+    assert len(set(stated.values())) == 1, f"documented counts disagree: {stated}"
+
+
+def test_documented_narrative_count_forms(tmp_path: Path) -> None:
+    """Narrative English, Spanish, and HTML count claims must stay detectable."""
+    cases = (
+        ("Built with ~2,241 tests.", 2241),
+        ("Built with 2241 tests.", 2241),
+        ("Validated with real kills and 1380 tests.", 1380),
+        ("Validated with real kills and ~2,241 tests.", 2241),
+        ("Validado con muertes reales y 1380 tests.", 1380),
+        ("Validado con muertes reales y ~2,241 tests.", 2241),
+        ("cerca de 2,311 tests", 2311),
+        # docs/index.html: meta description, hero banner, metrics card (#1283).
+        ("12 MCP tools, 46 CLI commands, 2,397 tests.", 2397),
+        ("<div>2,397 TESTS PASSING</div>", 2397),
+        ('<span class="metric-value">2,397<span class="accent">+</span>', 2397),
+    )
+    for index, (text, expected) in enumerate(cases):
+        path = tmp_path / f"doc-{index}.md"
+        path.write_text(text, encoding="utf-8")
+        assert documented_total(path) == expected
+
+
+def test_index_html_test_figure_matches_the_docs() -> None:
+    """The marketing page states the suite size too, so it is watched (#840).
+
+    ``docs/index.html`` said ``2,163 tests`` while every guarded file said
+    ~2,195: the page is edited rarely enough that nothing compared it with the
+    rest of the docs. Its tool-count and CLI-command figures are already
+    guarded (``tests/test_mcp_docs.py`` scans ``*.html``); this pins the test
+    figure to the same total the markdown files carry.
+    """
+    text = (ROOT / "docs" / "index.html").read_text(encoding="utf-8")
+    # The page states the figure three ways and the original guard saw one. The
+    # meta description carries plain "2,324 tests" inside the tag's attribute,
+    # which tag-stripping destroys, so it is matched on the raw text; the hero
+    # footer ("2,324 TESTS PASSING") and the metrics card ("2,324+ TESTS
+    # PASSING", split across spans so the markup has to go first) only surface
+    # after the tags are stripped. Matching any one of the three let the other
+    # two contradict it unnoticed (#840 review).
+    stripped = re.sub(r"<[^>]+>", " ", text)
+    pattern = re.compile(r"\b([\d,]+)\s*\+?\s*tests\b", re.IGNORECASE)
+    figures = list(dict.fromkeys(pattern.findall(text) + pattern.findall(stripped)))
+    assert figures, "docs/index.html states no test-count figure"
+    expected = documented_total(COUNTED_FILES[0])
+    for figure in figures:
+        stated = int(figure.replace(",", ""))
+        assert stated == expected, (
+            f"docs/index.html states {stated} tests, but the docs say ~{expected}: "
+            "bump the figure in the meta description, the hero footer and the "
+            "metrics card together with the markdown files"
+        )
+
+
+@pytest.mark.slow
+def test_documented_count_matches_suite() -> None:
+    documented = documented_total(ROOT / "README.md")
+    assert documented is not None, "README.md states no collected-total figure"
+    live = live_total()
+    assert abs(live - documented) <= TOLERANCE, (
+        f"suite collects {live} tests but docs say ~{documented}: re-sync "
+        "README.md, the translated READMEs, CHANGELOG.md, "
+        "docs/CONTRIBUTING_ONBOARDING.md, references/testing.md, and "
+        "references/install.md (pytest --collect-only -q; pytest -q)"
+    )
+
+
+def test_documented_extras_exist_in_pyproject() -> None:
+    """No doc installs an extra that pyproject.toml does not declare.
+
+    ``docs/cloud_api.md`` taught ``uv pip install -e ".[cloud]"`` for an extra
+    that never existed (#840): a reader following it got an error from pip and
+    nowhere to turn. Every extras bracket in an install context, both the
+    ``continuum-agent[x]`` and the editable ``.[x]`` spelling, is checked
+    against the declared optional-dependencies.
+    """
+    import tomllib
+
+    data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    declared = set(data["project"]["optional-dependencies"])
+
+    scanned = [
+        ROOT / "README.md",
+        *sorted(ROOT.joinpath("docs").rglob("*.md")),
+        *sorted(ROOT.joinpath("references").rglob("*.md")),
+    ]
+    for path in scanned:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            # Only install-command lines carry extras, and the bracket must
+            # sit directly on `continuum-agent` or the editable `.` target;
+            # anything else (Codex's `[features]` toml section, markdown
+            # links, regex examples) is not a pip extra.
+            if "install" not in line.lower():
+                continue
+            for group in re.findall(r"(?:continuum-agent|\.)\[([\w,-]+)\]", line):
+                for extra in group.split(","):
+                    assert extra in declared, (
+                        f"{path} installs the [{extra}] extra, but pyproject.toml "
+                        f"declares only {sorted(declared)}"
+                    )
+
+
+def _check_pyproject_line_references(path: Path, pyproject_lines: list[str]) -> int:
+    """Assert all ``pyproject.toml:NN`` references in ``path`` resolve correctly (#1701)."""
+    ref_pattern = re.compile(r"`pyproject\.toml:(\d+)(?:-(\d+))?`")
+    extra_pattern = re.compile(r"\[([\w-]+)\]")
+
+    checked = 0
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        matches = list(ref_pattern.finditer(line))
+        if not matches:
+            continue
+
+        for match in matches:
+            checked += 1
+            target_line_num = int(match.group(1))
+            end_line_group = match.group(2)
+            assert 1 <= target_line_num <= len(pyproject_lines), (
+                f"{path.name}:{line_no} cites pyproject.toml:{target_line_num}, "
+                f"which is outside the file (1-{len(pyproject_lines)})"
+            )
+            if end_line_group is not None:
+                end_line_num = int(end_line_group)
+                assert target_line_num <= end_line_num <= len(pyproject_lines), (
+                    f"{path.name}:{line_no} cites pyproject.toml range {target_line_num}-{end_line_num}, "
+                    f"which is reversed or outside the file (1-{len(pyproject_lines)})"
+                )
+
+            actual_line = pyproject_lines[target_line_num - 1]
+
+            if "core" in line.lower() and "dependencies" in line.lower():
+                assert "dependencies = [" in actual_line or "pydantic" in actual_line, (
+                    f"{path.name}:{line_no} cites pyproject.toml:{target_line_num} "
+                    f"for core dependencies, but that line holds: {actual_line!r}"
+                )
+            elif "optional extra" in line.lower() or "optional-dependencies" in line.lower():
+                assert (
+                    "[project.optional-dependencies]" in actual_line
+                    or "dependencies = [" in actual_line
+                ), (
+                    f"{path.name}:{line_no} cites pyproject.toml:{target_line_num} "
+                    f"for optional extras, but that line holds: {actual_line!r}"
+                )
+            else:
+                extra_match = extra_pattern.search(line)
+                if extra_match:
+                    extra = extra_match.group(1)
+                    assert actual_line.strip().startswith(f"{extra} ="), (
+                        f"{path.name}:{line_no} cites pyproject.toml:{target_line_num} "
+                        f"for [{extra}], but that line holds: {actual_line!r}"
+                    )
+    return checked
+
+
+def test_documented_pyproject_line_references_resolve() -> None:
+    """Documented pyproject.toml:NN references resolve to the right declaration (#1701).
+
+    Several docs cite a specific line in pyproject.toml (e.g. pyproject.toml:30
+    for core dependencies, or pyproject.toml:58 for the mcp extra). Line
+    numbers drift when dependencies or comments are added to pyproject.toml,
+    leaving documentation pointing at comment lines or wrong extras.
+
+    This guard resolves each cited line number and asserts that it declares
+    the cited dependency (or dependencies = [ for the core one). When an
+    extra moves, the cited line number must be updated to match.
+    """
+    pyproject_lines = (ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines()
+
+    scanned = [
+        ROOT / "README.md",
+        *sorted(ROOT.joinpath("docs").rglob("*.md")),
+        *sorted(ROOT.joinpath("references").rglob("*.md")),
+    ]
+
+    total_refs = sum(_check_pyproject_line_references(path, pyproject_lines) for path in scanned)
+    assert total_refs > 0, "No pyproject.toml:NN references found to guard"
+
+
+def test_documented_pyproject_line_references_resolve_failures(tmp_path: Path) -> None:
+    """Out-of-bounds or misaligned pyproject.toml references fail with descriptive messages (#1701)."""
+    synthetic_toml = [
+        "# comment 1",
+        'dependencies = ["pydantic>=2.7"]',
+        "[project.optional-dependencies]",
+        "# comment 4",
+        'mcp = ["mcp>=2.0"]',
+        'browser = ["playwright>=1.40"]',
+    ]
+
+    # Out of bounds line number
+    oob = tmp_path / "oob.md"
+    oob.write_text("`pyproject.toml:9999` (`[mcp]`)", encoding="utf-8")
+    with pytest.raises(
+        AssertionError, match="oob.md:1 cites pyproject.toml:9999, which is outside the file"
+    ):
+        _check_pyproject_line_references(oob, synthetic_toml)
+
+    # Reversed or out of bounds range
+    rev = tmp_path / "rev.md"
+    rev.write_text("`pyproject.toml:5-2` (`[mcp]`)", encoding="utf-8")
+    with pytest.raises(
+        AssertionError,
+        match="rev.md:1 cites pyproject.toml range 5-2, which is reversed or outside",
+    ):
+        _check_pyproject_line_references(rev, synthetic_toml)
+
+    # Pointing at a comment line
+    comment = tmp_path / "comment.md"
+    comment.write_text("`pyproject.toml:4` (`[mcp]`)", encoding="utf-8")
+    with pytest.raises(
+        AssertionError,
+        match=r"comment.md:1 cites pyproject.toml:4 for \[mcp\], but that line holds: '# comment 4'",
+    ):
+        _check_pyproject_line_references(comment, synthetic_toml)
+
+    # Pointing at the wrong extra declaration
+    wrong = tmp_path / "wrong.md"
+    wrong.write_text("`pyproject.toml:6` (`[mcp]`)", encoding="utf-8")
+    with pytest.raises(
+        AssertionError,
+        match=r"wrong.md:1 cites pyproject.toml:6 for \[mcp\], but that line holds: 'browser =",
+    ):
+        _check_pyproject_line_references(wrong, synthetic_toml)
+
+
+def _tree_counts() -> tuple[int, int]:
+    """Modules and test files, counted the way README.md states them.
+
+    The module figure excludes the top-level ``__init__.py`` (the package
+    entry point, not a module with a role) and the test figure counts
+    ``tests/test_*.py``. Both are read from the working tree, so a merged
+    module or test file fails the guard instead of silently aging the
+    sentence (#1068).
+    """
+    package_init = ROOT / "src" / "continuum" / "__init__.py"
+    modules = [p for p in (ROOT / "src" / "continuum").rglob("*.py") if p != package_init]
+    tests = list((ROOT / "tests").glob("test_*.py"))
+    return len(modules), len(tests)
+
+
+def test_readme_module_and_test_file_counts_match_tree() -> None:
+    """README's module and test-file counts must match the tree (#1068).
+
+    The sentence read "124 modules" and "161 test files" while the tree
+    carried 126 and 169. Only the two file counts had rotted: the ~2,241
+    collected total in the same sentence is covered by the tolerance guard
+    above, but the two file counts had no guard at all, and the test-file
+    figure was already stale the day it was written.
+    """
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    match = re.search(r"`src/continuum`,\s*(\d+)\s*modules\)\D*?(\d+)\s*test files", text)
+    assert match, "README states no module/test-file counts to guard"
+
+    documented_modules, documented_tests = int(match.group(1)), int(match.group(2))
+    live_modules, live_tests = _tree_counts()
+    assert abs(live_modules - documented_modules) <= TREE_COUNT_TOLERANCE, (
+        f"README says {documented_modules} modules but src/continuum carries {live_modules}"
+    )
+    assert abs(live_tests - documented_tests) <= TREE_COUNT_TOLERANCE, (
+        f"README says {documented_tests} test files but tests/ carries {live_tests}"
+    )
+
+    arch_html = ROOT / "docs" / "architecture.html"
+    if arch_html.exists():
+        arch_text = arch_html.read_text(encoding="utf-8")
+        m_match = re.search(r"<b>(\d+)</b>\s+modules", arch_text)
+        t_match = re.search(r"<b>(\d+)</b>\s+test files", arch_text)
+        if m_match and t_match:
+            arch_modules, arch_tests = int(m_match.group(1)), int(t_match.group(1))
+            assert abs(live_modules - arch_modules) <= TREE_COUNT_TOLERANCE, (
+                f"docs/architecture.html says {arch_modules} modules but src/continuum carries {live_modules}"
+            )
+            assert abs(live_tests - arch_tests) <= TREE_COUNT_TOLERANCE, (
+                f"docs/architecture.html says {arch_tests} test files but tests/ carries {live_tests}"
+            )
+
+
+def test_pyproject_line_references_in_docs() -> None:
+    """Verify pyproject.toml:NN references in docs point to valid dependency lines.
+
+    Design note: These are line numbers, and any added extra shifts them.
+    When pyproject.toml changes, references in docs must be updated.
+    """
+    import re
+
+    root_dir = Path(__file__).resolve().parents[1]
+    pyproject_path = root_dir / "pyproject.toml"
+    assert pyproject_path.exists(), "pyproject.toml not found"
+
+    pyproject_lines = [""] + pyproject_path.read_text(encoding="utf-8").splitlines()
+    ref_pattern = re.compile(r"pyproject\.toml:(\d+)")
+
+    docs_dir = root_dir / "references"
+    if not docs_dir.exists():
+        docs_dir = root_dir
+
+    for doc_path in docs_dir.glob("**/*.md"):
+        doc_lines = doc_path.read_text(encoding="utf-8").splitlines()
+        for doc_line_no, line_str in enumerate(doc_lines, start=1):
+            matches = ref_pattern.findall(line_str)
+            for line_ref in matches:
+                target_line_no = int(line_ref)
+                assert target_line_no < len(pyproject_lines), (
+                    f"Invalid line number {target_line_no} in {doc_path}:{doc_line_no}"
+                )
+
+                actual_content = pyproject_lines[target_line_no].strip()
+                is_valid = bool(actual_content) and not actual_content.startswith("#")
+
+                assert is_valid, (
+                    f"\n[STALE REFERENCE DETECTED]\n"
+                    f"Doc: {doc_path.name}:{doc_line_no}\n"
+                    f"Points to: pyproject.toml:{target_line_no}\n"
+                    f"Actual line content: '{actual_content}'"
+                )

@@ -1,0 +1,1375 @@
+"""All tunable thresholds for SNAGLINE's tier-1 detectors.
+
+Centralizing thresholds here means ``Monitor.default()`` ships sensible
+defaults and a caller can retune everything from one object without touching
+detector constructors (project.md §5.4).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import types
+from collections.abc import Mapping
+from dataclasses import dataclass, fields
+from typing import Any, Union, get_args, get_origin, get_type_hints
+from urllib.parse import urlsplit
+
+from snagline.baseline import BaselineProfile
+
+logger = logging.getLogger("snagline")
+
+
+def _union_args(hint: Any) -> tuple[Any, ...] | None:
+    """Return the member tuple when ``hint`` is a union type, else None.
+
+    Covers both spellings across Python versions: PEP 604 ``X | Y``
+    (``types.UnionType``, whose get_origin differs between versions) and
+    ``typing.Union[X, Y]`` / ``Optional[X]``.
+    """
+    if isinstance(hint, types.UnionType):
+        return get_args(hint)
+    if get_origin(hint) is Union:
+        return get_args(hint)
+    return None
+
+
+def _coercible_hint(hint: Any) -> Any:
+    """Unwrap ``X | None`` to ``X`` when X is an env-coercible scalar.
+
+    Lets optional scalar fields (for example the calibration baseline path,
+    issue #101) be set from environment variables like plain scalars, while
+    non-scalar optionals (object references such as a BaselineProfile) stay
+    out of reach of string coercion.
+
+    A ``set[str]`` / ``frozenset[str]`` hint reduces to ``frozenset``, which
+    ``_coerce`` builds from a comma-separated string (issue #578).
+    """
+    if get_origin(hint) in (frozenset, set):
+        element = get_args(hint)
+        if len(element) == 1 and element[0] is str:
+            return frozenset
+    args = _union_args(hint)
+    if args is None or len(args) != 2 or type(None) not in args:
+        return hint
+    other = next(a for a in args if a is not type(None))
+    if other in (bool, int, float, str):
+        return other
+    return hint
+
+
+def _coerce_str_collection(name: str, value: Any) -> frozenset[str]:
+    """Build a ``frozenset[str]`` from a config value (issue #578).
+
+    Env values are one comma-separated string; file values arrive as a native
+    JSON/TOML list. An empty result is rejected rather than silently clearing
+    the field, which would disable the knob's detector the same way a bad
+    scalar silently deadens one (see ``_coerce`` on non-finite floats,
+    issue #383).
+    """
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.split(",")]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        parts = list(value)
+    else:
+        raise TypeError(
+            f"config field {name!r} expects a list of strings; the value "
+            f"{value!r} is {type(value).__name__}"
+        )
+    bad = [p for p in parts if not isinstance(p, str) or not p.strip()]
+    if bad:
+        raise ValueError(
+            f"config field {name!r} expects non-empty strings; rejecting {bad!r}"
+        )
+    items = frozenset(p.strip() for p in parts if isinstance(p, str))
+    if not items:
+        raise ValueError(
+            f"config field {name!r} needs at least one action type; an empty "
+            f"set disables the detector, which fires on every episode when "
+            f"nothing counts as output"
+        )
+    return items
+
+
+def _coerce(hint: type, value: str) -> Any:
+    if hint is bool:
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "on", "t"):
+            return True
+        if normalized in ("0", "false", "no", "off", "f"):
+            return False
+        raise ValueError(f"invalid boolean value: {value!r}")
+    if hint is int:
+        return int(value)
+    if hint is float:
+        parsed = float(value)
+        # ``float()`` happily accepts "inf", "-inf", "nan" and overflows like
+        # "1e400". Every one of them silently deadens the knob's detector for
+        # the whole run: ``cusum > inf`` is never true, and
+        # ``max(0.0, nan)`` is 0.0, which pins a CUSUM accumulator at zero.
+        # The process starts cleanly and the safety net is off with nothing
+        # in the logs to say so, so reject the value where it enters instead
+        # of letting a non-finite comparison disable detection (issue #383).
+        if not math.isfinite(parsed):
+            raise ValueError(f"non-finite float value: {value!r}")
+        return parsed
+    return value
+
+
+def _coerce_file_value(name: str, hint: Any, value: Any) -> Any:
+    """Type-check one value from a config file (issue #437).
+
+    Env values are strings and go through ``_coerce``; file values arrive as
+    native JSON/TOML types and were used verbatim, so ``{"fail_open": "false"}``
+    stayed a truthy string (fail-open silently *on*) and
+    ``{"max_live_episodes": "5000"}`` blew up with an off-point ``TypeError``
+    deep inside a range validator. A file is a configured artifact, not a
+    Python API call: the value is coerced to the declared scalar type when the
+    text carries one unambiguously, and anything that does not is rejected
+    here with the field name and both types, before a downstream comparison
+    fails with no context.
+
+    ``null`` is accepted on an ``X | None`` field as the documented "disabled"
+    spelling (issue #590): it is the one way a file expresses an unset optional
+    scalar, and rejecting it forced operators to delete the key instead. It is
+    rejected on a non-optional scalar, where ``None`` is not a value the field
+    can hold and passing it through would surface later as an off-point
+    ``TypeError`` inside a range check.
+
+    Non-scalar fields (``BaselineProfile`` and friends) are passed through
+    unchanged: a file cannot construct them, and the env path keeps them out
+    of reach for the same reason.
+    """
+    if value is None:
+        args = _union_args(hint)
+        if args is not None and type(None) in args:
+            return None
+        raise TypeError(
+            f"config field {name!r} is not optional; null is not a valid value"
+        )
+    scalar = _coercible_hint(hint)
+    if scalar is frozenset:
+        # A string-collection field: the file may carry a native list, and a
+        # str value is parsed as a comma-separated list like the env path.
+        return _coerce_str_collection(name, value)
+    if scalar not in (bool, int, float, str):
+        return value  # non-scalar: unchanged behaviour
+    if type(value) is scalar:
+        return value
+    if scalar is bool and isinstance(value, int):
+        return bool(value)
+    if scalar is float and isinstance(value, int) and not isinstance(value, bool):
+        return float(value)
+    if scalar is int and isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return _coerce(scalar, value)
+        except ValueError:
+            raise ValueError(
+                f"config field {name!r} expects a {scalar.__name__}; the file "
+                f"value {value!r} does not parse as one"
+            ) from None
+    raise TypeError(
+        f"config field {name!r} expects a {scalar.__name__}; the file value "
+        f"{value!r} is {type(value).__name__}"
+    )
+
+
+def _load_toml(text: str) -> dict[str, Any]:
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - exercised only on <3.11
+        raise RuntimeError(
+            "TOML config requires Python 3.11+ (tomllib); use JSON or upgrade."
+        ) from None
+    return tomllib.loads(text)
+
+
+# Valid values for ``Config.log_format`` (issue #119). Anything else is a
+# configuration error and fails loudly at construction/resolve time instead
+# of being silently accepted and left undefined downstream.
+LOG_FORMATS: tuple[str, ...] = ("text", "json")
+
+
+def _validated_horizon(cfg: Config) -> None:
+    """Validate the horizon-scale knobs (issue #92); raise when invalid.
+
+    Mirrors the ``log_format`` precedent (issue #119): an out-of-range value is
+    a configuration error and fails loudly at construction/resolve time rather
+    than being silently ignored downstream. All knobs are opt-in (defaults off)
+    so validation only bites operators who turned the feature on.
+    """
+    if not 0.0 < cfg.warn_fraction <= 1.0:
+        raise ValueError(
+            f"warn_fraction must be within (0, 1]; got {cfg.warn_fraction!r}"
+        )
+    if cfg.max_episode_wall_seconds is not None and cfg.max_episode_wall_seconds <= 0:
+        raise ValueError(
+            "max_episode_wall_seconds must be positive when set; "
+            f"got {cfg.max_episode_wall_seconds!r}"
+        )
+    if cfg.idle_warn_seconds is not None and cfg.idle_warn_seconds <= 0:
+        raise ValueError(
+            f"idle_warn_seconds must be positive when set; got {cfg.idle_warn_seconds!r}"
+        )
+    if cfg.window_scale_steps < 0:
+        raise ValueError(
+            f"window_scale_steps must be >= 0 (0 disables scaling); "
+            f"got {cfg.window_scale_steps!r}"
+        )
+    if cfg.max_window < 1:
+        raise ValueError(f"max_window must be >= 1; got {cfg.max_window!r}")
+    if cfg.cusum_refit_every < 0:
+        raise ValueError(
+            f"cusum_refit_every must be >= 0 (0 disables refits); "
+            f"got {cfg.cusum_refit_every!r}"
+        )
+
+
+def _validated_token_runaway(cfg: Config) -> None:
+    """Validate the token-budget envelope knobs (issue #317); raise when invalid.
+
+    Same contract as the horizon knobs above (issue #92): an out-of-range
+    value is a configuration error and fails loudly at construction/resolve
+    time instead of silently degrading detection downstream. Both knobs are
+    opt-in (``token_runaway_enabled`` defaults off), so stock configurations
+    never hit these checks.
+
+    ``episode_token_budget`` documents ``None`` as "envelope disabled"; a
+    budget of zero tokens can never be honored, so ``total >= budget`` is true
+    on the first token-bearing step and the detector emits a score-1.0
+    ``budget_breach`` immediately. Zero is far more likely a mistyped or
+    unset "disable" than a real budget, and a negative budget is the same
+    failure one step earlier.
+    ``token_budget_warn_fraction`` is the envelope's analogue of
+    ``warn_fraction`` and gets the same range: ``<= 0`` makes the warning
+    threshold ``<= 0``, so ``total >= threshold`` holds on the first step and
+    the warning fires unconditionally, and ``> 1.0`` puts the threshold above
+    the budget, so the pre-breach warning can never fire before the breach
+    silences it.
+    """
+    if cfg.episode_token_budget is not None and cfg.episode_token_budget <= 0:
+        raise ValueError(
+            "episode_token_budget must be positive when set (None disables "
+            f"the envelope); got {cfg.episode_token_budget!r}"
+        )
+    if not 0.0 < cfg.token_budget_warn_fraction <= 1.0:
+        raise ValueError(
+            "token_budget_warn_fraction must be within (0, 1]; got "
+            f"{cfg.token_budget_warn_fraction!r}"
+        )
+
+
+def _validated_enforcement(cfg: Config) -> None:
+    """Validate the numeric enforcement knobs (issue #353); raise when invalid.
+
+    Same contract as the horizon / stagnation validators: an out-of-range
+    value is a configuration error and fails loudly at construction and after
+    env/file layering, not deep inside the command that consumes it. Until now
+    these two were checked only in ``Monitor._configure_policy``, which
+    ``snagline serve`` reaches *after* printing its listening banner and inside
+    ``with suppress(KeyboardInterrupt)`` -- so the ValueError escaped as a
+    traceback and exit code 1, and the operator had already been told the
+    server was starting.
+    """
+    # Risk scores live in [0, 1]; a threshold outside that range would silently
+    # disable or permanently enable halting. Unconditional, like the existing
+    # check in _configure_policy -- the range does not depend on the policy.
+    if not 0.0 <= float(cfg.min_severity_for_halt) <= 1.0:
+        raise ValueError(
+            "min_severity_for_halt must be within [0, 1]; got "
+            f"{cfg.min_severity_for_halt!r}"
+        )
+    # A non-positive timeout has no meaningful reading under any policy: it is
+    # a budget for a network round-trip, not a toggle. In _configure_policy this
+    # check is gated on policy == "halt_webhook", so a negative timeout set
+    # while observing only surfaced when the policy was later armed -- and
+    # Monitor.default() then rejects a config the direct constructor accepted
+    # (issue #353, adjacent observation). Checking it here makes both entry
+    # points agree and catches the typo at startup.
+    if float(cfg.halt_timeout_s) <= 0:
+        raise ValueError(f"halt_timeout_s must be positive; got {cfg.halt_timeout_s!r}")
+    # Issue #587: the *endpoint* was the one enforcement knob still validated
+    # only in Monitor._configure_policy. serve/watch/replay build the Config
+    # first and print their banner before the Monitor is constructed, so a
+    # missing or non-http(s) halt_url told the operator a listener was coming
+    # and then died in a traceback. Checking it here moves the failure to the
+    # same place the numeric knobs already fail: before any banner is printed.
+    if cfg.policy == "halt_webhook":
+        if not cfg.halt_url:
+            raise ValueError("policy='halt_webhook' requires halt_url")
+        scheme = urlsplit(cfg.halt_url).scheme.strip().lower()
+        if scheme not in ("http", "https"):
+            raise ValueError(
+                "halt_url must be an http(s) endpoint; got scheme "
+                f"{scheme!r} (halt_url={cfg.halt_url!r})"
+            )
+
+
+def _validated_log_format(value: str) -> str:
+    """Normalize and validate a ``log_format`` value; raise when invalid.
+
+    Surrounding whitespace and case are forgiven (" JSON " means "json") so
+    operators are not punished for spelling, but anything outside
+    ``LOG_FORMATS`` raises ``ValueError`` (issue #119): an undefined value used
+    to be silently accepted, which hid typos until exactly the moment someone
+    relied on the knob.
+    """
+    normalized = value.strip().lower() if isinstance(value, str) else value
+    if normalized not in LOG_FORMATS:
+        allowed = ", ".join(repr(v) for v in LOG_FORMATS)
+        raise ValueError(f"log_format must be one of {allowed}; got {value!r}")
+    return normalized
+
+
+# Closed value set for ``Config.policy`` (issue #93). Like log_format, an
+# unknown policy is a configuration error and fails loudly at construction or
+# resolve time: a typo'd enforcement setting must not silently degrade to
+# observation at exactly the moment someone relies on it.
+ENFORCEMENT_POLICIES: tuple[str, ...] = ("observe", "callback", "halt_webhook")
+
+
+def validate_policy(value: str) -> str:
+    """Normalize and validate a ``policy`` value; raise when invalid.
+
+    Case and surrounding whitespace are forgiven; anything outside
+    ``ENFORCEMENT_POLICIES`` raises ``ValueError`` (same precedent as
+    log_format, issue #119).
+    """
+    normalized = value.strip().lower() if isinstance(value, str) else value
+    if normalized not in ENFORCEMENT_POLICIES:
+        allowed = ", ".join(repr(v) for v in ENFORCEMENT_POLICIES)
+        raise ValueError(f"policy must be one of {allowed}; got {value!r}")
+    return normalized
+
+
+def _validated_max_live_episodes(cfg: Config) -> None:
+    """Validate the per-episode cap (issue #184); raise when invalid."""
+    if cfg.max_live_episodes < 1:
+        raise ValueError(
+            f"max_live_episodes must be >= 1; got {cfg.max_live_episodes!r}"
+        )
+
+
+def _validated_semantic_drift_tolerance(cfg: Config) -> None:
+    """Validate the goal-drift noise threshold (issue #397); raise when invalid.
+
+    ``semantic_drift_tolerance`` is the cosine-deviation noise floor for the
+    semantic goal-drift detector, and the expression ``(2.0 - tol)`` is the
+    denominator of the drift signal (drift/goal_drift.py). ``dev`` is bounded
+    to ``[0, 2]``, so the knob's valid domain is ``[0, 2)``: at or above 2.0
+    the comparison ``dev <= tol`` is always true, the signal is pinned at 0.0
+    and the detector is permanently inert with no log line -- the same
+    fail-quiet shape as the other unvalidated detector knobs. A non-finite
+    tolerance is worse: ``min(1.0, NaN)`` returns ``1.0`` in CPython, so every
+    step scores a full-strength alarm.
+    """
+    tol = cfg.semantic_drift_tolerance
+    if not math.isfinite(tol) or not 0.0 <= tol < 2.0:
+        raise ValueError(
+            "semantic_drift_tolerance must be finite and within [0, 2); got "
+            f"{tol!r}. The cosine deviation is bounded to [0, 2], so a value "
+            "at or above 2.0 silently disables the goal-drift detector and a "
+            "non-finite value alarms on every step."
+        )
+
+
+def _validated_stagnation(cfg: Config) -> None:
+    """Validate the stagnation-detector knobs (issue #132); raise when invalid.
+
+    Same contract as the horizon knobs (issue #92): an out-of-range value is a
+    configuration error and fails loudly at construction/resolve time instead
+    of silently disabling detection downstream. The one deliberate tightening
+    against ``StagnationDetector``'s old range: ``min_novelty=0.0`` used to be
+    accepted but made the fire condition unreachable (a novelty rate is always
+    >= 0, so ``rate < 0.0`` can never hold), i.e. a silently disabled safety
+    net. "Alert me when novelty hits exactly zero" needs a small positive floor
+    instead: with the default window of 50 the share moves in steps of 0.02,
+    so e.g. ``0.01`` fires precisely when nothing in the window was new.
+    """
+    if cfg.stagnation_window_size < 1:
+        raise ValueError(
+            f"stagnation_window_size must be >= 1; got {cfg.stagnation_window_size!r}"
+        )
+    if not 0.0 < cfg.stagnation_min_novelty <= 1.0:
+        raise ValueError(
+            "stagnation_min_novelty must be within (0.0, 1.0]; 0.0 would make "
+            "the fire condition unreachable and silently disable the detector; "
+            f"got {cfg.stagnation_min_novelty!r}"
+        )
+    if cfg.stagnation_patience < 1:
+        raise ValueError(
+            f"stagnation_patience must be >= 1; got {cfg.stagnation_patience!r}"
+        )
+
+
+def _validated_side_effect_guard(cfg: Config) -> None:
+    """Validate the side-effect guard's repeat tolerance (issue #328).
+
+    ``allowed_repeats`` is compared against a per-episode occurrence count
+    (line 92) with the edge-triggered equality ``count != allowed_repeats +
+    1``. The count is always an integer, so a *fractional* tolerance is
+    never equal to ``count + 1`` and the guard never fires -- the duplicate
+    send/payment/deploy detector is completely and silently blinded for the
+    whole run. ``1.5`` reads as "one and a half retries" but means "never
+    alert"; ``2.0`` is fine because an int-equal float compares equal, which
+    is why only the fractional case is a defect.
+
+    The same layering problem the other validators cover (issue #322): a
+    JSON config file hands the field straight through as a float, so
+    ``SNAGLINE_SIDE_EFFECT_ALLOWED_REPEATS=1.5`` is ignored by the env
+    coercioner (it asks for an int) while the file path silently accepts
+    it, and ``Config(...)`` itself accepted any value until now.
+    """
+    value = cfg.side_effect_allowed_repeats
+    if value < 1:
+        raise ValueError(f"side_effect_allowed_repeats must be >= 1; got {value!r}")
+    if value != int(value):
+        raise ValueError(
+            "side_effect_allowed_repeats must be a whole number; the guard "
+            "compares it against an integer occurrence count, so a "
+            "fractional value can never be equal and silently disables the "
+            "duplicate non-idempotent action detector for the whole run; "
+            f"got {value!r}"
+        )
+
+
+def _validated_silent_abort(cfg: Config) -> None:
+    """Validate the silent-abort completion check's output action types.
+
+    ``SilentAbortDetector.finalize`` asks one question -- was the episode's
+    last step an action type this host counts as "the agent produced its
+    result"? An empty set makes every episode look abandoned: the detector
+    fires at end_episode on every healthy run, which is the exact
+    false-positive storm DETECTOR_GUIDE rule 5 says gets a detector
+    uninstalled. An empty *element* (``""`` or whitespace) is a typo that
+    can never match an ``action_type``, silently narrowing the set, and a
+    non-string element compares unequal to every ``action_type`` for the
+    same reason.
+    """
+    types = cfg.silent_abort_output_action_types
+    if len(types) == 0:
+        raise ValueError(
+            "silent_abort_output_action_types must name at least one action "
+            "type; an empty set makes nothing count as output so the "
+            "detector fires on every episode"
+        )
+    bad = [
+        t
+        for t in types
+        if not isinstance(t, str) or not t or not t.strip() or t != t.strip()
+    ]
+    if bad:
+        raise ValueError(
+            "silent_abort_output_action_types must be non-empty stripped "
+            f"strings; an entry can never match an action_type otherwise; "
+            f"rejecting {bad!r}"
+        )
+
+
+def _validated_window_thresholds(cfg: Config) -> None:
+    """Reject a count threshold the window can never hold (issue #436).
+
+    A repeat/cascade rule fires when a signature's count *inside the sliding
+    window* reaches the threshold, and that count can never exceed the window
+    length. With auto-scaling off the window is fixed at its nominal size, so
+    a threshold above it is mathematically unreachable: the detector never
+    fires on any input, with no error or warning -- a silently disabled safety
+    net, the same shape ``_validated_stagnation`` rejects ``min_novelty=0.0``
+    for. Both knobs individually pass every other validator, which is exactly
+    how the combination slips through.
+
+    With scaling on the window grows toward ``max_window``, so the reachable
+    bound is the cap rather than the nominal size. Cycle mode needs two full
+    periods to fit in its scan window (``[A,B,A,B]``), so a window below
+    ``2 * loop_cycle_min_period`` is dead the same way.
+    """
+    # A zero window is a fail-safe disable (guarded by
+    # test_zero_window_size_does_not_raise_under_scaling), not a config error,
+    # so only constrain the threshold when the window can actually hold it.
+    scaled = cfg.window_scale_steps > 0
+    cap = cfg.max_window if scaled else 0
+    if cfg.loop_window_size > 0:
+        loop_limit = max(cfg.loop_window_size, cap)
+        if cfg.loop_repeat_threshold > loop_limit:
+            raise ValueError(
+                f"loop_repeat_threshold must fit inside the loop window (<= "
+                f"{loop_limit}, the {'scaled cap' if scaled else 'window size'}; "
+                f"got {cfg.loop_repeat_threshold!r}. A count inside a window of "
+                f"{loop_limit} can never reach it, so the detector would never "
+                "fire on any input"
+            )
+    if cfg.cascade_window_size > 0:
+        cascade_limit = max(cfg.cascade_window_size, cap)
+        if cfg.cascade_error_threshold > cascade_limit:
+            raise ValueError(
+                f"cascade_error_threshold must fit inside the cascade window (<= "
+                f"{cascade_limit}, the {'scaled cap' if scaled else 'window size'}; "
+                f"got {cfg.cascade_error_threshold!r}. The density rule needs that "
+                f"many flagged steps inside a window of {cascade_limit}, which can "
+                "never hold, so the detector would never fire on any input"
+            )
+    # Cycle mode is off by default; its window only has to be reachable when
+    # the scan is actually enabled.
+    if (
+        cfg.loop_cycle_enabled
+        and cfg.loop_cycle_window_size < 2 * cfg.loop_cycle_min_period
+    ):
+        raise ValueError(
+            f"loop_cycle_window_size must be at least 2 * "
+            f"loop_cycle_min_period ({2 * cfg.loop_cycle_min_period}) to hold "
+            f"two full periods; got {cfg.loop_cycle_window_size!r}. A shorter "
+            "window can never contain a repeat, so cycle mode would never fire"
+        )
+    # The scan needs two full periods of a candidate inside the window before
+    # it will even test that candidate (``_minimal_period`` returns None as
+    # soon as ``n < 2 * p``), so a max_period above half the effective window
+    # is a band the detector can never see (issue #594) -- the upper part of
+    # the configured range is permanently dark and the failure reads as "no
+    # loop found" rather than a misconfiguration. The effective bound is the
+    # scaled cap when auto-scaling is on, exactly as for the repeat threshold
+    # above; without scaling it is the nominal window size.
+    if cfg.loop_cycle_enabled and cfg.loop_cycle_window_size > 0:
+        cycle_limit = max(cfg.loop_cycle_window_size, cap)
+        if cfg.loop_cycle_max_period > cycle_limit // 2:
+            raise ValueError(
+                f"loop_cycle_max_period must fit inside the cycle window (<= "
+                f"{cycle_limit // 2}, half of the "
+                f"{'scaled cap' if scaled else 'window size'} {cycle_limit}; "
+                f"got {cfg.loop_cycle_max_period!r}. Detecting a period p "
+                f"requires 2 * p steps of history, so anything above half the "
+                "window is never testable and cycle mode would silently skip "
+                "the top of its own configured band"
+            )
+
+
+def _validated_divisor_thresholds(cfg: Config) -> None:
+    """Validate the threshold knobs the detectors divide by (issue #322).
+
+    Four detectors compute a risk score by dividing a count by a threshold, so
+    a threshold of ``0`` raises ``ZeroDivisionError`` on the first step. The
+    fire conditions are ``>=`` comparisons, which ``0`` trivially satisfies, so
+    the detector reaches the division and dies; ``Monitor.ingest`` is fail-open,
+    so the exception is swallowed and the detector stays installed and dead for
+    the rest of the run -- the silently disabled safety net ``_validated_stagnation``
+    rejects ``min_novelty=0.0`` for. ``0`` is also the natural "disable this
+    detector" value a user reaches for, and it is accepted by every config layer.
+    """
+    knobs = (
+        ("cascade_consecutive_threshold", cfg.cascade_consecutive_threshold),
+        ("cascade_error_threshold", cfg.cascade_error_threshold),
+        ("loop_repeat_threshold", cfg.loop_repeat_threshold),
+        ("loop_stall_steps", cfg.loop_stall_steps),
+    )
+    for name, value in knobs:
+        if value < 1:
+            raise ValueError(
+                f"{name} must be >= 1; got {value!r}. A threshold of 0 makes the "
+                "fire condition trivially true and the score computation divides "
+                "by it, which raises ZeroDivisionError on the first step and "
+                "silently disables the detector for the rest of the run"
+            )
+
+
+def _validated_cusum(cfg: Config) -> None:
+    """Validate the CUSUM alarm bars and sigma floors (issues #331, #351); raise.
+
+    ``cusum_h`` and ``token_cusum_h`` are the *denominators* of their
+    detector's risk score, so neither has a meaningful zero or negative value.
+    ``h = 0`` makes ``alarm_cusum / h`` raise ZeroDivisionError at ingest time,
+    which ``Monitor.ingest``'s fail-open handler swallows after logging once --
+    the detector then stays installed and reports nothing for the whole run.
+    Any negative ``h`` makes ``cusum > h`` trivially true on every step (the
+    CUSUM statistic is clamped to >= 0 by construction), so perfectly healthy
+    traffic pages constantly. Unlike the integer count knobs there is no
+    "disable this detector" reading to preserve: ``h`` has no disabled state,
+    and the detectors are opt-in through their own ``*_enabled`` flags.
+
+    The sigma floors are the same class of hazard (#351) and are checked
+    alongside ``h`` because they share the failure: the frozen ``sigma0`` is
+    ``max(std, abs_floor, rel_floor * |mean|)`` and is itself a denominator in
+    the hot path. A negative floor is meaningless (``max`` discards it), and
+    with both floors at 0 a perfectly stable baseline gives ``sigma0 = 0``,
+    which raises ZeroDivisionError on the first post-warm-up step and, via the
+    same fail-open path, deadens the detector for the run. At least one floor
+    must be strictly positive; both default positive, so stock configs pass.
+    """
+    for name in ("cusum_h", "token_cusum_h"):
+        value = getattr(cfg, name)
+        if not value > 0:
+            raise ValueError(
+                f"{name} must be positive; got {value!r}. The CUSUM alarm bar is "
+                "the denominator of the risk score, so 0 raises ZeroDivisionError "
+                "at ingest time and a negative value makes the alarm trivially "
+                "true on every step"
+            )
+    # Issue #351: a negative floor is meaningless and both-at-zero makes the
+    # derived sigma0 a zero denominator on a stable baseline.
+    for name in ("cusum_sigma_floor_abs", "cusum_sigma_floor_rel"):
+        value = getattr(cfg, name)
+        if value < 0:
+            raise ValueError(
+                f"{name} must be >= 0; got {value!r}. A negative sigma floor is "
+                "discarded by the max() that derives sigma0 and cannot do anything "
+                "a 0 does not already"
+            )
+    if cfg.cusum_sigma_floor_abs == 0 and cfg.cusum_sigma_floor_rel == 0:
+        raise ValueError(
+            "cusum_sigma_floor_abs and cusum_sigma_floor_rel are both 0. The "
+            "derived sigma0 is the denominator of the CUSUM update, so a "
+            "perfectly stable baseline (std 0) gives sigma0 = 0 and raises "
+            "ZeroDivisionError at ingest time; at least one floor must be "
+            "positive -- see the config docstring for why they exist"
+        )
+
+
+def _validated_counts_and_windows(cfg: Config) -> None:
+    """Validate the sample-count / window-size knobs (issues #333, #346); raise.
+
+    A window or warm-up count of 0 is never meaningful, and it breaks each
+    affected detector in one of two silent ways. Either the fire condition
+    becomes unreachable -- ``deque(maxlen=0)`` discards every sample, so a
+    repeat count is always 0 and the plain loop detector can never page on a
+    pure-repeat episode -- or the detector proceeds to score an empty window
+    and fabricates an alert: ``MeltdownDetector``'s entropy of an empty window
+    is 0.0, which is below ``meltdown_low_entropy``, so a score-0.7 risk naming
+    "0 distinct in last 0 steps" fires on step 0 of every episode. A warm-up
+    count <= 1 additionally freezes the baseline on the first sample, letting
+    one unrepresentative step define "healthy" for the rest of the episode.
+    ``stagnation_window_size`` and ``max_window`` are covered by
+    ``_validated_stagnation`` / ``_validated_horizon``.
+
+    ``loop_window_size`` / ``cascade_window_size`` are deliberately exempt: a
+    zero base window is a *fail-safe* disable for those two detectors (the
+    scaled window stays 0, the deque discards everything, no risk can ever
+    fire) and upstream's window-scaling work locks that contract in with
+    ``test_zero_window_size_does_not_raise_under_scaling``. Rejecting it here
+    would break that guard, so only negative values are invalid for the pair.
+    """
+    for name in (
+        "cusum_min_samples",
+        "token_min_samples",
+        "loop_cycle_window_size",
+        "meltdown_window_size",
+        "meltdown_rearm_steps",
+        "semantic_drift_window_size",
+    ):
+        value = getattr(cfg, name)
+        if value < 1:
+            raise ValueError(
+                f"{name} must be >= 1; got {value!r}. A window or sample count of 0 "
+                "either makes the detector's condition unreachable (a silent "
+                "disable) or lets it score an empty window (fabricated alerts)"
+            )
+    # loop_window_size / cascade_window_size: 0 is a legitimate fail-safe
+    # disable (see the docstring), but a negative window is never meaningful --
+    # deque(maxlen=<0) is empty, so the detector silently never fires.
+    for name in ("loop_window_size", "cascade_window_size"):
+        value = getattr(cfg, name)
+        if value < 0:
+            raise ValueError(
+                f"{name} must be >= 0; got {value!r}. 0 is a valid fail-safe "
+                "disable for this detector, but a negative window is an empty "
+                "deque, which silently disables the detector"
+            )
+    # Issue #346: below 3 the entropy statistic cannot mean anything, so the
+    # same fabricated collapse alert slips past the >= 1 check above. A
+    # one-item window has entropy exactly 0.0 by construction -- it is always
+    # below meltdown_low_entropy and pages on the first step of every episode.
+    # A two-item window can only take the values {0.0, 1.0} bits, so the low
+    # threshold is crossed by nothing but the degenerate all-identical case and
+    # the detector fires on the first repeat of an agent that simply called one
+    # tool twice. Three is the smallest window able to express "collapse onto
+    # one tool among several": it admits a 2:1 split (~0.92 bits) that stays
+    # quiet, leaving the alarm for a genuine collapse.
+    if cfg.meltdown_window_size < 3:
+        raise ValueError(
+            f"meltdown_window_size must be >= 3; got {cfg.meltdown_window_size!r}. "
+            "Below 3 the entropy statistic is vacuous: a one-item window scores "
+            "0.0 bits by construction and a two-item window can only be 0.0 or "
+            "1.0 bits, so the low threshold pages on a single tool call rather "
+            "than a collapse"
+        )
+    # Issue #591: entropy is measured in bits and is always >= 0, so a negative
+    # threshold can never be a meaningful bar. A negative low makes
+    # ``H < low`` unreachable -- the collapse alarm is dead for the whole run
+    # while the detector reports itself healthy -- and a negative high makes
+    # ``H > high`` trivially true, false-alarming on the first window of every
+    # episode. NaN is worse still: every comparison against it is False, so the
+    # low alarm dies and the high one dies with it, silently. Both are config
+    # errors at startup, not values to carry into the window arithmetic.
+    for value, label, relation in (
+        (cfg.meltdown_low_entropy, "meltdown_low_entropy", "below"),
+        (cfg.meltdown_high_entropy, "meltdown_high_entropy", "above"),
+    ):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"{label} must be a finite, non-negative number of bits; got "
+                f"{value!r}. Entropy is always >= 0, so a negative {label} can "
+                f"never be crossed and {relation}-threshold alarms would "
+                "either never fire or fire on every window"
+            )
+
+
+def _validated_semantic_drift(cfg: Config) -> None:
+    """Validate the semantic goal-drift CUSUM knobs (issue #370); raise when
+    invalid.
+
+    Same contract as the horizon knobs (issue #92) and the deterministic
+    CUSUM bars (#331): an out-of-range value is a configuration error and
+    fails loudly at construction/resolve time instead of reaching
+    ``SemanticGoalDriftDetector._observe``, where the consequences are the two
+    things a drift detector must never do.
+
+    ``cusum_h`` is the denominator of the alarm score, so ``0`` raises
+    ``ZeroDivisionError`` on every scored step; ``observe`` swallows it
+    fail-open and re-logs a traceback once per step, and the episode never
+    alarms. A negative ``h`` makes ``debt >= h`` trivially true (debt is
+    clamped to ``>= 0``), and a negative slack ``k`` adds to the debt instead
+    of subtracting, so either one storms a false positive on nearly every
+    step.
+    """
+    if cfg.semantic_drift_cusum_h <= 0:
+        raise ValueError(
+            "semantic_drift_cusum_h must be positive; it is the denominator "
+            "of the alarm score, so 0 deadens the detector with a swallowed "
+            f"ZeroDivisionError; got {cfg.semantic_drift_cusum_h!r}"
+        )
+    if cfg.semantic_drift_cusum_k < 0:
+        raise ValueError(
+            "semantic_drift_cusum_k must be >= 0; a negative slack adds to "
+            "the CUSUM debt instead of subtracting and storms false "
+            f"positives; got {cfg.semantic_drift_cusum_k!r}"
+        )
+
+
+def _validated_score_thresholds(cfg: Config) -> None:
+    """Validate the comparison-style score/tolerance knobs (issue #385).
+
+    The goal-drift and ml-ensemble detectors gate their own output on a score
+    threshold, and the scores are clamped to ``[0, 1]``. So a threshold above
+    ``1.0`` makes ``score < threshold`` always true and the detector can never
+    emit a risk on any input, while a negative one makes it always false, so a
+    score of exactly ``0.0`` -- an episode indistinguishable from the healthy
+    baseline -- still pages. The tolerance knobs are the same comparison run
+    backwards: ``error_tolerance`` is subtracted from the live-minus-baseline
+    error gap, and ``latency_k`` is subtracted from a z-score, so a negative
+    value adds to the drift instead of absorbing it.
+
+    None of these is a divisor or a count, which is why they sit outside
+    ``_validated_divisor_thresholds`` and ``_validated_counts_and_windows``:
+    a bad value here never raises, it just produces wrong telemetry until
+    someone notices the missing or spurious pages.
+    """
+    for name in ("goal_drift_score_threshold", "ml_ensemble_score_threshold"):
+        value = getattr(cfg, name)
+        if not 0.0 < value <= 1.0:
+            raise ValueError(
+                f"{name} must be within (0.0, 1.0]; got {value!r}. Scores are "
+                "clamped to [0, 1], so a threshold above 1.0 makes the detector's "
+                "own gate always true and it can never fire, while 0.0 or less "
+                "fires on a zero score -- healthy traffic pages. Use the "
+                "*_enabled flag to disable a detector, not its threshold"
+            )
+    for name in ("goal_drift_error_tolerance", "goal_drift_latency_k"):
+        value = getattr(cfg, name)
+        if value < 0.0:
+            raise ValueError(
+                f"{name} must be >= 0; got {value!r}. The value is slack "
+                "subtracted from a non-negative drift measure, so a negative "
+                "one adds to the drift and healthy traffic pages"
+            )
+
+
+def _validated_cusum_slack(cfg: Config) -> None:
+    """Validate the CUSUM slack knobs (issue #421); raise when invalid.
+
+    ``cusum_k`` and ``token_cusum_k`` are the slack subtracted from the CUSUM
+    accumulator on every scored step. A negative slack *adds* ``|k|``
+    unconditionally, so the accumulator grows by ``|k|`` per step regardless of
+    what the data does and the alarm becomes unavoidable once enough steps
+    elapse -- a false-positive storm on perfectly healthy traffic (measured: 20
+    risks in 30 steps on an exactly constant 100 tokens/step, score climbing to
+    1.0). No data pattern prevents it and no baseline accuracy helps, so the
+    value must be rejected rather than tolerated.
+
+    ``0`` is legitimate: it means "no slack" -- the accumulator is never
+    decayed, so the detector is maximally sensitive but not inverted. The bound
+    is therefore open at zero, matching #371's treatment of
+    ``semantic_drift_cusum_k``.
+    """
+    for name in ("cusum_k", "token_cusum_k"):
+        value = getattr(cfg, name)
+        if value < 0:
+            raise ValueError(
+                f"{name} must be >= 0; got {value!r}. The slack is subtracted "
+                "from the CUSUM accumulator each scored step, so a negative "
+                "value adds |k| unconditionally and the alarm fires on healthy "
+                "traffic once enough steps elapse -- no data pattern prevents it"
+            )
+
+
+@dataclass
+class Config:
+    # Loop detector
+    loop_window_size: int = 12
+    loop_repeat_threshold: int = 3
+
+    # Error-cascade detector
+    cascade_window_size: int = 10
+    cascade_error_threshold: int = 3
+    cascade_consecutive_threshold: int = 3
+    # By default the cascade detector only counts *tool* failures. A LangChain
+    # LLM 502 or a planning-chain error is infrastructure noise that should not
+    # trip a "tool is failing" alert (issue #16). Flip this to True to count
+    # every error-bearing step regardless of action_type.
+    cascade_count_non_tool_errors: bool = False
+
+    # Latency / CUSUM detector (used once that detector lands)
+    cusum_k: float = 0.5
+    cusum_h: float = 5.0
+    # Warm-up: learn a baseline before alarming. Lowered from 20 to 5 so that
+    # tools called only a handful of times are still monitored (issue #9) --
+    # the frozen baseline + sigma floor make a single large spike alarm after
+    # the warm-up rather than requiring several sustained ones.
+    cusum_min_samples: int = 5
+    # A perfectly stable baseline has sample std 0, which would make every
+    # deviation infinite and force a div-by-zero guard that never fires. These
+    # floors give the detector a meaningful deviation scale even for constant
+    # baselines, so a single large spike alarms instead of requiring several.
+    cusum_sigma_floor_abs: float = 1.0  # ms; never treat baseline std as smaller
+    cusum_sigma_floor_rel: float = 0.05  # ... or smaller than 5% of the mean
+
+    # Goal-drift detector (next phase, step 2). Compares a live run's per-tool
+    # error rate / latency against a persisted healthy BaselineProfile and
+    # flags meaningful deviation. Opt-in: enabled only when a baseline exists.
+    goal_drift_enabled: bool = False
+    goal_drift_error_tolerance: float = 0.1  # allow baseline error_rate + this
+    goal_drift_latency_k: float = 3.0  # sigmas above baseline mean counts as drift
+    goal_drift_min_samples: int = 10  # live steps before scoring an episode
+    goal_drift_score_threshold: float = 0.5  # emit a risk above this score
+    goal_drift_baseline: BaselineProfile | None = None  # healthy reference
+
+    # ML ensemble detector (next phase, step 3). When enabled, Monitor.default
+    # wraps the base detectors in a single MLOrchestrator so signals combine.
+    ml_ensemble_enabled: bool = False
+    ml_ensemble_score_threshold: float = 0.5  # emit a combined risk above this
+
+    # --- Optional semantic goal-drift detector (issue #81, ``drift`` extra) --
+    # Embeds structural labels only (action_type, tool_name, error_type; never
+    # prompt/response content, metadata is never read) and compares the live
+    # episode's running embedding centroid against the persisted
+    # BaselineProfile's embedding_centroid through cosine distance. A CUSUM
+    # over the deviation keeps it silent unless the divergence is sustained.
+    # Requires ``pip install snagline[drift]`` AND a baseline fitted with
+    # snagline.drift.fit_semantic_baseline; anything missing degrades fail-open
+    # to an inert, logged detector and the zero-dep preset is untouched.
+    semantic_drift_enabled: bool = False
+    semantic_drift_model: str = "all-MiniLM-L6-v2"  # provenance + load target
+    semantic_drift_min_samples: int = 10  # live steps before scoring starts
+    semantic_drift_window_size: int = (
+        20  # sliding window size for live deviation (issue #603)
+    )
+    semantic_drift_tolerance: float = 0.2  # cosine deviation treated as noise (calibrated to stay below multi-tool shift, issue #603)
+    semantic_drift_cusum_k: float = 0.05  # slack subtracted per evaluation
+    semantic_drift_cusum_h: float = 0.5  # sustained-deviation alarm threshold
+
+    # --- Loop hardening modes (issue #89, opt-in) ----------------------------
+    # Each mode extends LoopDetector with one more failure shape beyond plain
+    # single-signature repetition. All default off so the plain-loop path is
+    # unchanged and the zero-dependency preset keeps its bench numbers.
+    # Triggers emitted (API strings): "near_duplicate_loop", "cycle", "stall".
+    loop_near_duplicate_enabled: bool = False  # collapse volatile ids, recount
+    loop_cycle_enabled: bool = False  # A,B,A,B,... periodicity scan
+    loop_cycle_window_size: int = 12  # window scanned for periodicity
+    loop_cycle_min_period: int = 2  # shortest repeating period considered
+    loop_cycle_max_period: int = 6  # longest repeating period considered
+    loop_stall_enabled: bool = False  # identical signature, zero progress
+    loop_stall_steps: int = 25  # consecutive identical steps before firing
+
+    # --- Stagnation detector (issue #87) --------------------------------------
+    # Opt-in novelty-rate tracker: flags an episode whose share of never-
+    # before-seen action signatures collapses, i.e. the agent is busy but
+    # discovering nothing. Distinct from the loop detector, which needs exact
+    # repeats: near-duplicate actions with slightly varied arguments produce
+    # fresh signatures and evade exact matching while still being stuck.
+    # Default off so the zero-dependency preset and the published bench
+    # numbers are untouched.
+    #
+    # Validation contract (issue #132): these three knobs are range-checked in
+    # _validated_stagnation() at construction and after env/file layering, so
+    # an invalid value aborts startup loudly instead of silently disabling the
+    # detector. This means invalid monitoring config is a configuration error:
+    # Monitor.default() may raise ValueError during construction when handed
+    # one. Runtime detection stays fail-open (project.md §1.2); only startup
+    # with a broken config fails, and it fails with a message naming the knob.
+    stagnation_enabled: bool = False
+    stagnation_window_size: int = 50  # steps per novelty window; must be >= 1
+    stagnation_min_novelty: float = 0.05  # stale when fewer than this share new; must be within (0.0, 1.0]; 0.0 would make firing unreachable
+    stagnation_patience: int = (
+        2  # consecutive stale windows before firing; must be >= 1
+    )
+
+    # Token-runaway detector (issue #84, opt-in). Sustained-burn CUSUM over
+    # per-step token volume plus an optional hard per-episode budget envelope.
+    # Needs adapters that report tokens_in/tokens_out; disabled by default so
+    # the zero-configuration preset and its published bench numbers are
+    # unchanged until the accuracy gate (#82) has validated thresholds.
+    token_runaway_enabled: bool = False
+    token_cusum_k: float = 0.5  # slack parameter
+    token_cusum_h: float = 5.0  # alarm threshold
+    token_min_samples: int = 20  # warm-up before sustained-burn alarms
+    # total tokens; None disables envelope, must be positive when set
+    episode_token_budget: int | None = None
+    # single warning at this fraction; must be within (0, 1] (issue #317):
+    # 0.0 fires it on the first step and >1.0 makes it unreachable
+    token_budget_warn_fraction: float = 0.8
+
+    # Meltdown detector (issue #85, opt-in until the accuracy gate lands).
+    # Sliding-window Shannon entropy over tool-call identities; flags both the
+    # low-entropy rote-collapse shape and the high-entropy thrash shape
+    # documented as "meltdown" in arXiv:2603.29231. Thresholds are bits and
+    # were tuned against fixtures: uniform alternation over eight tools
+    # (~2.97 bits at window 20) stays silent, collapse onto one tool
+    # (<0.4 bits) and churn across 12+ (~3.52 bits) fire. The high threshold
+    # of 3.4 bits corresponds to ~10.5 tools uniform (2**3.4), so an
+    # eight-tool ReAct agent used evenly is comfortably below while
+    # pathological churn across a dozen distinct tools in one window still
+    # fires; see src/snagline/detectors/meltdown.py for the full rationale.
+    meltdown_enabled: bool = False
+    meltdown_window_size: int = 20
+    meltdown_low_entropy: float = 0.4  # bits; below this the window is rote
+    meltdown_high_entropy: float = 3.4  # bits; above this the window thrashes
+    meltdown_rearm_steps: int = 10  # in-band steps before re-arming
+
+    # Silent-abort detector (issue #86, opt-in). Evaluated once at
+    # end_episode(): fires when an episode's final step was an error-free bare
+    # tool call instead of an output step -- the completion check from
+    # arXiv:2608.02464 that caught 7/7 organic failures-of-omission there.
+    silent_abort_enabled: bool = False
+    # Which action types count as "the agent produced its result". The default
+    # names the types the LangChain adapter emits for a completed turn; six of
+    # the seven shipped integrations end a healthy episode on something else
+    # (claude_code ends on a tool_call because it drops the Stop hook, the
+    # OpenAI/Anthropic auto-wrappers label every LLM call tool_call, langgraph
+    # emits node_run, crewai/autogen emit agent_step), and for those the stock
+    # default means the completion check fires on *every* successful run. This
+    # field is the operator surface for that -- see _validated_silent_abort and
+    # docs/DETECTOR_GUIDE.md (issue #578).
+    silent_abort_output_action_types: frozenset[str] = frozenset(
+        {"message", "plan_step"}
+    )
+
+    # --- Side-effect guard detector (issue #88, opt-in) ----------------------
+    # Duplicate detection for host-declared non-idempotent actions
+    # (``StepEvent.side_effect``): a second identical (tool_name,
+    # action_signature) pair within one episode fires "side_effect_duplicate"
+    # immediately. Deliberately stricter than the loop detector, which waits
+    # for ``loop_repeat_threshold`` hits inside a sliding window and targets
+    # wasted-work loops; here one repeated payment/send/deploy is already the
+    # incident. Default off so the zero-dependency preset and its published
+    # bench numbers are untouched.
+    side_effect_guard_enabled: bool = False
+    side_effect_allowed_repeats: int = 1  # occurrences tolerated before firing
+    side_effect_score: float = 0.9  # routes as critical severity
+
+    # Compaction tripwire (issue #90, opt-in). Governance-decay detection
+    # across context compactions: adapters whose host exposes compaction hooks
+    # emit step("compaction", metadata={"pinned": ["<sha256>", ...]}) and
+    # step("constraint_present", metadata={"pin": "<sha256>"}); pins still
+    # unconfirmed grace_steps events after the compaction fire exactly one
+    # score=0.9 risk with trigger "governance_decay". Hashes only: constraint
+    # text never reaches snagline. Inert by design on hosts that offer no
+    # compaction visibility. Default off so the zero-dependency preset and its
+    # published bench numbers are untouched.
+    compaction_tripwire_enabled: bool = False
+    compaction_tripwire_grace_steps: int = 3  # events allowed to re-confirm
+
+    # --- Opt-in auto-calibration from a fitted BaselineProfile (issue #101) --
+    # calibration="auto" derives error-cascade thresholds and the CUSUM latency
+    # reference from a healthy-run profile (see snagline.calibration) instead
+    # of using the hand-tuned constants above. Without a usable profile the
+    # hand-tuned defaults apply unchanged (never worse than today). Derived
+    # cascade counts are clamp-limited to [2, hand-tuned default] so auto can
+    # only ever become more sensitive than shipped behavior.
+    calibration: str = "manual"  # "manual" | "auto"
+    # False-alarm probability budget per window evaluation used when deriving
+    # cascade thresholds. Small on purpose: tier-1 detectors evaluate every
+    # step, so one window is implicitly tested many times per episode.
+    calibration_alpha: float = 0.001
+    # Healthy reference for calibration. Pass the fitted object directly, or
+    # point calibration_baseline_path at a file written by save_baseline() /
+    # `snagline baseline --save`. The object field cannot come from JSON/TOML
+    # config files or the environment; use the path variant there.
+    calibration_baseline: BaselineProfile | None = None
+    calibration_baseline_path: str | None = None
+
+    # Global
+    fail_open: bool = True
+
+    # --- Structured logging sink (issue #99) ---------------------------------
+    # Emission format for the logging sink (``sinks/logging_sink.py``):
+    # "text" keeps plain lines, "json" emits one compact JSON object per risk
+    # with exactly the keys ts, episode_id, step_id, trigger, severity, score,
+    # detail. Selectable via env ``SNAGLINE_LOG_FORMAT`` or a config-file
+    # ``log_format`` key. Values outside {"text", "json"} raise ValueError at
+    # construction/resolve time (issue #119); when "json" is selected,
+    # Monitor.default() and the CLI install LoggingSink next to ConsoleSink
+    # so SNAGLINE_LOG_FORMAT=json needs zero code changes.
+    # Structure only: the emitted object never carries prompt/response content.
+    log_format: str = "text"
+
+    # --- Sidecar /metrics exposition (issue #98) -----------------------------
+    # Format served by GET /metrics on the sidecar: "prometheus" serves text
+    # exposition version 0.0.4 (the default), "classic" serves the legacy JSON
+    # counters body. Per-request override via ?format=classic or
+    # ?format=prometheus; environment override SNAGLINE_METRICS_FORMAT.
+    metrics_format: str = "prometheus"
+
+    # --- Sidecar read timeout (issue #130) ----------------------------------
+    # Socket read timeout in seconds for each sidecar connection; a stalled
+    # sender that declares a large Content-Length but sends only a few bytes
+    # is closed after this many seconds so one slow peer cannot pin a handler
+    # thread indefinitely. Environment override SNAGLINE_SERVER_READ_TIMEOUT.
+    # Default comfortably above legitimate slow senders (30 s).
+    server_read_timeout: float = 30.0
+
+    # --- Enforcement policy (issue #93) ---------------------------------------
+    # Optional escalation layer that runs AFTER the sinks on every dispatched
+    # risk (documented ordering: detectors -> sinks -> policy). "observe" (the
+    # default) is today's detection-only behavior with zero overhead;
+    # "callback" invokes a host-supplied callable wrapped fail-open; and
+    # "halt_webhook" POSTs the FailureRisk JSON to halt_url and surfaces the
+    # response directive as Monitor.last_directive, failing open to continue
+    # on timeout/error. The callable for callback mode cannot come from env
+    # vars or files; pass on_risk= to Monitor directly.
+    policy: str = "observe"
+    halt_url: str | None = None  # required when policy == "halt_webhook"
+    # Webhook budget: how long one halt consultation may delay its own thread
+    # before the directive defaults to continue. 250ms per issue #93.
+    halt_timeout_s: float = 0.25
+    # Only risks scoring at or above this pay the webhook cost; below it the
+    # risk still reaches sinks/callback as usual but no halt round-trip happens.
+    min_severity_for_halt: float = 0.8
+
+    # --- Horizon-scale time axis (issue #92, opt-in) -------------------------
+    # Fixed step-count assumptions break on multi-day episodes where step rates
+    # vary by orders of magnitude between phases. Every knob below defaults off
+    # and leaves behavior byte-identical when unset; all timing is derived from
+    # StepEvent.timestamp inside ingest(), never from the wall clock, so replay
+    # stays deterministic by construction.
+    #
+    # Wall-clock budget: one warning risk at warn_fraction of the budget and a
+    # single critical breach risk at the limit, each fired at most once per
+    # episode. Trigger name for both: "wall_clock_budget", scored 0.7 (keeps
+    # the pre-breach signal in the "warning" severity band) and 1.0.
+    max_episode_wall_seconds: float | None = None
+    warn_fraction: float = 0.8  # single warning risk before breach
+    # Idle detection: a gap of at least this many seconds between consecutive
+    # ingests (event timestamps again) fires one "idle_gap" risk per episode.
+    idle_warn_seconds: float | None = None
+    # Window auto-scaling for window-based detectors: the effective window grows
+    # as base * ceil(episode_len / window_scale_steps), capped at max_window,
+    # refitted lazily as it grows. 0 disables scaling entirely (the default).
+    window_scale_steps: int = 0
+    max_window: int = 512  # hard cap for scaled windows
+    # Latency CUSUM periodic baseline re-fit: every N post-warm-up samples the
+    # detector starts a fresh Welford learner while the frozen baseline keeps
+    # scoring; when the learner completes, its stats are compared against the
+    # frozen baseline and a sustained shift in the baseline itself emits one
+    # latency_anomaly risk before the new baseline is adopted. 0 disables.
+    cusum_refit_every: int = 0
+
+    # --- Per-episode retention cap (issue #184) -----------------------------
+    # Long-lived monitors (especially the sidecar) must not grow without
+    # bound when hosts never call end_episode. The cap is a safety net:
+    # explicit end_episode still frees immediately; eviction only fires
+    # when the number of distinct live episodes would otherwise exceed this.
+    # LRU by last-seen is the safe policy: a genuinely active episode is
+    # by definition recently seen, so it cannot be evicted out from under
+    # itself. Eviction is silent (no finalize risks) and fail-open.
+    # Environment override SNAGLINE_MAX_LIVE_EPISODES.
+    max_live_episodes: int = 10_000
+
+    # --- Sidecar episode TTL (issue #173) -----------------------------------
+    # When set, the sidecar's episodes-active gauge expires ids not seen for
+    # this many wall-clock seconds. None or 0 disables (default, byte-identical
+    # to pre-TTL behavior). Uses monotonic time so NTP jumps cannot
+    # mass-expire or freeze entries. Replay caveat: replaying old trajectories
+    # through a live sidecar will resurrect stale ids; docs note this.
+    # Environment override SNAGLINE_EPISODE_TTL_SECONDS.
+    episode_ttl_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        # Issue #119: invalid closed-set values are configuration errors and
+        # must fail loudly here instead of being silently ignored downstream.
+        self.log_format = _validated_log_format(self.log_format)
+        self.policy = validate_policy(self.policy)
+        # Issue #92: same policy for the horizon-scale knobs. All default off,
+        # so stock configurations never hit these checks.
+        _validated_horizon(self)
+        # Issue #132: same policy for the stagnation knobs. The defaults are
+        # always valid, so stock configurations never hit these checks.
+        _validated_stagnation(self)
+        # Issue #317: same policy for the token-budget envelope. Its defaults
+        # are valid too, so only a configured value can trip these checks.
+        _validated_token_runaway(self)
+        # Issue #353: the enforcement knobs' ranges do not depend on the
+        # policy, so they are checked unconditionally; the defaults are valid.
+        _validated_enforcement(self)
+        _validated_max_live_episodes(self)
+        # Issue #322: thresholds the detectors divide by; 0 raises
+        # ZeroDivisionError at ingest time and fail-open then silently disables
+        # the detector for the rest of the run.
+        _validated_divisor_thresholds(self)
+        # Issues #331 / #333: the CUSUM alarm bars and the window/sample-count
+        # knobs. The defaults are always valid, so stock configurations never
+        # hit these checks.
+        _validated_cusum(self)
+        _validated_counts_and_windows(self)
+        # Issue #370: same policy for the semantic goal-drift CUSUM knobs.
+        # Their defaults are valid, so only a configured value trips these.
+        _validated_semantic_drift(self)
+        # Issue #385: the goal-drift / ml-ensemble score gates and tolerances.
+        # These never raise on their own -- they only mis-route alerts -- so
+        # they need the same startup check the other comparison knobs get.
+        _validated_score_thresholds(self)
+        # Issue #397: a tolerance at/above 2.0 silently deadens the goal-drift
+        # detector and a NaN one storms alarms; valid only within [0, 2).
+        _validated_semantic_drift_tolerance(self)
+        # Issue #328: a fractional side-effect tolerance can never equal the
+        # integer occurrence count it is compared against, so the duplicate
+        # non-idempotent action detector never fires at all.
+        _validated_side_effect_guard(self)
+        # Issue #578: an empty or malformed output-type set either fires the
+        # completion check on every episode or can never match an action_type.
+        _validated_silent_abort(self)
+        # Issue #421: the CUSUM slack. A negative value inverts the accumulator
+        # and storms healthy traffic (see _validated_cusum_slack).
+        _validated_cusum_slack(self)
+        # Issue #436: a count threshold wider than its window is unreachable on
+        # every input, which silently disables the detector the same way.
+        _validated_window_thresholds(self)
+
+    # --- 12-factor configuration (project.md §5.4, ATTACH_ANY_SYSTEM P0) -----
+    @classmethod
+    def from_env_overrides(
+        cls, environ: Mapping[str, str] | None = None, prefix: str = "SNAGLINE_"
+    ) -> dict[str, Any]:
+        """Return only the fields that ``environ`` actually sets, coerced.
+
+        ``resolve`` needs the *set of keys present in the environment*, not just
+        their values: once folded into a ``Config``, an environment variable
+        whose value equals the built-in default is indistinguishable from an
+        unset one, and comparing against a default instance would silently drop
+        it (issue #66).
+
+        Reads ``<prefix><FIELD>`` (case-insensitive, so ``snagline_log_format``
+        and ``SNAGLINE_LOG_FORMAT`` are the same variable; if both are present,
+        the later one in iteration order wins). Unknown prefixes, unknown keys,
+        values that fail to coerce, and keys naming object-typed fields that
+        cannot be built from a string are ignored (logged at warning) rather
+        than fatal, so a host can pass through unrelated environment without
+        breaking startup.
+        """
+        environ = os.environ if environ is None else environ
+        # Issue #541: the prefix comparison has to be case-insensitive too.
+        # Only the field suffix was lowercased, so the startswith(prefix)
+        # comparison stayed exact-case and any variable whose prefix was spelled
+        # in any other case was silently dropped -- a silent drop, not a warned
+        # one, since the warning path only fires for a recognized key whose value
+        # fails to coerce. A POSIX operator spelling the prefix in lowercase hit
+        # it, as did any host passing environ in explicitly (os.environ itself
+        # uppercases keys on Windows, so the process-inherited case is masked
+        # there). Casefold both sides and slice on the folded prefix so a prefix
+        # whose casefold changes its length still leaves the right field name.
+        prefix_fold = prefix.casefold()
+        hints = get_type_hints(cls)
+        overrides: dict[str, Any] = {}
+        for key, value in environ.items():
+            folded = key.casefold()
+            if not folded.startswith(prefix_fold):
+                continue
+            name = folded[len(prefix_fold) :]
+            if name not in hints:
+                continue
+            hint = _coercible_hint(hints[name])
+            if hint is frozenset:
+                # A string-collection field, read as a comma-separated list
+                # (issue #578). A value that fails to parse is warned about
+                # and dropped, like any other malformed value here.
+                try:
+                    overrides[name] = _coerce_str_collection(name, value)
+                except (ValueError, TypeError):
+                    logger.warning("snagline: ignoring bad env %s=%r", key, value)
+            elif hint in (bool, int, float, str):
+                try:
+                    overrides[name] = _coerce(hint, value)
+                except ValueError:
+                    logger.warning("snagline: ignoring bad env %s=%r", key, value)
+            else:
+                # A present key naming a field that cannot be built from a
+                # string. _coercible_hint keeps object-typed fields
+                # (goal_drift_baseline / calibration_baseline, both
+                # ``BaselineProfile | None``) out of reach of coercion on
+                # purpose -- a profile is a fitted artifact, not a path --
+                # but nothing else told the operator this, so the env form of
+                # either field was a silent no-op, discoverable only by
+                # noticing the detector staying inert. The module docstring
+                # promises that ignored keys are "ignored (logged at
+                # warning)", and a key that can never apply is as worth
+                # logging as one whose value is malformed (issue #355).
+                path_field = f"{name}_path"
+                if path_field in hints:
+                    advise = f" use {prefix}{path_field.upper()} for a file path"
+                else:
+                    advise = " pass the object in code"
+                logger.warning(
+                    "snagline: ignoring env %s=%r: %s is an object-typed field "
+                    "and cannot be set from the environment;%s",
+                    key,
+                    value,
+                    name,
+                    advise,
+                )
+        return overrides
+
+    @classmethod
+    def from_env(
+        cls, environ: Mapping[str, str] | None = None, prefix: str = "SNAGLINE_"
+    ) -> Config:
+        """Build a ``Config`` from environment variables (12-factor).
+
+        Reads ``<prefix><FIELD>`` (case-insensitive) and overrides the matching
+        scalar field; every other field keeps its built-in default. See
+        ``from_env_overrides`` for the same information as a dict of just the
+        keys the environment set.
+        """
+        return cls(**cls.from_env_overrides(environ=environ, prefix=prefix))
+
+    @classmethod
+    def load_file(cls, path: str) -> Config:
+        """Load a ``Config`` from a JSON or TOML file.
+
+        ``.json`` is parsed with the stdlib ``json`` module; ``.toml`` requires
+        Python 3.11+ (``tomllib``). Unknown keys are ignored so a config file
+        can carry extra metadata without breaking construction.
+        """
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        if path.endswith(".toml"):
+            data: dict[str, Any] = _load_toml(text)
+        else:
+            # ``json.loads`` accepts the bare ``Infinity`` / ``NaN`` tokens by
+            # default, and literals like ``1e400`` overflow to inf without a
+            # complaint. Reject either here rather than letting a non-finite
+            # knob silently deaden its detector (issue #383).
+            data = json.loads(text)
+        for key, value in data.items():
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{key}: non-finite float value {value!r} in {path}")
+        valid = {f.name for f in fields(cls)}
+        # ``f.type`` is a raw string under ``from __future__ import
+        # annotations``; resolve the real annotations once so the scalar
+        # hints unwrap Optional[X] correctly.
+        hints = get_type_hints(cls)
+        # Type-check each accepted value (issue #437): env values are coerced
+        # from text by from_env_overrides, file values were used verbatim, so
+        # a quoted scalar silently changed behaviour instead of erroring here.
+        coerced: dict[str, Any] = {}
+        for name, value in data.items():
+            if name not in valid:
+                continue
+            coerced[name] = _coerce_file_value(name, hints[name], value)
+        return cls(**coerced)
+
+    @classmethod
+    def resolve(
+        cls,
+        path: str | None = None,
+        environ: Mapping[str, str] | None = None,
+        prefix: str = "SNAGLINE_",
+    ) -> Config:
+        """Build the effective ``Config`` by layering sources (12-factor).
+
+        Precedence (lowest to highest): built-in defaults -> optional config
+        file (``path``) -> environment variables (``prefix``). Environment
+        overrides win over the file, which wins over defaults. Unknown file
+        keys and unset environment keys do not change anything.
+
+        This is the single entrypoint the CLI and host integrations should use
+        so behavior is consistent across ``snagline serve``, ``watch``,
+        ``replay``, and embedded use.
+        """
+        cfg = cls.load_file(path) if path else cls()
+        # Apply exactly the keys the environment set. Comparing an env-derived
+        # Config against a default instance instead would treat "set to the
+        # default value" as "unset" and let the file win (issue #66) -- which is
+        # precisely the case an operator hits when resetting a shared config
+        # file back to stock behaviour from the environment.
+        for name, value in cls.from_env_overrides(
+            environ=environ, prefix=prefix
+        ).items():
+            setattr(cfg, name, value)
+        # setattr bypasses __post_init__, so re-validate the fields that carry
+        # a closed value set after env layering (issue #119).
+        cfg.log_format = _validated_log_format(cfg.log_format)
+        cfg.policy = validate_policy(cfg.policy)
+        # Same re-validation for the horizon-scale knobs set from env/file
+        # (issue #92): SNAGLINE_WARN_FRACTION=5 must fail loudly, not silently.
+        _validated_horizon(cfg)
+        # Same re-validation for the stagnation knobs set from env/file
+        # (issue #132): SNAGLINE_STAGNATION_MIN_NOVELTY=99 must abort startup
+        # with a clear error, not crash later inside StagnationDetector or,
+        # worse, run silently mis-configured.
+        _validated_stagnation(cfg)
+        # Same re-validation for the token-budget envelope (issue #317):
+        # SNAGLINE_EPISODE_TOKEN_BUDGET=0 must abort startup with a clear
+        # error, not page at critical severity on the first ingested step.
+        _validated_token_runaway(cfg)
+        # Same re-validation for the enforcement knobs (issue #353):
+        # SNAGLINE_MIN_SEVERITY_FOR_HALT=5 must exit 2 here, not reach
+        # Monitor._configure_policy and traceback after the serve banner.
+        _validated_enforcement(cfg)
+        _validated_max_live_episodes(cfg)
+        # Same re-validation for the divisor thresholds set from env/file
+        # (issue #322): SNAGLINE_LOOP_REPEAT_THRESHOLD=0 must abort startup
+        # with a clear error, not ZeroDivisionError inside the detector.
+        _validated_divisor_thresholds(cfg)
+        # Issues #331 / #333: SNAGLINE_CUSUM_H=0 and SNAGLINE_LOOP_WINDOW_SIZE=0
+        # must abort startup with a clear error, not deaden a detector for the
+        # whole run (0 divides) or fabricate alerts from an empty window.
+        _validated_cusum(cfg)
+        _validated_counts_and_windows(cfg)
+        # Same re-validation for the semantic goal-drift CUSUM knobs (issue
+        # #370): SNAGLINE_SEMANTIC_DRIFT_CUSUM_H=0 must abort startup with a
+        # clear error, not deaden the detector with a swallowed
+        # ZeroDivisionError once steps start flowing.
+        _validated_semantic_drift(cfg)
+        # Same re-validation for the score gates and tolerances (issue #385):
+        # SNAGLINE_GOAL_DRIFT_SCORE_THRESHOLD=2 must abort startup rather than
+        # run a goal-drift detector that can never fire.
+        _validated_score_thresholds(cfg)
+        # Same re-validation for the goal-drift noise threshold (issue #397):
+        # SNAGLINE_SEMANTIC_DRIFT_TOLERANCE=2 must abort startup with a clear
+        # error, not run a permanently inert detector.
+        _validated_semantic_drift_tolerance(cfg)
+        # Same re-validation for the side-effect tolerance (issue #328): a
+        # fractional value in a config file must abort startup with a clear
+        # error, not silently blind the duplicate-action guard for the run.
+        _validated_side_effect_guard(cfg)
+        # Same re-validation for the output action types (issue #578): an env
+        # or file value that empties the set must abort startup with a clear
+        # error, not page on every healthy episode.
+        _validated_silent_abort(cfg)
+        # Issue #421: SNAGLINE_CUSUM_K=-1.0 must abort startup with a clear
+        # error, not storm false positives from the first post-warm-up step.
+        _validated_cusum_slack(cfg)
+        # Same re-validation for the count-vs-window pairs (issue #436):
+        # loop_repeat_threshold=99 must abort startup with a clear error, not
+        # install a loop detector that can never fire on any input.
+        _validated_window_thresholds(cfg)
+        return cfg

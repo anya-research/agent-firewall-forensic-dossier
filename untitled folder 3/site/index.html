@@ -1,0 +1,2493 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SNAGLINE — Catch agent failures before they cascade</title>
+<meta name="description" content="Zero-dependency, O(1) per-step monitoring that catches loops, error cascades, latency drift, and goal drift in any AI agent. ~2 microseconds per step.">
+<meta name="theme-color" content="#08090b">
+<meta property="og:title" content="SNAGLINE — Catch agent failures before they cascade">
+<meta property="og:description" content="Real-time failure detection for AI agents. Zero dependencies. 1.53 microseconds per step. Never crashes the thing it monitors.">
+<meta property="og:type" content="website">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+/* ═══════════════ RESET + TOKENS ═══════════════ */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#08090b;--surface:#0e0f12;--elevated:#151619;
+  --line:rgba(255,255,255,0.07);--line-2:rgba(255,255,255,0.14);
+  --ink:#f2f2f0;--ink-2:#9b9ba4;--ink-3:#55555f;
+  --accent:#6ea8d8;--accent-dim:rgba(110,168,216,0.10);--accent-glow:rgba(110,168,216,0.20);
+  --green:#34d399;--green-dim:rgba(52,211,153,0.10);
+  --red:#f43f5e;--red-dim:rgba(244,63,94,0.10);
+  --amber:#fbbf24;--amber-dim:rgba(251,191,36,0.10);
+  --violet:#a78bfa;--violet-dim:rgba(167,139,250,0.10);
+  --display:'Space Grotesk',system-ui,sans-serif;
+  --sans:'Inter',system-ui,sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,monospace;
+  --nav-bg:rgba(8,9,11,0.72);
+  --pad:clamp(1.25rem,4.5vw,5rem);
+  --ease:cubic-bezier(.16,1,.3,1);
+}
+[data-theme="light"]{
+  --bg:#f1f0ec;--surface:#ffffff;--elevated:#e9e8e3;
+  --line:rgba(0,0,0,0.10);--line-2:rgba(0,0,0,0.20);
+  --ink:#0a0a0c;--ink-2:#5c5c66;--ink-3:#9a9aa4;
+  --accent:#0e7490;--accent-dim:rgba(14,116,144,0.08);--accent-glow:rgba(14,116,144,0.20);
+  --green:#047857;--green-dim:rgba(4,120,87,0.09);
+  --red:#be123c;--red-dim:rgba(190,18,60,0.09);
+  --amber:#b45309;--amber-dim:rgba(180,83,9,0.09);
+  --violet:#6d28d9;--violet-dim:rgba(109,40,217,0.09);
+  --nav-bg:rgba(241,240,236,0.78);
+}
+html{overflow-x:clip;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+body{font-family:var(--sans);background:var(--bg);color:var(--ink);line-height:1.6;
+  transition:background .5s var(--ease),color .5s var(--ease)}
+a{color:inherit;text-decoration:none}
+code,pre,.mono{font-family:var(--mono)}
+img,svg,canvas{max-width:100%}
+pre,.snip{max-width:100%}
+::selection{background:var(--accent);color:var(--bg)}
+h1,h2,h3{font-family:var(--display);font-weight:700;letter-spacing:-0.035em;line-height:1}
+
+/* ═══════════════ NAV ═══════════════ */
+nav{position:fixed;top:0;left:0;right:0;z-index:900;height:68px;padding:0 var(--pad);
+  display:flex;align-items:center;justify-content:space-between;
+  transition:transform .5s var(--ease),background .4s,border-color .4s;
+  border-bottom:1px solid transparent}
+nav.solid{background:var(--nav-bg);backdrop-filter:blur(9px);border-bottom-color:var(--line)}
+nav.hide{transform:translateY(-100%)}
+.brand{display:flex;align-items:center;gap:.6rem;font-family:var(--mono);font-weight:700;
+  font-size:1rem;letter-spacing:-0.02em;position:relative;cursor:pointer;
+  transition:color .2s,opacity .2s}
+.brand-glyph{width:22px;height:22px;color:var(--accent);flex-shrink:0;overflow:visible;
+  transition:color .2s,transform .25s var(--ease)}
+.brand:hover .brand-glyph{transform:scale(1.12)}
+.brand-glyph .bg-core{fill:var(--accent);transition:fill .2s}
+.brand-glyph .bg-line,.brand-glyph .bg-snag,.brand-glyph .bg-snag-sub{stroke:var(--accent);transition:stroke .2s}
+.brand i{width:7px;height:7px;border-radius:50%;background:var(--accent);
+  transition:background .2s,opacity .2s}
+.nav-r{display:flex;align-items:center;gap:clamp(1rem,2.2vw,2.1rem)}
+.nav-r a.nl{font-family:var(--mono);font-size:.75rem;letter-spacing:.04em;text-transform:uppercase;
+  color:var(--ink-2);position:relative;padding:.2rem 0}
+.nav-r a.nl::after{content:'';position:absolute;left:0;bottom:0;width:100%;height:1px;
+  background:currentColor;transform:scaleX(0);transform-origin:0 50%;transition:transform .45s var(--ease)}
+.nav-r a.nl:hover{color:var(--ink)}
+.nav-r a.nl:hover::after{transform:scaleX(1)}
+.nav-r a.nl i{color:var(--ink-3);margin-right:.35rem}
+.ghub{font-family:var(--mono);font-size:.74rem;font-weight:500;letter-spacing:.02em;
+  padding:.38rem .75rem;border-radius:100px;background:var(--surface);border:1px solid var(--line-2);
+  color:var(--ink);display:inline-flex;align-items:center;gap:.45rem;
+  transition:border-color .3s,background .3s,transform .25s var(--ease),box-shadow .3s;
+  box-shadow:0 2px 10px rgba(0,0,0,.2)}
+.ghub:hover{border-color:var(--accent);background:var(--elevated);color:#ffffff;transform:translateY(-2px);
+  box-shadow:0 4px 18px var(--accent-dim)}
+.ghub-icon{flex-shrink:0;opacity:.9}
+.ghub-sep{color:var(--line-2);user-select:none;font-size:.68rem}
+.ghub-star{display:inline-flex;align-items:center;gap:.25rem;color:var(--amber);font-weight:600}
+.ghub-star svg{flex-shrink:0;fill:var(--amber)}
+.gh-stars-count{color:var(--ink);font-variant-numeric:tabular-nums}
+.ghub:hover .gh-stars-count{color:#ffffff}
+.ghub-tag{font-size:.62rem;letter-spacing:.04em;padding:.15rem .45rem;border-radius:999px;
+  background:var(--accent-dim);color:var(--accent);border:1px solid var(--line-2);
+  font-weight:600;line-height:1;display:inline-block;transition:background .2s,border-color .2s}
+.ghub:hover .ghub-tag{background:var(--accent-dim);border-color:var(--accent)}
+[data-theme="light"] .ghub{background:var(--surface);border-color:var(--line-2);color:var(--ink);box-shadow:0 2px 8px rgba(0,0,0,.06)}
+[data-theme="light"] .ghub:hover{border-color:var(--accent);background:#ffffff;color:var(--ink)}
+[data-theme="light"] .ghub-tag{background:var(--accent-dim);color:var(--accent);border-color:rgba(14,116,144,.3)}
+@media(max-width:680px){.ghub-tag{display:none}}
+@media(max-width:480px){.ghub-sep,.ghub-label{display:none}}
+.tt{width:34px;height:34px;border-radius:50%;border:1px solid var(--line);background:transparent;
+  color:var(--ink-2);display:grid;place-items:center;transition:all .3s var(--ease)}
+.tt:hover{border-color:var(--line-2);color:var(--ink);transform:rotate(35deg)}
+
+/* ═══════════════ HERO ═══════════════ */
+.hero{position:relative;min-height:100svh;display:flex;flex-direction:column;
+  justify-content:center;padding:7rem var(--pad) 5.5rem;overflow:hidden}
+.hero-bg{position:absolute;inset:0;pointer-events:none;z-index:0}
+.hero-bg .orb{position:absolute;top:38%;left:50%;width:min(1250px,150vw);height:min(880px,110vh);
+  transform:translate(-50%,-50%);border-radius:50%;
+  background:radial-gradient(ellipse at center,var(--accent-dim) 0%,transparent 62%)}
+.hero-bg .mesh{position:absolute;inset:0;opacity:.5;
+  background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:clamp(48px,7vw,90px) clamp(48px,7vw,90px);
+  mask-image:radial-gradient(ellipse 62% 58% at 50% 45%,#000 20%,transparent 72%);
+  -webkit-mask-image:radial-gradient(ellipse 62% 58% at 50% 45%,#000 20%,transparent 72%)}
+.hero-in{position:relative;z-index:1;width:100%;max-width:1500px;margin:0 auto;will-change:transform,opacity}
+.eyebrow{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem;max-width:100%;
+  font-family:var(--mono);font-size:clamp(.63rem,1.7vw,.72rem);
+  letter-spacing:.11em;text-transform:uppercase;color:var(--ink-2);margin-bottom:clamp(1.5rem,4vh,3rem);
+  padding-bottom:1.1rem;border-bottom:1px solid var(--line);width:fit-content;max-width:100%}
+.eyebrow b{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 12px var(--accent-glow)}
+.eyebrow s{text-decoration:none;color:var(--ink-3)}
+/* The hero title is the page's loudest register and now reads as one: it steps
+   well above the section titles below, which in turn step above body copy. The
+   accent line keeps the gradient orb from the stripped version but lands it
+   behind a hairline rule that anchors the composition. */
+h1.kinetic{font-size:clamp(2.6rem,8.4vw,7.5rem);line-height:.92;letter-spacing:-0.05em;
+  text-transform:uppercase;margin-bottom:clamp(1.75rem,4vh,2.75rem)}
+h1.kinetic .ln{display:block}
+h1.kinetic .ln.pad{padding-left:clamp(0px,8vw,10rem)}
+h1.kinetic em{font-style:normal;color:var(--accent)}
+h1.kinetic .thin{font-weight:400;font-family:var(--display);letter-spacing:-0.04em;
+  text-transform:none;font-size:.42em;color:var(--ink-2);display:inline-block;
+  vertical-align:baseline;padding-left:.15em}
+.hero-foot{display:flex;flex-wrap:wrap;gap:clamp(1.5rem,4vw,4rem);align-items:flex-end;
+  justify-content:space-between;border-top:1px solid var(--line);padding-top:1.75rem}
+.hero-foot p{font-size:clamp(.95rem,1.35vw,1.12rem);color:var(--ink-2);max-width:min(44ch,100%);line-height:1.65}
+.hero-cta{display:flex;flex-wrap:wrap;gap:.7rem;align-items:center}
+.btn{display:inline-flex;align-items:center;gap:.55rem;padding:.9rem 1.6rem;border-radius:100px;
+  font-family:var(--mono);font-size:.8rem;font-weight:500;letter-spacing:.02em;border:1px solid transparent;
+  transition:transform .35s var(--ease),background .3s,color .3s,border-color .3s;white-space:nowrap}
+.btn-fill{background:var(--ink);color:var(--bg)}
+.btn-fill:hover{transform:translateY(-3px)}
+.btn-ghost{border-color:var(--line-2);color:var(--ink-2)}
+.btn-ghost:hover{border-color:var(--ink);color:var(--ink);transform:translateY(-3px)}
+.copyable{display:inline-flex;align-items:center;gap:.7rem;padding:.9rem 1.35rem;border-radius:100px;
+  border:1px solid var(--line);background:var(--surface);font-family:var(--mono);font-size:.8rem;
+  color:var(--ink-2);transition:border-color .3s,transform .35s var(--ease)}
+.copyable:hover{border-color:var(--line-2);transform:translateY(-3px)}
+.copyable .p{color:var(--accent)}
+.copyable .c{color:var(--ink)}
+.copyable .hint{font-size:.66rem;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+.scroll-cue{position:absolute;left:50%;bottom:1.5rem;transform:translateX(-50%);z-index:2;
+  font-family:var(--mono);font-size:.62rem;letter-spacing:.22em;text-transform:uppercase;
+  color:var(--ink-3);display:flex;flex-direction:column;align-items:center;gap:.6rem}
+.scroll-cue i{display:block;width:1px;height:38px;background:linear-gradient(var(--ink-3),transparent)}
+
+/* ═══════════════ MARQUEE (static band) ═══════════════ */
+.marquee{border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+  padding:1.1rem var(--pad);background:var(--surface);display:flex;justify-content:center;flex-wrap:wrap;gap:2.5rem}
+.marquee span{font-family:var(--mono);font-size:.78rem;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--ink-2);white-space:nowrap;display:flex;align-items:center;gap:2.5rem}
+.marquee span::after{content:'';width:5px;height:5px;border-radius:50%;background:var(--accent);opacity:.55}
+
+/* ═══════════════ SECTION FRAME ═══════════════ */
+section{padding:clamp(5rem,13vh,10rem) var(--pad);max-width:1500px;margin:0 auto;position:relative}
+/* Alternating depth gives the page a rhythm the flat restyle lost: adjacent
+   sections never share a surface, so the eye can tell where one ends. */
+section:nth-of-type(even){background:var(--surface)}
+section::before{content:'';position:absolute;top:0;left:var(--pad);right:var(--pad);
+  height:1px;background:linear-gradient(90deg,transparent,var(--line-2) 18%,var(--line-2) 82%,transparent)}
+.shead{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);gap:clamp(1.5rem,5vw,5rem);
+  align-items:end;margin-bottom:clamp(2.5rem,7vh,5rem)}
+.slabel{font-family:var(--mono);font-size:.7rem;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--accent);display:flex;align-items:center;gap:.7rem;margin-bottom:1.25rem}
+.slabel::before{content:'';width:clamp(18px,3vw,44px);height:1px;background:currentColor}
+/* The title scale is the page's primary hierarchy lever. It now steps clearly
+   above body copy and below the hero, so a scrolling reader gets three
+   registers instead of one undifferentiated grey mass. */
+h2.stitle{font-size:clamp(2.05rem,4.6vw,3.85rem);line-height:1.0;text-transform:uppercase;letter-spacing:-0.035em}
+h2.stitle em{font-style:normal;color:var(--ink-3)}
+.sdesc{font-size:clamp(.97rem,1.25vw,1.1rem);color:var(--ink-2);line-height:1.72;max-width:54ch}
+
+/* split-text reveal */
+.sw{display:inline-block;overflow:hidden;vertical-align:top;padding-bottom:.14em;margin-bottom:-.14em}
+.swi{display:inline-block;transform:translateY(112%);transition:transform .95s var(--ease)}
+.is-in .swi{transform:translateY(0)}
+.rv{transition:opacity .9s var(--ease),transform .9s var(--ease)}
+.js .rv{opacity:0;transform:translateY(30px)}
+.js .rv.is-in{opacity:1;transform:none}
+.rv.d1{transition-delay:.09s}.rv.d2{transition-delay:.18s}.rv.d3{transition-delay:.27s}.rv.d4{transition-delay:.36s}
+
+/* ═══════════════ LIVE (terminal + canvas) ═══════════════ */
+.live{display:grid;grid-template-columns:1.06fr .94fr;gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:0 30px 90px -30px rgba(0,0,0,.6)}
+.panel{background:var(--surface);display:flex;flex-direction:column;min-width:0}
+.panel-bar{display:flex;align-items:center;gap:.5rem;padding:.8rem 1.1rem;border-bottom:1px solid var(--line);
+  background:var(--elevated);flex-shrink:0}
+.panel-bar .d{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.panel-bar .d.r{background:#ff5f57}.panel-bar .d.y{background:#febc2e}.panel-bar .d.g{background:#28c840}
+.panel-bar h4{font-family:var(--mono);font-size:.7rem;font-weight:500;letter-spacing:.05em;
+  color:var(--ink-3);margin-left:.5rem;text-transform:uppercase}
+.panel-bar .badge{margin-left:auto;font-family:var(--mono);font-size:.62rem;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--green);display:flex;align-items:center;gap:.35rem}
+.panel-bar .badge i{width:5px;height:5px;border-radius:50%;background:var(--green);animation:beat 1.6s infinite}
+@keyframes beat{0%,100%{opacity:1}50%{opacity:.4}}
+.term-tabs{display:flex;align-items:center;gap:.4rem;padding:.45rem 1rem;background:var(--surface);
+  border-bottom:1px solid var(--line);flex-wrap:wrap;user-select:none}
+.term-tabs-label{font-family:var(--mono);font-size:.6rem;letter-spacing:.1em;color:var(--ink-3);font-weight:600;margin-right:.15rem}
+.term-tab{font-family:var(--mono);font-size:.64rem;letter-spacing:.02em;padding:.2rem .55rem;border-radius:6px;
+  background:var(--elevated);border:1px solid var(--line);color:var(--ink-2);cursor:pointer;
+  display:inline-flex;align-items:center;gap:.25rem;transition:all .2s var(--ease)}
+.term-tab .t-cmd-prefix{color:var(--accent);opacity:.75;font-weight:700}
+.term-tab:hover{border-color:var(--line-2);color:var(--ink);background:var(--elevated)}
+.term-tab.active{border-color:var(--accent);background:var(--accent-dim);color:var(--accent)}
+.term-tab.active .t-cmd-prefix{opacity:1}
+.term-tab-ghost{margin-left:auto;color:var(--ink-3);border-color:transparent;background:transparent}
+.term-tab-ghost:hover{color:var(--ink);border-color:var(--line);background:var(--elevated)}
+.term{padding:1rem 1.15rem;font-family:var(--mono);font-size:clamp(.66rem,.83vw,.78rem);line-height:1.85;
+  height:375px;display:flex;flex-direction:column;min-width:0;outline:none;position:relative}
+.term:focus-within{box-shadow:inset 0 0 0 1px var(--accent-dim)}
+.term-body{flex:1;overflow-y:auto;overflow-x:hidden;scroll-behavior:smooth;padding-right:.35rem;margin-bottom:.55rem}
+.term-body::-webkit-scrollbar{width:4px}
+.term-body::-webkit-scrollbar-track{background:transparent}
+.term-body::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:4px}
+.term-prompt-row{display:flex;align-items:center;gap:.45rem;padding:.42rem .7rem;border-radius:8px;
+  background:var(--elevated);border:1px solid var(--line);font-family:var(--mono);flex-shrink:0;transition:border-color .2s,box-shadow .2s}
+.term-prompt-row:focus-within{border-color:var(--accent)}
+.t-prompt-symbol{color:var(--accent);font-weight:700;font-size:.78rem;user-select:none}
+.t-prompt-cli{color:var(--ink-2);font-size:.72rem;font-weight:500;user-select:none}
+.term-input{background:transparent;border:none;outline:none;color:var(--ink);font-family:var(--mono);
+  font-size:clamp(.66rem,.83vw,.78rem);flex:1;min-width:60px;caret-color:var(--accent)}
+.term-input::placeholder{color:var(--ink-3);opacity:.65}
+.term-run-btn{background:transparent;border:1px solid var(--line);border-radius:4px;color:var(--ink-3);
+  width:22px;height:22px;display:grid;place-items:center;cursor:pointer;font-family:var(--mono);font-size:.75rem;
+  transition:all .2s;flex-shrink:0}
+.term-run-btn:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-dim)}
+.tl{opacity:0;transform:translateY(3px);animation:tin .35s var(--ease) forwards;white-space:nowrap}
+@keyframes tin{to{opacity:1;transform:none}}
+.tl .ts{color:var(--ink-3)}.tl .ok{color:var(--green)}.tl .wa{color:var(--amber)}
+.tl .er{color:var(--red)}.tl .dm{color:var(--ink-3)}.tl .ac{color:var(--accent)}
+.tl .vi{color:var(--violet)}.tl .hl{color:#ffffff;font-weight:600}
+.tl.cmd-echo{color:var(--ink);font-weight:600;padding:.2rem 0;border-bottom:1px dashed var(--line);margin-bottom:.3rem}
+.tl.cmd-echo .ac{color:var(--accent)}
+[data-theme="light"] .term-prompt-row{background:var(--surface);border-color:var(--line-2)}
+[data-theme="light"] .term-tab{background:var(--surface);border-color:var(--line-2)}
+[data-theme="light"] .term-tab:hover{background:var(--elevated)}
+[data-theme="light"] .term-tab.active{background:var(--accent-dim);border-color:var(--accent);color:var(--accent)}
+[data-theme="light"] .tl .hl{color:var(--ink)}
+.cv-wrap{padding:1.15rem;flex:1;display:flex;flex-direction:column;gap:.9rem;height:375px;min-height:330px}
+.cv-legend{display:flex;flex-wrap:wrap;gap:1.1rem;font-family:var(--mono);font-size:.63rem;
+  letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3)}
+.cv-legend b{display:inline-flex;align-items:center;gap:.4rem;font-weight:400}
+.cv-legend b::before{content:'';width:14px;height:2px;border-radius:2px;background:currentColor}
+.cv-legend .s{color:var(--accent)}.cv-legend .m{color:var(--ink-2)}.cv-legend .a{color:var(--red)}
+canvas#sig{width:100%;flex:1;min-height:190px;display:block}
+.cv-read{display:flex;justify-content:space-between;gap:1rem;font-family:var(--mono);font-size:.66rem;
+  letter-spacing:.05em;color:var(--ink-3);border-top:1px solid var(--line);padding-top:.8rem}
+.cv-read b{color:var(--ink);font-weight:500}
+.cv-read .fire{color:var(--red)}
+
+/* ═══════════════ STATS ═══════════════ */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);
+  border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.st{background:var(--surface);padding:clamp(1.5rem,4vw,2.75rem) clamp(1rem,2vw,1.75rem);
+  transition:background .4s}
+.st:hover{background:var(--elevated)}
+.st .n{font-family:var(--display);font-size:clamp(2rem,5.4vw,4.4rem);font-weight:700;
+  letter-spacing:-0.05em;line-height:.92;font-variant-numeric:tabular-nums}
+.st .n u{text-decoration:none;font-size:.32em;color:var(--accent);letter-spacing:0;
+  font-family:var(--mono);font-weight:500;padding-left:.25em;vertical-align:baseline}
+.st .l{font-family:var(--mono);font-size:.66rem;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--ink-3);margin-top:.75rem}
+
+/* ═══════════════ HOW IT WORKS ANIMATION VIDEO/SIMULATION ═══════════════ */
+.flow-anim-wrap{margin-bottom:clamp(3.5rem,7vw,5rem);border:1px solid var(--line);border-radius:16px;
+  background:var(--surface);overflow:hidden;box-shadow:0 30px 80px -25px rgba(0,0,0,.6)}
+.flow-anim-bar{display:flex;align-items:center;justify-content:space-between;padding:.85rem 1.25rem;
+  background:var(--elevated);border-bottom:1px solid var(--line);gap:1rem;flex-wrap:wrap}
+.flow-anim-title{display:flex;align-items:center;gap:.65rem;font-family:var(--mono);font-size:.7rem;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--ink-2)}
+.flow-anim-title .live-dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:beat 1.8s infinite}
+
+.flow-stage{padding:clamp(1.5rem,3.2vw,2.5rem);display:grid;grid-template-columns:1fr 1.35fr 1fr;
+  gap:clamp(1rem,2vw,2rem);align-items:stretch;position:relative}
+@media(max-width:980px){.flow-stage{grid-template-columns:1fr;gap:2.2rem}}
+
+.flow-col{display:flex;flex-direction:column;gap:.9rem}
+.flow-col-tag{font-family:var(--mono);font-size:.64rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);display:flex;align-items:center;gap:.5rem}
+.flow-col-tag.hl{color:var(--accent)}
+
+.flow-card{background:var(--elevated);border:1px solid var(--line);border-radius:12px;padding:1.15rem;display:flex;flex-direction:column;gap:.9rem;flex:1;position:relative;transition:border-color .3s,box-shadow .3s}
+.flow-card.firing{border-color:var(--red)}
+
+.agent-box{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:.85rem;display:flex;flex-direction:column;gap:.45rem}
+.agent-step-tag{font-family:var(--mono);font-size:.62rem;letter-spacing:.06em;color:var(--ink-3);text-transform:uppercase}
+.agent-call{font-family:var(--mono);font-size:.85rem;font-weight:700;color:var(--accent);word-break:break-all}
+.agent-call.err{color:var(--red)}
+.agent-meta{display:flex;align-items:center;justify-content:space-between;gap:.5rem;font-family:var(--mono);font-size:.66rem;color:var(--ink-2);margin-top:.3rem;border-top:1px solid var(--line);padding-top:.45rem}
+.agent-pill{padding:.15rem .45rem;border-radius:4px;font-weight:500}
+.agent-pill.ok{background:var(--green-dim);color:var(--green)}
+.agent-pill.warn{background:var(--amber-dim);color:var(--amber)}
+.agent-pill.alarm{background:var(--red-dim);color:var(--red)}
+
+.core-header{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:.65rem}
+.core-title{font-family:var(--mono);font-size:.72rem;font-weight:700;letter-spacing:.06em;color:var(--ink)}
+.core-badge{font-family:var(--mono);font-size:.6rem;padding:.15rem .45rem;border-radius:100px;background:var(--accent-dim);color:var(--accent);letter-spacing:.04em}
+
+.detectors-list{display:flex;flex-direction:column;gap:.55rem}
+.det-item{background:var(--surface);border:1px solid var(--line);border-radius:7px;padding:.55rem .75rem;transition:border-color .25s,background .25s}
+.det-item.fired{border-color:var(--red);background:rgba(244,63,94,0.06)}
+.det-item.warning{border-color:var(--amber);background:rgba(251,191,36,0.05)}
+.det-row{display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:.66rem;margin-bottom:.35rem}
+.det-name{color:var(--ink-2)}
+.det-val{font-weight:500;color:var(--ink)}
+.det-item.fired .det-val{color:var(--red)}
+.det-item.warning .det-val{color:var(--amber)}
+.det-bar{height:3px;background:var(--line);border-radius:99px;overflow:hidden}
+.det-fill{height:100%;width:0;background:var(--accent);border-radius:99px;transition:width .35s var(--ease),background .35s}
+.det-item.fired .det-fill{background:var(--red)}
+.det-item.warning .det-fill{background:var(--amber)}
+
+.risk-box{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:.75rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.risk-left{display:flex;flex-direction:column;gap:.2rem}
+.risk-lbl{font-family:var(--mono);font-size:.6rem;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3)}
+.risk-sub{font-family:var(--mono);font-size:.64rem;color:var(--green);transition:color .3s}
+.risk-sub.fired{color:var(--red)}
+.risk-sub.warn{color:var(--amber)}
+.risk-score{font-family:var(--mono);font-size:1.35rem;font-weight:700;color:var(--green);transition:color .3s}
+.risk-score.fired{color:var(--red)}
+.risk-score.warn{color:var(--amber)}
+
+.outcome-box{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:.85rem;display:flex;flex-direction:column;gap:.45rem}
+.outcome-lbl{font-family:var(--mono);font-size:.6rem;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3)}
+.directive-val{font-family:var(--mono);font-size:.95rem;font-weight:700;letter-spacing:.04em;color:var(--green);transition:color .3s}
+.directive-val.halt{color:var(--red);animation:pulseHalt 1s infinite}
+@keyframes pulseHalt{0%,100%{opacity:1}50%{opacity:.65}}
+.directive-sub{font-size:.76rem;color:var(--ink-2);line-height:1.4}
+
+.sinks-list{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.3rem}
+.sink-pill{font-family:var(--mono);font-size:.63rem;padding:.25rem .6rem;border-radius:4px;border:1px solid var(--line);color:var(--ink-3);background:var(--surface);transition:all .3s}
+.sink-pill.fired{border-color:var(--accent);color:var(--accent);background:var(--accent-dim)}
+.sink-pill.fired-red{border-color:var(--red);color:var(--red);background:var(--red-dim)}
+
+.flow-timeline{padding:.9rem 1.25rem;border-top:1px solid var(--line);background:var(--elevated);display:flex;flex-direction:column;gap:.6rem}
+.timeline-head{display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:.64rem;color:var(--ink-3);letter-spacing:.08em}
+.timeline-bar{display:grid;grid-template-columns:repeat(5,1fr);gap:.5rem}
+@media(max-width:760px){.timeline-bar{grid-template-columns:1fr;gap:.35rem}}
+.time-step-btn{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:.5rem .6rem;cursor:pointer;display:flex;flex-direction:column;gap:.2rem;text-align:left;transition:all .2s}
+.time-step-btn:hover{border-color:var(--line-2)}
+.time-step-btn.active{border-color:var(--accent);background:var(--accent-dim)}
+.time-step-btn.active-err{border-color:var(--red);background:rgba(244,63,94,0.08)}
+.time-step-idx{font-family:var(--mono);font-size:.58rem;color:var(--ink-3);letter-spacing:.06em}
+.time-step-name{font-family:var(--mono);font-size:.68rem;font-weight:500;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.time-step-btn.active .time-step-name{color:var(--accent)}
+.time-step-btn.active-err .time-step-name{color:var(--red)}
+
+.flow-ticker{padding:.65rem 1.25rem;background:var(--surface);border-top:1px solid var(--line);font-family:var(--mono);font-size:.68rem;color:var(--ink-2);display:flex;align-items:center;gap:.6rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.flow-ticker .tag{color:var(--accent);font-weight:700}
+
+/* ═══════════════ STEPS (how it works) ═══════════════ */
+.steps{border-top:1px solid var(--line)}
+.step{display:grid;grid-template-columns:clamp(3rem,7vw,7rem) minmax(0,1fr) minmax(0,1.25fr);
+  gap:clamp(1rem,3.5vw,3rem);padding:clamp(1.75rem,4.5vw,3rem) 0;border-bottom:1px solid var(--line);
+  align-items:start;transition:background .45s}
+.step:hover{background:var(--surface)}
+.step .idx{font-family:var(--mono);font-size:.75rem;letter-spacing:.08em;color:var(--ink-3);padding-top:.3rem}
+.step h3{font-size:clamp(1.15rem,2.2vw,1.85rem);letter-spacing:-0.03em;line-height:1.05}
+.step .body{display:flex;flex-direction:column;gap:1rem}
+.step p{font-size:.94rem;color:var(--ink-2);line-height:1.7;max-width:56ch}
+.chip{display:inline-flex;align-items:center;gap:.45rem;font-family:var(--mono);font-size:.64rem;
+  letter-spacing:.08em;text-transform:uppercase;padding:.3rem .6rem;border-radius:100px;
+  border:1px solid var(--line);color:var(--ink-3);width:fit-content}
+.snip{font-family:var(--mono);font-size:clamp(.66rem,.85vw,.76rem);line-height:1.85;
+  background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:.9rem 1.1rem;
+  overflow-x:auto;color:var(--ink-2)}
+.step:hover .snip{border-color:var(--line-2)}
+.kw{color:var(--accent)}.str{color:var(--green)}.cmt{color:var(--ink-3)}
+.num{color:var(--amber)}.fn{color:var(--violet)}.op{color:var(--ink-3)}
+
+/* ═══════════════ DETECTOR TRACK (horizontal swipe) ═══════════════ */
+.track-wrap{position:relative;padding:clamp(3.5rem,8vh,6rem) 0;max-width:100%;margin:0 auto}
+.track-sticky{position:static;height:auto;overflow:visible;display:flex;flex-direction:column}
+.track-head{padding:0 var(--pad);max-width:1500px;margin:0 auto 2rem;width:100%;display:flex;align-items:flex-end;justify-content:space-between;gap:1.5rem}
+.track-arrows{display:flex;gap:.6rem;align-items:center}
+.track-btn{width:40px;height:40px;border-radius:50%;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-family:var(--mono);font-size:1.1rem;line-height:1;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;transition:border-color .3s,background .3s,transform .2s var(--ease),color .3s}
+.track-btn:hover{border-color:var(--line-2);background:var(--elevated);color:var(--accent);transform:translateY(-2px)}
+.track-btn:active{transform:translateY(0)}
+.track-rail{display:flex;gap:clamp(1.2rem,2.2vw,2.25rem);padding:.5rem var(--pad) 1.5rem;overflow-x:auto;overflow-y:hidden;scroll-behavior:smooth;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;cursor:grab;scrollbar-width:thin;scrollbar-color:var(--line-2) transparent}
+.track-rail.is-dragging{cursor:grabbing;scroll-snap-type:none;scroll-behavior:auto;user-select:none}
+.track-rail::-webkit-scrollbar{height:6px}
+.track-rail::-webkit-scrollbar-track{background:transparent}
+.track-rail::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:999px}
+.track-rail::-webkit-scrollbar-thumb:hover{background:var(--ink-3)}
+.dcard{flex:0 0 clamp(320px,42vw,470px);scroll-snap-align:start;background:var(--surface);border:1px solid var(--line);
+  border-radius:14px;padding:clamp(1.4rem,2.6vw,2.1rem);display:flex;flex-direction:column;
+  gap:1rem;min-height:min(52vh,410px);transition:border-color .4s,transform .4s var(--ease)}
+.dcard:hover{border-color:var(--line-2);transform:translateY(-4px)}
+.dcard .top{display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.dcard .no{font-family:var(--mono);font-size:.68rem;letter-spacing:.1em;color:var(--ink-3)}
+.tag{font-family:var(--mono);font-size:.63rem;letter-spacing:.07em;padding:.28rem .6rem;
+  border-radius:100px;font-weight:500}
+.tag.loop{background:var(--accent-dim);color:var(--accent)}
+.tag.casc{background:var(--red-dim);color:var(--red)}
+.tag.lat{background:var(--amber-dim);color:var(--amber)}
+.tag.drift{background:var(--violet-dim);color:var(--violet)}
+.tag.ml{background:var(--green-dim);color:var(--green)}
+.tag.stag{background:var(--violet-dim);color:var(--violet)}
+.tag.tok{background:var(--amber-dim);color:var(--amber)}
+.tag.melt{background:var(--red-dim);color:var(--red)}
+.tag.abort{background:var(--accent-dim);color:var(--accent)}
+.tag.guard{background:var(--green-dim);color:var(--green)}
+.tag.compact{background:var(--violet-dim);color:var(--violet)}
+.tag.core{background:var(--green-dim);color:var(--green)}
+.tag.opt{background:var(--amber-dim);color:var(--amber)}
+.dcard h3{font-size:clamp(1.2rem,2vw,1.6rem);letter-spacing:-0.03em;line-height:1.05}
+.dcard p{font-size:.9rem;color:var(--ink-2);line-height:1.7}
+.dcard .algo{margin-top:auto;padding-top:1.1rem;border-top:1px solid var(--line);
+  font-family:var(--mono);font-size:.68rem;letter-spacing:.02em;color:var(--ink-3);line-height:1.6}
+.track-note{padding:1.2rem var(--pad) 0;max-width:1500px;margin:0 auto;width:100%;
+  font-family:var(--mono);font-size:.65rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);
+  display:flex;align-items:center;gap:.7rem}
+.track-note b{flex:1;height:1px;background:var(--line);max-width:180px}
+
+/* ═══════════════ CODE PAIR ═══════════════ */
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:clamp(1rem,2.5vw,2rem)}
+.code{background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden;
+  transition:border-color .4s,transform .5s var(--ease);display:flex;flex-direction:column}
+.code:hover{border-color:var(--line-2);transform:translateY(-5px)}
+.code-h{display:flex;align-items:center;justify-content:space-between;padding:.75rem 1.1rem;
+  background:var(--elevated);border-bottom:1px solid var(--line)}
+.code-h .f{font-family:var(--mono);font-size:.7rem;color:var(--ink-3)}
+.code-h .g{font-family:var(--mono);font-size:.62rem;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--accent);background:var(--accent-dim);padding:.2rem .55rem;border-radius:100px}
+.code .cap{padding:1.1rem 1.1rem 0}
+.code .cap h3{font-size:1.02rem;letter-spacing:-0.02em;margin-bottom:.5rem}
+.code .cap p{font-size:.87rem;color:var(--ink-2);line-height:1.65}
+.code pre{padding:1.1rem;font-family:var(--mono);font-size:clamp(.66rem,.85vw,.76rem);
+  line-height:1.9;overflow-x:auto;color:var(--ink-2);margin-top:auto}
+
+/* ═══════════════ FEATURE / SINK GRID ═══════════════ */
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.cell{background:var(--surface);padding:clamp(1.35rem,2.6vw,2rem);display:flex;flex-direction:column;
+  gap:.7rem;transition:background .4s}
+.cell:hover{background:var(--elevated)}
+.cell .ic{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;font-family:var(--mono);
+  font-size:.85rem;font-weight:700;flex-shrink:0;margin-bottom:.3rem}
+.ic.cy{background:var(--accent-dim);color:var(--accent)}.ic.gr{background:var(--green-dim);color:var(--green)}
+.ic.am{background:var(--amber-dim);color:var(--amber)}.ic.rd{background:var(--red-dim);color:var(--red)}
+.ic.vi{background:var(--violet-dim);color:var(--violet)}
+.cell h3{font-family:var(--mono);font-size:.9rem;font-weight:600;letter-spacing:-0.01em}
+.cell p{font-size:.87rem;color:var(--ink-2);line-height:1.65}
+.cell code{font-family:var(--mono);font-size:.72rem;color:var(--accent)}
+
+/* ═══════════════ ROWS (integrations) ═══════════════ */
+.rows{border-top:1px solid var(--line)}
+.rgroup{font-family:var(--mono);font-size:.66rem;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--ink-3);padding:1.6rem 0 .7rem}
+.row{display:grid;grid-template-columns:clamp(2.5rem,5vw,4.5rem) minmax(0,1.1fr) minmax(0,1.5fr) clamp(7rem,12vw,11.5rem);
+  gap:clamp(.75rem,2.5vw,2rem);align-items:center;padding:clamp(1rem,2.2vw,1.4rem) 0;
+  border-bottom:1px solid var(--line);position:relative;transition:padding .4s var(--ease)}
+.row::before{content:'';position:absolute;inset:0 calc(var(--pad) * -0.4);background:var(--surface);
+  opacity:0;transition:opacity .4s;z-index:-1;border-radius:8px}
+.row:hover::before{opacity:1}
+.row:hover{padding-left:.6rem}
+.row .no{font-family:var(--mono);font-size:.7rem;color:var(--ink-3)}
+.row .nm{display:flex;align-items:center;gap:.7rem;font-family:var(--display);font-weight:500;
+  font-size:clamp(1rem,1.7vw,1.35rem);letter-spacing:-0.025em}
+.row .nm i{width:5px;height:5px;border-radius:50%;background:var(--ink-3);flex-shrink:0;
+  transition:background .35s,box-shadow .35s}
+.row:hover .nm i{background:var(--accent)}
+.row .ds{font-size:.87rem;color:var(--ink-2);line-height:1.6}
+.row .mt{font-family:var(--mono);font-size:.66rem;letter-spacing:.05em;color:var(--ink-3);
+  white-space:nowrap;text-align:right}
+.row .mt.ship{color:var(--green)}
+
+/* ═══════════════ EVIDENCE ═══════════════ */
+.ev{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.evc{background:var(--surface);padding:clamp(1.6rem,3vw,2.5rem);display:flex;flex-direction:column;gap:1rem;
+  transition:background .4s,transform .4s var(--ease);position:relative}
+.evc::before{content:'';position:absolute;left:0;top:0;bottom:0;width:2px;
+  background:linear-gradient(var(--accent),transparent);opacity:0;transition:opacity .4s}
+.evc:hover{background:var(--elevated)}
+.evc:hover::before{opacity:1}
+.evc .lb{font-family:var(--mono);font-size:.66rem;letter-spacing:.11em;text-transform:uppercase;color:var(--accent);
+  display:flex;align-items:center;gap:.6rem}
+.evc .lb::after{content:'';flex:1;height:1px;background:var(--line)}
+.evc q{font-size:clamp(.95rem,1.25vw,1.08rem);color:var(--ink);line-height:1.65;quotes:none;
+  font-family:var(--display);font-weight:400;letter-spacing:-0.015em}
+.evc .src{font-family:var(--mono);font-size:.68rem;color:var(--ink-3);margin-top:auto;
+  padding-top:.9rem;border-top:1px solid var(--line);line-height:1.6}
+
+/* ═══════════════ ROADMAP ═══════════════ */
+.rm{display:grid;grid-template-columns:repeat(2,1fr);column-gap:clamp(1.5rem,4vw,4rem);
+  border-top:1px solid var(--line)}
+.rmi{display:flex;align-items:center;gap:.9rem;padding:.95rem 0;border-bottom:1px solid var(--line);
+  font-family:var(--mono);font-size:.8rem;color:var(--ink-2);transition:color .3s,background .3s;
+  padding-left:.6rem;margin-left:-.6rem;border-radius:8px}
+.rmi:hover{color:var(--ink);background:var(--elevated)}
+.rmi .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:var(--green);
+  box-shadow:0 0 10px var(--green-dim)}
+.rmi .dot.part{background:var(--amber);box-shadow:0 0 10px var(--amber-dim)}
+.rmi .ph{color:var(--ink-3);font-size:.7rem;min-width:1.8rem}
+.rmi .tx{flex:1}
+.rmi .tx b{color:var(--ink);font-weight:500}
+.rmi .st2{font-size:.65rem;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+
+/* ═══════════════ CTA + FOOTER ═══════════════ */
+.cta{position:relative;text-align:center;padding:clamp(6rem,16vh,12rem) var(--pad);overflow:hidden;
+  border-top:1px solid var(--line)}
+.cta h2{position:relative;font-size:clamp(1.9rem,5.5vw,4rem);line-height:.98;text-transform:uppercase;
+  letter-spacing:-0.045em;margin-bottom:1.35rem}
+.cta p{position:relative;color:var(--ink-2);font-size:1.02rem;margin-bottom:2.5rem}
+.cta-row{position:relative;display:flex;gap:.7rem;justify-content:center;flex-wrap:wrap}
+footer{border-top:1px solid var(--line);padding:2.75rem var(--pad);max-width:1500px;margin:0 auto;
+  display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1.5rem}
+.f-l{font-family:var(--mono);font-size:.72rem;color:var(--ink-3);letter-spacing:.04em}
+.f-r{display:flex;gap:clamp(1rem,2.5vw,2rem);flex-wrap:wrap}
+.f-r a{font-family:var(--mono);font-size:.72rem;color:var(--ink-3);letter-spacing:.04em;
+  position:relative;transition:color .3s}
+.f-r a:hover{color:var(--ink)}
+
+/* ═══════════════ RESPONSIVE ═══════════════ */
+@media(max-width:1000px){
+  .live{grid-template-columns:1fr}
+  .shead{grid-template-columns:1fr;align-items:start}
+  .pair{grid-template-columns:1fr}
+  .grid3{grid-template-columns:1fr}
+  .ev{grid-template-columns:1fr}
+  .rm{grid-template-columns:1fr}
+  .step{grid-template-columns:2.5rem 1fr}
+  .step .body{grid-column:1 / -1}
+  .row{grid-template-columns:2.5rem 1fr auto;row-gap:.4rem}
+  .row .ds{grid-column:2 / -1}
+  .nav-r a.nl{display:none}
+}
+@media(max-width:760px){
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .track-sticky{position:static;height:auto;padding:0}
+  .track-rail{padding:0 var(--pad) 1.2rem;gap:1rem}
+  .dcard{flex:0 0 85vw;min-height:360px}
+  .track-arrows{display:none}
+  .track-note{padding-top:.8rem}
+  .hero-foot{flex-direction:column;align-items:stretch}
+  h1.kinetic .ln.pad{padding-left:0}
+}
+
+/* ═══════════════ REDUCED MOTION ═══════════════ */
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.001s !important;animation-iteration-count:1 !important;
+    transition-duration:.001s !important;scroll-behavior:auto !important}
+  .swi{transform:none !important}
+  .rv{opacity:1 !important;transform:none !important}
+}
+</style>
+<script>document.documentElement.classList.add('js');</script>
+</head>
+<body>
+
+<!-- ░░ NAV ░░ -->
+<nav id="nav">
+  <a href="#top" class="brand">
+    <svg class="brand-glyph" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path class="bg-line" d="M2 12h4" stroke-width="2"/>
+      <path class="bg-line" d="M18 12h4" stroke-width="2"/>
+      <path class="bg-snag" d="M6 12c1.8-4.5 4.2-4.5 6 0s4.2 4.5 6 0" stroke-width="2"/>
+      <path class="bg-snag-sub" d="M6 12c1.8 4.5 4.2 4.5 6 0s4.2-4.5 6 0" stroke-width="2" opacity="0.45"/>
+      <circle class="bg-core" cx="12" cy="12" r="2.2" fill="currentColor" stroke="none"/>
+    </svg>
+    <span>SNAGLINE</span>
+  </a>
+  <div class="nav-r">
+    <a href="#how-it-works" class="nl"><i>01</i>How</a>
+    <a href="#detectors" class="nl"><i>02</i>Detectors</a>
+    <a href="#integrations" class="nl"><i>04</i>Integrations</a>
+    <a href="#evidence" class="nl"><i>06</i>Evidence</a>
+    <a href="https://github.com/Cyrax321/SNAGLINE" class="ghub" target="_blank" rel="noopener noreferrer">
+      <svg class="ghub-icon" viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">
+        <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+      </svg>
+      <span class="ghub-label">GitHub</span>
+      <span class="ghub-sep" aria-hidden="true">/</span>
+      <span class="ghub-star">
+        <svg class="star-icon" viewBox="0 0 16 16" width="12" height="12" fill="currentColor" aria-hidden="true">
+          <path d="M8 .25a.75.75 0 01.673.418l1.882 3.815 4.21.612a.75.75 0 01.416 1.279l-3.046 2.97.719 4.192a.75.75 0 01-1.088.791L8 12.347l-3.766 1.98a.75.75 0 01-1.088-.79l.72-4.194L.818 6.374a.75.75 0 01.416-1.28l4.21-.611L7.327.668A.75.75 0 018 .25z"/>
+        </svg>
+        <span id="ghStars" class="gh-stars-count">13</span>
+      </span>
+      <span class="ghub-tag" id="ghVersion">v0.1.0</span>
+    </a>
+    <button class="tt" id="tt" aria-label="Toggle colour theme" title="Toggle colour theme"></button>
+  </div>
+</nav>
+
+<!-- ░░ HERO ░░ -->
+<header class="hero" id="top">
+  <div class="hero-bg" aria-hidden="true"><div class="mesh"></div><div class="orb"></div></div>
+  <div class="hero-in" id="heroIn">
+    <div class="eyebrow rv"><b></b> Open source <s>/</s> Zero dependencies <s>/</s> 1.53&#181;s per step</div>
+    <h1 class="kinetic" data-split>
+      <span class="ln">Catch agent</span>
+      <span class="ln pad">failures before</span>
+      <span class="ln">they <em>cascade.</em></span>
+    </h1>
+    <div class="hero-foot">
+      <p class="rv d1">SNAGLINE watches your agent's execution stream and flags loops, error cascades,
+        latency drift and goal drift in real time. Zero required dependencies. It can never crash or
+        stall the agent it monitors.</p>
+      <div class="hero-cta rv d2">
+        <a href="#install" class="btn btn-fill">Get started →</a>
+        <button class="copyable" data-copy="pip install .">
+          <span class="p">$</span><span class="c">pip install .</span><span class="hint">copy</span>
+        </button>
+      </div>
+    </div>
+  </div>
+  <div class="scroll-cue" aria-hidden="true">scroll<i></i></div>
+</header>
+
+<!-- ░░ MARQUEE (static band) ░░ -->
+<div class="marquee" aria-hidden="true">
+  <span>Loop detection</span><span>Error cascades</span><span>Latency CUSUM</span>
+  <span>Goal drift</span><span>ML ensemble</span><span>Fail-open by construction</span>
+  <span>O(1) per step</span><span>No content retention</span>
+</div>
+
+<!-- ░░ LIVE ░░ -->
+<section style="padding-top:clamp(3.5rem,9vh,6rem)">
+  <div class="live rv">
+    <div class="panel">
+      <div class="panel-bar">
+        <span class="d r"></span><span class="d y"></span><span class="d g"></span>
+        <h4 id="termTitle">snagline watch &middot; ep-001</h4>
+        <span class="badge" id="termBadge"><i></i>live</span>
+      </div>
+      <div class="term-tabs" role="tablist" aria-label="Terminal preset commands">
+        <span class="term-tabs-label">TRY:</span>
+        <button type="button" class="term-tab active" data-cmd="watch" role="tab" aria-selected="true" title="Stream live agent monitoring"><span class="t-cmd-prefix">$</span> watch</button>
+        <button type="button" class="term-tab" data-cmd="replay" role="tab" aria-selected="false" title="Replay failure episode with step intercept"><span class="t-cmd-prefix">$</span> replay</button>
+        <button type="button" class="term-tab" data-cmd="bench" role="tab" aria-selected="false" title="Run 2µs pipeline overhead benchmark"><span class="t-cmd-prefix">$</span> bench</button>
+        <button type="button" class="term-tab" data-cmd="audit" role="tab" aria-selected="false" title="Demo-only visualization (there is no real snagline audit command)"><span class="t-cmd-prefix">$</span> audit <span class="dm">(demo)</span></button>
+        <button type="button" class="term-tab term-tab-ghost" data-cmd="clear" title="Clear terminal screen buffer">clear</button>
+      </div>
+      <div class="term" id="term" tabindex="0" role="region" aria-label="Interactive SNAGLINE terminal">
+        <div class="term-body" id="termBody"></div>
+        <form class="term-prompt-row" id="termForm" onsubmit="return false;">
+          <span class="t-prompt-symbol">$</span>
+          <span class="t-prompt-cli">snagline</span>
+          <input type="text" id="termInput" class="term-input" placeholder="type 'watch', 'replay', 'bench', 'serve' ... (or click tabs above)" autocomplete="off" spellcheck="false" aria-label="Interactive terminal input">
+          <button type="submit" class="term-run-btn" id="termRunBtn" title="Run command" aria-label="Run command">↵</button>
+        </form>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-bar">
+        <h4 style="margin-left:0">latency stream &middot; tool:search</h4>
+        <span class="badge" id="cusumBadge"><i></i>nominal</span>
+      </div>
+      <div class="cv-wrap">
+        <div class="cv-legend">
+          <b class="s">observed</b><b class="m">frozen baseline</b><b class="a">cusum alarm</b>
+        </div>
+        <canvas id="sig" aria-label="Simulated latency stream with CUSUM alarm"></canvas>
+        <div class="cv-read">
+          <span>mean <b id="rMean">—</b></span>
+          <span>last <b id="rLast">—</b></span>
+          <span>cusum <b id="rCusum">—</b></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ░░ STATS ░░ -->
+<div class="stats" id="stats">
+  <div class="st"><div class="n" data-to="1.53" data-dec="2">0.00<u>&#181;s</u></div><div class="l">Median per step, Apple M1</div></div>
+  <div class="st"><div class="n" data-to="0">0</div><div class="l">Required dependencies</div></div>
+  <div class="st"><div class="n" data-to="11">0</div><div class="l">Detectors shipped</div></div>
+  <div class="st"><div class="n" data-to="1550">0</div><div class="l">Tests in the suite</div></div>
+</div>
+
+<!-- ░░ 01 · HOW IT WORKS ░░ -->
+<section id="how-it-works">
+  <div class="shead">
+    <div>
+      <div class="slabel rv">01 &mdash; How it works</div>
+      <h2 class="stitle" data-split>Monitoring that stays out of your way</h2>
+    </div>
+    <p class="sdesc rv d1">A thin adapter normalises your agent's events into one canonical schema.
+      The monitor runs deterministic detectors on every step. Alerts go to sinks. Nothing calls an LLM,
+      nothing reads your content, nothing blocks.</p>
+  </div>
+
+  <!-- ░░ INTERACTIVE PIPELINE ANIMATION ░░ -->
+  <div class="flow-anim-wrap rv">
+    <div class="flow-anim-bar">
+      <div class="flow-anim-title">
+        <span class="live-dot"></span>
+        <span>SNAGLINE Execution Pipeline &middot; Live Flow Simulation</span>
+      </div>
+    </div>
+
+    <div class="flow-stage">
+      <!-- 01 · SOURCE AGENT -->
+      <div class="flow-col">
+        <div class="flow-col-tag">01 &middot; Agent Stream</div>
+        <div class="flow-card" id="flowAgentCard">
+          <div class="agent-box">
+            <div class="agent-step-tag" id="flowStepTag">STEP 1 &middot; RUNNING</div>
+            <div class="agent-call" id="flowAgentCall">tool_call:search("docs")</div>
+            <div class="agent-meta">
+              <span class="agent-pill ok" id="flowStatusPill">STATUS: OK</span>
+              <span id="flowLatencyVal">118ms</span>
+            </div>
+          </div>
+          <p style="font-size:0.75rem;color:var(--ink-2);line-height:1.5">
+            Agent executes actions. A zero-overhead hook maps timestamps, tool names, and exit codes without modifying the agent.
+          </p>
+        </div>
+      </div>
+
+      <!-- 02 · SNAGLINE CORE MONITOR -->
+      <div class="flow-col">
+        <div class="flow-col-tag hl">02 &middot; Snagline Core (~2µs)</div>
+        <div class="flow-card" id="flowCoreCard">
+          <div class="core-header">
+            <span class="core-title">PARALLEL DETECTORS</span>
+            <span class="core-badge">O(1) &middot; ZERO LLM</span>
+          </div>
+          <div class="detectors-list">
+            <div class="det-item" id="flowDetLoop">
+              <div class="det-row">
+                <span class="det-name">Loop Detector (Hash window)</span>
+                <span class="det-val" id="flowDetLoopVal">0 / 3</span>
+              </div>
+              <div class="det-bar"><div class="det-fill" id="flowDetLoopFill" style="width:0%"></div></div>
+            </div>
+            <div class="det-item" id="flowDetCascade">
+              <div class="det-row">
+                <span class="det-name">Error Cascade (Consecutive)</span>
+                <span class="det-val" id="flowDetCascadeVal">0 / 3</span>
+              </div>
+              <div class="det-bar"><div class="det-fill" id="flowDetCascadeFill" style="width:0%"></div></div>
+            </div>
+            <div class="det-item" id="flowDetLatency">
+              <div class="det-row">
+                <span class="det-name">Latency CUSUM (Page test)</span>
+                <span class="det-val" id="flowDetLatencyVal">S = 0.00</span>
+              </div>
+              <div class="det-bar"><div class="det-fill" id="flowDetLatencyFill" style="width:5%"></div></div>
+            </div>
+          </div>
+          <div class="risk-box" id="flowRiskBox">
+            <div class="risk-left">
+              <span class="risk-lbl">Failure Risk (Noisy-OR)</span>
+              <span class="risk-sub" id="flowRiskSub">Nominal &middot; Safe</span>
+            </div>
+            <div class="risk-score" id="flowRiskScore">0.00</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 03 · OUTCOME & INTERVENTION -->
+      <div class="flow-col">
+        <div class="flow-col-tag">03 &middot; Enforcement & Sinks</div>
+        <div class="flow-card" id="flowOutcomeCard">
+          <div class="outcome-box">
+            <span class="outcome-lbl">Control Directive</span>
+            <div class="directive-val" id="flowDirectiveVal">CONTINUE</div>
+            <div class="directive-sub" id="flowDirectiveSub">Step allowed. Zero latency overhead added to agent.</div>
+          </div>
+          <div class="outcome-box">
+            <span class="outcome-lbl">Active Sinks</span>
+            <div class="sinks-list">
+              <span class="sink-pill fired" id="flowSinkConsole">Console</span>
+              <span class="sink-pill" id="flowSinkWebhook">Webhook</span>
+              <span class="sink-pill" id="flowSinkHalt">Halt Hook</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TIMELINE SCRUBBER -->
+    <div class="flow-timeline">
+      <div class="timeline-head">
+        <span>EXECUTION STEPS (CLICK ANY STEP TO JUMP)</span>
+        <span id="flowStepCounter">STEP 1 OF 5</span>
+      </div>
+      <div class="timeline-bar">
+        <button class="time-step-btn active" data-flow-step="0">
+          <span class="time-step-idx">STEP 01</span>
+          <span class="time-step-name">search() &middot; ok</span>
+        </button>
+        <button class="time-step-btn" data-flow-step="1">
+          <span class="time-step-idx">STEP 02</span>
+          <span class="time-step-name">fetch() &middot; ok</span>
+        </button>
+        <button class="time-step-btn" data-flow-step="2">
+          <span class="time-step-idx">STEP 03</span>
+          <span class="time-step-name">scrape() &middot; err 429</span>
+        </button>
+        <button class="time-step-btn" data-flow-step="3">
+          <span class="time-step-idx">STEP 04</span>
+          <span class="time-step-name">scrape() &middot; retry 1</span>
+        </button>
+        <button class="time-step-btn" data-flow-step="4">
+          <span class="time-step-idx">STEP 05</span>
+          <span class="time-step-name">scrape() &middot; TRIP & HALT</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="flow-ticker">
+      <span class="tag">EVENT:</span>
+      <span id="flowTickerText">Observed tool_call:search (118ms) &mdash; All detectors nominal &mdash; Action: continue</span>
+    </div>
+  </div>
+
+  <div class="steps">
+    <div class="step rv">
+      <div class="idx">STEP 01</div>
+      <h3>Adapter normalises events</h3>
+      <div class="body">
+        <p>Raw Python loop, LangChain callback, LangGraph stream, AutoGen, CrewAI, or an HTTP sidecar.
+          Framework-specific code stays quarantined inside adapter modules, so the core never learns
+          about your stack.</p>
+        <div class="snip"><span class="kw">with</span> watch(monitor, <span class="str">"ep-1"</span>) <span class="kw">as</span> step:
+    step(<span class="str">"tool_call"</span>, tool_name<span class="op">=</span><span class="str">"search"</span>, latency_ms<span class="op">=</span><span class="num">120</span>)</div>
+      </div>
+    </div>
+    <div class="step rv">
+      <div class="idx">STEP 02</div>
+      <h3>Monitor runs detectors</h3>
+      <div class="body">
+        <p>Every registered detector sees every event. O(1) amortised per step, no network calls, no LLM
+          calls, no embeddings. Detectors reason over hashes, counts and timings only.</p>
+        <div class="chip">1.53&#181;s median &middot; 1.66&#181;s p99 &middot; 200k steps, Apple M1 &mdash; see verification below</div>
+      </div>
+    </div>
+    <div class="step rv">
+      <div class="idx">STEP 03</div>
+      <h3>FailureRisk dispatched to sinks</h3>
+      <div class="body">
+        <p>When a detector fires, the risk fans out to every registered sink &mdash; console, webhook, Slack,
+          PagerDuty, or your own. Only risk fields travel; never prompts, never responses.</p>
+        <div class="snip">{<span class="str">"episode_id"</span>:<span class="str">"ep-1"</span>, <span class="str">"score"</span>:<span class="num">0.5</span>, <span class="str">"trigger"</span>:<span class="str">"loop"</span>,
+ <span class="str">"detail"</span>:<span class="str">"action repeated 3x in last 3 steps"</span>}</div>
+      </div>
+    </div>
+    <div class="step rv">
+      <div class="idx">STEP 04</div>
+      <h3>Fail-open by construction</h3>
+      <div class="body">
+        <p>Detector exceptions are caught and logged. Sink exceptions are caught and logged. There is no
+          code path where SNAGLINE can raise into your agent or hold its thread. The guarantee is
+          structural, not aspirational.</p>
+        <div class="chip">Hard fail-open guarantee</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ░░ 02 · DETECTORS (horizontal swipe) ░░ -->
+<section class="track-wrap" id="trackWrap">
+  <div class="track-sticky">
+    <div class="track-head">
+      <div>
+        <div class="slabel rv">02 &mdash; Detectors</div>
+        <h2 class="stitle" data-split>Eleven detectors, three on by default</h2>
+      </div>
+      <div class="track-arrows">
+        <button class="track-btn" id="railPrev" aria-label="Previous detector" title="Previous detector">&#8592;</button>
+        <button class="track-btn" id="railNext" aria-label="Next detector" title="Next detector">&#8594;</button>
+      </div>
+    </div>
+    <div class="track-rail" id="rail">
+      <div class="dcard" id="detectors">
+        <div class="top"><span class="no">01 / 11</span><span><span class="tag loop">loop</span> <span class="tag core">default</span></span></div>
+        <h3>Loop detector</h3>
+        <p>Catches retry storms and stuck agents. Keeps a sliding window of action signatures; if the
+          same signature repeats N times inside W steps, it fires.</p>
+        <div class="algo">Sliding window<br>+ SHA-256 action signatures</div>
+      </div>
+      <div class="dcard">
+        <div class="top"><span class="no">02 / 11</span><span><span class="tag casc">cascade</span> <span class="tag core">default</span></span></div>
+        <h3>Error cascade detector</h3>
+        <p>Catches both fast cascades and slow-burn degradation. Two independent modes: N consecutive
+          errors, or N errors inside a recent window. Scores grade with severity rather than a flat 1.0.</p>
+        <div class="algo">Consecutive counter<br>+ windowed counter</div>
+      </div>
+      <div class="dcard">
+        <div class="top"><span class="no">03 / 11</span><span><span class="tag lat">latency</span> <span class="tag core">default</span></span></div>
+        <h3>Latency anomaly detector</h3>
+        <p>Catches sustained performance regression rather than single slow calls. Per-tool running
+          statistics, a frozen healthy baseline, and a cumulative-sum test. A warm-up period suppresses
+          false positives.</p>
+        <div class="algo">Welford mean/variance<br>+ Page CUSUM + frozen baseline</div>
+      </div>
+      <div class="dcard">
+        <div class="top"><span class="no">04 / 11</span><span><span class="tag drift">goal drift</span> <span class="tag opt">opt-in</span></span></div>
+        <h3>Goal-drift detector</h3>
+        <p>Compares the live run against a persisted <em>healthy</em> baseline profile and flags rising
+          error rates, latency several sigma past the healthy mean, and tools that never appeared in the
+          baseline at all. Dependency-free; a no-op until you supply a baseline.</p>
+        <div class="algo">Structural baseline comparison<br>optional embedder for semantic drift</div>
+      </div>
+      <div class="dcard">
+        <div class="top"><span class="no">05 / 11</span><span><span class="tag ml">ensemble</span> <span class="tag opt">opt-in</span></span></div>
+        <h3>ML ensemble orchestrator</h3>
+        <p>Combines the base detectors into one stronger signal. The default combiner is a transparent
+          noisy-OR over their scores, so confidence rises when independent detectors agree. Slot in a
+          fitted model via one callable when you want to.</p>
+        <div class="algo">noisy-OR: 1 &minus; &prod;(1 &minus; s&#7522;)<br>pluggable model hook</div>
+      </div>
+      <div class="dcard">
+        <div class="top"><span class="no">06 / 11</span><span><span class="tag stag">stagnation</span> <span class="tag opt">opt-in</span></span></div>
+        <h3>Stagnation detector</h3>
+        <p>Catches busy-but-discovering-nothing episodes. Tracks the share of never-before-seen action
+          signatures in a window; when novelty collapses below a floor for several consecutive windows
+          it fires once. Catches argument-varying loops that evade exact matching.</p>
+        <div class="algo">Novelty share of a sliding window<br>no baseline needed</div>
+      </div>
+      <div class="dcard">
+        <div class="top"><span class="no">07 / 11</span><span><span class="tag tok">budget</span> <span class="tag opt">opt-in</span></span></div>
+        <h3>Token runaway detector</h3>
+        <p>Catches unbounded token consumption and silence on long episodes. Tracks per-episode token
+          counts against a budget envelope, fires on runaway growth, and derives a wall-clock budget
+          and idle-gap signal from event timestamps &mdash; never the wall clock, so replay stays
+          deterministic.</p>
+        <div class="algo">Token budget envelope<br>+ timestamp-derived horizon</div>
+      </div>
+      <div class="dcard">
+        <div class="top"><span class="no">08 / 11</span><span><span class="tag melt">churn</span> <span class="tag opt">opt-in</span></span></div>
+        <h3>Meltdown detector</h3>
+        <p>Catches pathological tool churn. Measures the entropy of tool usage in a window and fires
+          when it is either too low &mdash; stuck hammering one tool &mdash; or too high, thrashing
+          across many tools without settling.</p>
+        <div class="algo">Windowed tool-usage entropy<br>low and high bands</div>
+      </div>
+      <div class="dcard">
+        <div class="top"><span class="no">09 / 11</span><span><span class="tag abort">abandoned</span> <span class="tag opt">opt-in</span></span></div>
+        <h3>Silent abort detector</h3>
+        <p>Catches abandoned episodes. Checks at end-of-episode for the expected completion signals
+          and fires when an episode ends without a terminal tool call or an explicit success &mdash;
+          the failure mode where an agent simply stops and nobody notices.</p>
+        <div class="algo">End-of-episode<br>completion-signal check</div>
+      </div>
+      <div class="dcard">
+        <div class="top"><span class="no">10 / 11</span><span><span class="tag guard">idempotency</span> <span class="tag opt">opt-in</span></span></div>
+        <h3>Side-effect guard</h3>
+        <p>Catches duplicate non-idempotent actions. Counts per-episode occurrences of
+          (episode, tool, signature) for steps marked side-effecting and fires on the second
+          occurrence &mdash; the second charge on the card, the second row deleted.</p>
+        <div class="algo">Per-(tool, signature) counter<br>gated on side_effect flag</div>
+      </div>
+      <div class="dcard">
+        <div class="top"><span class="no">11 / 11</span><span><span class="tag compact">governance</span> <span class="tag opt">opt-in</span></span></div>
+        <h3>Compaction tripwire</h3>
+        <p>Catches governance decay after context compaction. Tracks adapter-defined compaction pins
+          and fires when a pin is not re-confirmed within its grace window &mdash; the silent way an
+          agent drops a constraint it was supposed to keep honouring.</p>
+        <div class="algo">Compaction pins<br>+ grace-window re-confirmation</div>
+      </div>
+    </div>
+    <div class="track-note" aria-hidden="true"><b></b>&larr; Swipe horizontally to browse &rarr;</div>
+  </div>
+</section>
+
+<!-- ░░ 03 · FEATURES ░░ -->
+<section id="features">
+  <div class="shead">
+    <div>
+      <div class="slabel rv">03 &mdash; Configuration</div>
+      <h2 class="stitle" data-split>Zero config. Total control.</h2>
+    </div>
+    <p class="sdesc rv d1">Sensible defaults out of the box. Every threshold, window size and sensitivity
+      parameter is a constructor argument on one dataclass &mdash; no config files, no environment
+      variables, no hidden state.</p>
+  </div>
+
+  <div class="pair">
+    <div class="code rv">
+      <div class="code-h"><span class="f">monitor.py</span><span class="g">python</span></div>
+      <div class="cap">
+        <h3>Works today</h3>
+        <p>One call gives you loop, error-cascade and latency detectors with a console sink attached.</p>
+      </div>
+      <pre><span class="kw">from</span> snagline <span class="kw">import</span> Monitor
+
+monitor <span class="op">=</span> Monitor.<span class="fn">default</span>()
+
+<span class="cmt"># That's it. Three detectors running,</span>
+<span class="cmt"># console sink attached, zero deps,</span>
+<span class="cmt"># ~2 microseconds of overhead per step.</span></pre>
+    </div>
+    <div class="code rv d1">
+      <div class="code-h"><span class="f">custom_config.py</span><span class="g">python</span></div>
+      <div class="cap">
+        <h3>Tune when you need to</h3>
+        <p>Override only what matters. Everything else keeps its default.</p>
+      </div>
+      <pre><span class="kw">from</span> snagline <span class="kw">import</span> Monitor, Config
+
+config <span class="op">=</span> <span class="fn">Config</span>(
+    loop_window_size<span class="op">=</span><span class="num">20</span>,
+    loop_repeat_threshold<span class="op">=</span><span class="num">5</span>,
+    cusum_k<span class="op">=</span><span class="num">0.3</span>,
+    cusum_h<span class="op">=</span><span class="num">3.0</span>,
+)
+
+monitor <span class="op">=</span> Monitor.<span class="fn">default</span>(config<span class="op">=</span>config)</pre>
+    </div>
+  </div>
+
+  <div class="grid3 rv" style="margin-top:clamp(1rem,2.5vw,2rem)">
+    <div class="cell"><div class="ic cy">=</div><h3>Thread-safe</h3>
+      <p>A per-instance lock means concurrent multi-episode monitoring stays correct under load.</p></div>
+    <div class="cell"><div class="ic gr">#</div><h3>No content retention</h3>
+      <p>Detectors see hashes, timings, counts and booleans. Prompt and response content never enters
+        the monitor, so it cannot leak from it.</p></div>
+    <div class="cell"><div class="ic am">&gt;</div><h3>Streaming and batch</h3>
+      <p>Monitor a live agent, or replay an exported trajectory file through the identical schema and
+        detectors with <code>snagline replay</code>.</p></div>
+  </div>
+</section>
+
+<!-- ░░ 04 · INTEGRATIONS ░░ -->
+<section id="integrations">
+  <div class="shead">
+    <div>
+      <div class="slabel rv">04 &mdash; Integrations</div>
+      <h2 class="stitle" data-split>Works with any agent runtime</h2>
+    </div>
+    <p class="sdesc rv d1">Nine adapters and three zero-touch auto-instrumenters ship in the box. Anything
+      that speaks HTTP can post events without an adapter at all &mdash; or write your own in under fifty
+      lines against a documented protocol.</p>
+  </div>
+
+  <div class="rows rv">
+    <div class="rgroup">Adapters</div>
+    <div class="row">
+      <span class="no">01</span>
+      <span class="nm"><i></i>Raw Python</span>
+      <span class="ds">Context manager and decorator for any hand-rolled agent loop.</span>
+      <span class="mt ship">stdlib only</span>
+    </div>
+    <div class="row">
+      <span class="no">02</span>
+      <span class="nm"><i></i>LangChain</span>
+      <span class="ds">Callback handler covering tool calls, LLM calls, chain errors and agent decisions.</span>
+      <span class="mt">snagline[langchain]</span>
+    </div>
+    <div class="row">
+      <span class="no">03</span>
+      <span class="nm"><i></i>LangGraph</span>
+      <span class="ds">Stream wrapper that reads node transitions as steps.</span>
+      <span class="mt">snagline[langgraph]</span>
+    </div>
+    <div class="row">
+      <span class="no">04</span>
+      <span class="nm"><i></i>Claude Code</span>
+      <span class="ds">Native hook mapping, with Pre/Post tool-use pairing via HookTracker.</span>
+      <span class="mt ship">hooks bridge</span>
+    </div>
+    <div class="row">
+      <span class="no">05</span>
+      <span class="nm"><i></i>AutoGen</span>
+      <span class="ds">Event translation for AgentChat multi-agent conversations.</span>
+      <span class="mt">snagline[autogen]</span>
+    </div>
+    <div class="row">
+      <span class="no">06</span>
+      <span class="nm"><i></i>CrewAI</span>
+      <span class="ds">Crew and task lifecycle mapped onto the canonical step schema.</span>
+      <span class="mt">snagline[crewai]</span>
+    </div>
+    <div class="row">
+      <span class="no">07</span>
+      <span class="nm"><i></i>OpenAI SDK</span>
+      <span class="ds">Explicit per-client wrappers for raw SDK users who want instrumentation visible at the call site.</span>
+      <span class="mt">snagline[openai]</span>
+    </div>
+    <div class="row">
+      <span class="no">08</span>
+      <span class="nm"><i></i>Anthropic SDK</span>
+      <span class="ds">Same explicit wrappers for Claude message calls, no monkeypatching.</span>
+      <span class="mt">snagline[anthropic]</span>
+    </div>
+    <div class="row">
+      <span class="no">09</span>
+      <span class="nm"><i></i>CONTINUUM</span>
+      <span class="ds">Reads a run's hash-chained event log through its public Storage API. Zero new instrumentation on the host side.</span>
+      <span class="mt">snagline[continuum]</span>
+    </div>
+
+    <div class="rgroup">Auto-instrument &middot; <code style="font-family:var(--mono);color:var(--accent)">snagline.auto</code></div>
+    <div class="row">
+      <span class="no">10</span><span class="nm"><i></i>OpenAI SDK</span>
+      <span class="ds">Patch the client once; every completion becomes a monitored step.</span>
+      <span class="mt">snagline[openai]</span>
+    </div>
+    <div class="row">
+      <span class="no">11</span><span class="nm"><i></i>Anthropic SDK</span>
+      <span class="ds">Same one-line attach for Claude message calls.</span>
+      <span class="mt">snagline[anthropic]</span>
+    </div>
+    <div class="row">
+      <span class="no">12</span><span class="nm"><i></i>LangChain (auto)</span>
+      <span class="ds">Registers the callback handler globally, no per-chain wiring.</span>
+      <span class="mt">snagline[langchain]</span>
+    </div>
+  </div>
+
+  <div class="grid3 rv" style="margin-top:clamp(1.5rem,3.5vw,2.5rem)">
+    <div class="cell"><div class="ic cy">{}</div><h3>HTTP sidecar</h3>
+      <p>Any runtime that speaks HTTP can POST events to the built-in server.
+        <code>snagline serve --port 8787</code></p></div>
+    <div class="cell"><div class="ic gr">|</div><h3>Command bridge</h3>
+      <p>Pipe hook payloads straight through the CLI. Always exits 0, so it can never break the caller.</p></div>
+    <div class="cell"><div class="ic am">~</div><h3>File bridge</h3>
+      <p>Tail a JSONL file, for frameworks that can only append to disk.</p></div>
+  </div>
+</section>
+
+<!-- ░░ 05 · SINKS ░░ -->
+<section id="sinks">
+  <div class="shead">
+    <div>
+      <div class="slabel rv">05 &mdash; Sinks</div>
+      <h2 class="stitle" data-split>Route risk anywhere</h2>
+    </div>
+    <p class="sdesc rv d1">Nine sinks ship in the core, and the Slack and PagerDuty ones need no extra
+      dependency &mdash; they are stdlib all the way down. Compose them: wrap a noisy sink in dedup, then
+      in batching, and the semantics still hold.</p>
+  </div>
+
+  <div class="grid3 rv">
+    <div class="cell"><div class="ic cy">01</div><h3>ConsoleSink</h3>
+      <p>One JSON line per risk to stderr. The zero-config default.</p></div>
+    <div class="cell"><div class="ic cy">02</div><h3>WebhookSink</h3>
+      <p>POST the risk payload to any URL. Credentials in the URL are redacted from logs.</p></div>
+    <div class="cell"><div class="ic gr">03</div><h3>SlackSink</h3>
+      <p>Formatted incoming-webhook messages. Stdlib only, no extra install.</p></div>
+    <div class="cell"><div class="ic rd">04</div><h3>PagerDutySink</h3>
+      <p>Events API v2 alerts, with score mapped onto PagerDuty severity.</p></div>
+    <div class="cell"><div class="ic am">05</div><h3>DedupSink</h3>
+      <p>Cooldown wrapper that collapses repeat alerts for the same trigger.</p></div>
+    <div class="cell"><div class="ic vi">06</div><h3>BatchingSink</h3>
+      <p>Async, rate-limited dispatch on a background worker so slow endpoints never touch your agent.</p></div>
+    <div class="cell"><div class="ic cy">07</div><h3>LoggingSink</h3>
+      <p>One JSON record per risk on the <code>snagline</code> logger, so log aggregators get
+        machine-readable lines. Structure only, never content.</p></div>
+    <div class="cell"><div class="ic gr">08</div><h3>HeartbeatSink</h3>
+      <p>Touches a liveness file's mtime on every ingest, so an external supervisor sees a hung host
+        in-band detectors never can.</p></div>
+    <div class="cell"><div class="ic vi">09</div><h3>ContinuumSink</h3>
+      <p>Escalates a risk into a CONTINUUM review through its existing request-human path.</p></div>
+  </div>
+  <div class="grid3 rv d1" style="margin-top:1px;grid-template-columns:1fr">
+    <div class="cell"><div class="ic gr">10</div><h3>Your own sink</h3>
+      <p>A sink is one method: <code>emit(risk) -&gt; None</code>. Implement the protocol, register it, and
+        the monitor's fail-open contract covers your code too &mdash; if it raises, the exception is caught
+        and logged, and the agent keeps running.</p></div>
+  </div>
+</section>
+
+<!-- ░░ 06 · EVIDENCE ░░ -->
+<section id="evidence">
+  <div class="shead">
+    <div>
+      <div class="slabel rv">06 &mdash; Evidence</div>
+      <h2 class="stitle" data-split>Verified, not asserted</h2>
+    </div>
+    <p class="sdesc rv d1">Every claim on this page is reproducible from the repository. The proof scripts
+      are the primary artefact; the prose is secondary.</p>
+  </div>
+
+  <div class="ev rv">
+    <div class="evc">
+      <div class="lb">LangChain 1.x</div>
+      <q>Driven across chaos scenarios with a real create_agent. The callback handler captured tool calls,
+        LLM calls, chain errors and agent decisions, firing all three tier-1 detectors as expected.</q>
+      <div class="src">tests/test_integration.py</div>
+    </div>
+    <div class="evc">
+      <div class="lb">Claude Code hooks</div>
+      <q>Five PostToolUseFailure payloads posted to the HTTP sidecar produced both a loop and an
+        error-cascade FailureRisk, with HookTracker correctly pairing Pre and Post events.</q>
+      <div class="src">tests/test_claude_code.py</div>
+    </div>
+    <div class="evc">
+      <div class="lb">Fixture trajectories</div>
+      <q>Hand-built trajectory files act as ground truth. Loop, cascade and latency detectors fire on the
+        failing runs, and healthy runs produce zero false positives. The accuracy corpus is 109 episodes:
+        68 labelled failing plus 41 healthy controls.</q>
+      <div class="src">tests/fixtures/trajectories/</div>
+    </div>
+    <div class="evc">
+      <div class="lb">Overhead benchmark</div>
+      <q>200,000 synthetic steps measured end to end. Median 1.53&#181;s per step, p99 1.66&#181;s on Apple
+        M1, independently reproduced at 1.70 / 1.77 on M4. With window auto-scaling the median stays flat
+        at ~2.4&#181;s across a 4x window range &mdash; the O(1) claim measured rather than asserted.</q>
+      <div class="src">snagline bench &middot; 200,000 steps &middot; Apple M1, arm64, CPython 3.13.5, commit b667169 (2026-09-20). Reproduce: <code>python benchmarks/overhead_benchmark.py</code>. Hardware-dependent &mdash; a slower machine reports more.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ░░ 07 · ROADMAP ░░ -->
+<section id="roadmap">
+  <div class="shead">
+    <div>
+      <div class="slabel rv">07 &mdash; Roadmap</div>
+      <h2 class="stitle" data-split>Every phase shipped</h2>
+    </div>
+    <p class="sdesc rv d1">The original nineteen phases all shipped, and four later phases followed them: the
+      opt-in detectors, the remaining sinks and adapters, and the CONTINUUM integration. The two heavier
+      optional upgrades landed behind extras rather than in the zero-dependency core: an ESN model behind
+      <code>snagline[ml]</code> and sentence embeddings behind <code>snagline[drift]</code>.</p>
+    <p class="sdesc rv d2">Verification status is stated, not implied. The zero-dependency core is exercised by
+      the full suite on every push. The <code>ml</code> extra has its own CI leg that installs numpy and
+      scikit-learn, so its import-guard and fail-open behaviour run on real installs; the <code>drift</code>
+      extra's embeddings path is covered by tests that skip when its dependency is absent, so it is
+      verified against source, not by a runtime leg. This page's detector, sink and adapter descriptions
+      were checked against the code for this release; the benchmark figures above are the provenance-labelled
+      numbers from one machine, reproducible with <code>snagline bench</code>.</p>
+  </div>
+
+  <div class="rm rv">
+    <div class="rmi"><span class="dot"></span><span class="ph">01</span><span class="tx">Core schema &mdash; <b>StepEvent, FailureRisk, Config</b></span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">02</span><span class="tx"><b>Monitor</b> orchestrator with fail-open guarantee</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">03</span><span class="tx">Loop detector</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">04</span><span class="tx">Error cascade detector</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">05</span><span class="tx">Console sink + raw adapter</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">06</span><span class="tx">Latency anomaly (CUSUM) detector</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">07</span><span class="tx">Overhead benchmark &mdash; <b>snagline bench</b></span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">08</span><span class="tx">LangChain adapter</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">09</span><span class="tx">Webhook sink</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">10</span><span class="tx">HTTP sidecar &mdash; <b>snagline serve</b></span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">11</span><span class="tx">LangGraph adapter</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">12</span><span class="tx">Claude Code hooks bridge</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">13</span><span class="tx">Framework bridge docs</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">14</span><span class="tx">Offline replay CLI &mdash; <b>snagline replay</b></span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">15</span><span class="tx">Dedup / cooldown &mdash; <b>DedupSink</b></span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">16</span><span class="tx">ML ensemble detector</span><span class="st2">ESN &middot; snagline[ml]</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">17</span><span class="tx">Goal-drift detector</span><span class="st2">embeddings &middot; snagline[drift]</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">18</span><span class="tx">AutoGen / CrewAI adapters</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">19</span><span class="tx">Slack + PagerDuty sinks</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">20</span><span class="tx">Stagnation, token runaway, meltdown, silent abort</span><span class="st2">opt-in</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">21</span><span class="tx">Side-effect guard + compaction tripwire</span><span class="st2">opt-in</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">22</span><span class="tx">Logging, heartbeat, CONTINUUM sinks</span></div>
+    <div class="rmi"><span class="dot"></span><span class="ph">23</span><span class="tx">OpenAI / Anthropic / CONTINUUM adapters</span></div>
+  </div>
+</section>
+
+<!-- ░░ CTA ░░ -->
+<div class="cta" id="install">
+  <h2 data-split>Start monitoring in thirty seconds</h2>
+  <p class="rv d1">Zero required dependencies. Python 3.10+. MIT licensed.</p>
+  <div class="cta-row rv d2">
+    <button class="copyable" data-copy="pip install .">
+      <span class="p">$</span><span class="c">pip install .</span><span class="hint">copy</span>
+    </button>
+    <a href="https://github.com/Cyrax321/SNAGLINE" class="btn btn-fill">View on GitHub ↗</a>
+  </div>
+</div>
+
+<!-- ░░ FOOTER ░░ -->
+<footer>
+  <div class="f-l">SNAGLINE &middot; MIT &middot; Built for agents that run unattended</div>
+  <div class="f-r">
+    <a href="https://github.com/Cyrax321/SNAGLINE">GitHub</a>
+    <a href="https://github.com/Cyrax321/SNAGLINE/issues">Issues</a>
+    <a href="https://github.com/Cyrax321/SNAGLINE/blob/master/docs/ADAPTER_GUIDE.md">Adapter guide</a>
+    <a href="https://github.com/Cyrax321/SNAGLINE/blob/master/docs/DETECTOR_GUIDE.md">Detector guide</a>
+    <a href="https://github.com/Cyrax321/SNAGLINE/blob/master/LICENSE">License</a>
+  </div>
+</footer>
+
+<script>
+(function(){
+'use strict';
+/* ═══════════════ ENV ═══════════════ */
+var REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+var FINE    = matchMedia('(pointer: fine)').matches;
+var clamp   = function(v,a,b){ return v<a?a:v>b?b:v; };
+var $  = function(s,c){ return (c||document).querySelector(s); };
+var $$ = function(s,c){ return Array.prototype.slice.call((c||document).querySelectorAll(s)); };
+
+/* ═══════════════ SPLIT TEXT ═══════════════ */
+function split(el){
+  var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+  var nodes = [], n;
+  while((n = walker.nextNode())) nodes.push(n);
+  nodes.forEach(function(tn){
+    if(!tn.textContent.trim()) return;
+    var frag = document.createDocumentFragment();
+    tn.textContent.split(/(\s+)/).forEach(function(w){
+      if(!w) return;
+      if(/^\s+$/.test(w)){ frag.appendChild(document.createTextNode(' ')); return; }
+      var o = document.createElement('span'); o.className = 'sw';
+      var i = document.createElement('span'); i.className = 'swi'; i.textContent = w;
+      o.appendChild(i); frag.appendChild(o);
+    });
+    tn.parentNode.replaceChild(frag, tn);
+  });
+  $$('.swi', el).forEach(function(w,i){
+    w.style.transitionDelay = Math.min(i*45, 700) + 'ms';
+  });
+}
+$$('[data-split]').forEach(split);
+
+/* ═══════════════ REVEAL ═══════════════ */
+/* Run as soon as the DOM is live. There is no preloader curtain any more, so
+   anything already inside the viewport must get .is-in on the first frame or
+   the hero renders invisible. */
+function initReveals(){
+  var io = new IntersectionObserver(function(es){
+    es.forEach(function(e){
+      if(e.isIntersecting){ e.target.classList.add('is-in'); io.unobserve(e.target); }
+    });
+  }, { threshold:0.12, rootMargin:'0px 0px -8% 0px' });
+  $$('.rv,[data-split]').forEach(function(el){
+    var r = el.getBoundingClientRect();
+    if(r.top < innerHeight * 0.92 && r.bottom > 0) el.classList.add('is-in');
+    else io.observe(el);
+  });
+}
+initReveals();
+
+/* ═══════════════ INERTIA SCROLL ═══════════════ */
+var SS = (function(){
+  var on = FINE && !REDUCED && innerWidth > 1000;
+  var target = scrollY, cur = scrollY, running = false;
+  function max(){ return document.documentElement.scrollHeight - innerHeight; }
+  function tick(){
+    var d = target - cur;
+    if(Math.abs(d) < 0.5){ cur = target; scrollTo(0, cur); running = false; return; }
+    cur += d * 0.22;
+    scrollTo(0, cur);
+    requestAnimationFrame(tick);
+  }
+  function run(){ if(!running){ running = true; requestAnimationFrame(tick); } }
+  function goTo(y){ target = clamp(y, 0, max()); if(on){ run(); } else { scrollTo({top:target, behavior:REDUCED?'auto':'smooth'}); } }
+  if(on){
+    addEventListener('wheel', function(e){
+      if(e.ctrlKey) return;
+      var hScroll = e.target && e.target.closest && e.target.closest('#rail, pre, .snip');
+      if(hScroll && Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+      e.preventDefault();
+      var d = e.deltaY;
+      if(e.deltaMode === 1) d *= 16; else if(e.deltaMode === 2) d *= innerHeight;
+      target = clamp(target + d, 0, max());
+      run();
+    }, { passive:false });
+    addEventListener('scroll', function(){ if(!running){ target = cur = scrollY; } }, { passive:true });
+    addEventListener('resize', function(){ target = cur = scrollY; });
+  }
+  return { goTo:goTo, enabled:on };
+})();
+
+$$('a[href^="#"]').forEach(function(a){
+  a.addEventListener('click', function(e){
+    var id = a.getAttribute('href');
+    if(id === '#') return;
+    var t = document.querySelector(id);
+    if(!t) return;
+    e.preventDefault();
+    SS.goTo(t.getBoundingClientRect().top + scrollY - (id === '#top' ? 0 : 40));
+  });
+});
+
+/* ═══════════════ SCROLL-LINKED ═══════════════ */
+(function(){
+  var nav = $('#nav'), heroIn = $('#heroIn');
+  var lastY = scrollY, acc = 0, hidden = false, solid = false, queued = false;
+
+  function frame(){
+    queued = false;
+    var y = scrollY;
+
+    if(y > 40 !== solid){ solid = y > 40; nav.classList.toggle('solid', solid); }
+
+    var dy = y - lastY;
+    lastY = y;
+    if(Math.abs(dy) > 0.5){
+      if((dy > 0) !== (acc > 0)) acc = 0;
+      acc += dy;
+    }
+    if(y < 300){
+      if(hidden){ hidden = false; nav.classList.remove('hide'); }
+      acc = 0;
+    } else if(!hidden && acc > 90){
+      hidden = true; nav.classList.add('hide'); acc = 0;
+    } else if(hidden && acc < -50){
+      hidden = false; nav.classList.remove('hide'); acc = 0;
+    }
+
+    if(heroIn && y < innerHeight * 1.2){
+      var p = clamp(y / innerHeight, 0, 1);
+      heroIn.style.transform = 'translate3d(0,' + (p * -11) + 'vh,0) scale(' + (1 - p*0.11) + ')';
+      heroIn.style.opacity   = String(1 - p*0.95);
+    }
+  }
+  function onScroll(){ if(!queued){ queued = true; requestAnimationFrame(frame); } }
+
+  function reveal(){ if(hidden){ hidden = false; acc = 0; nav.classList.remove('hide'); } }
+  nav.addEventListener('mouseenter', reveal);
+  addEventListener('mousemove', function(e){ if(e.clientY < 70) reveal(); }, { passive:true });
+  addEventListener('focusin', reveal);
+  addEventListener('keydown', function(e){
+    if(e.key === 'Home' || e.key === 'Escape') reveal();
+  }, { passive:true });
+
+  addEventListener('scroll', onScroll, { passive:true });
+  frame();
+})();
+
+/* ═══════════════ DETECTORS HORIZONTAL SWIPE ═══════════════ */
+(function(){
+  var rail = $('#rail');
+  var prevBtn = $('#railPrev');
+  var nextBtn = $('#railNext');
+  if(!rail) return;
+
+  function getStep(){
+    var card = rail.querySelector('.dcard');
+    return card ? card.offsetWidth + 24 : 420;
+  }
+
+  if(prevBtn){
+    prevBtn.addEventListener('click', function(){
+      rail.scrollBy({ left: -getStep(), behavior: 'smooth' });
+    });
+  }
+
+  if(nextBtn){
+    nextBtn.addEventListener('click', function(){
+      rail.scrollBy({ left: getStep(), behavior: 'smooth' });
+    });
+  }
+
+  /* Mouse Drag-to-Scroll for desktop pointer */
+  var isDown = false, startX = 0, scrollLeftStart = 0, hasMoved = false;
+
+  rail.addEventListener('pointerdown', function(e){
+    if(e.button !== 0) return;
+    isDown = true;
+    hasMoved = false;
+    startX = e.clientX;
+    scrollLeftStart = rail.scrollLeft;
+    rail.classList.add('is-dragging');
+    try { rail.setPointerCapture(e.pointerId); } catch(_) {}
+  });
+
+  rail.addEventListener('pointermove', function(e){
+    if(!isDown) return;
+    var dx = e.clientX - startX;
+    if(Math.abs(dx) > 4){
+      hasMoved = true;
+      rail.scrollLeft = scrollLeftStart - dx;
+    }
+  });
+
+  function endDrag(e){
+    if(!isDown) return;
+    isDown = false;
+    rail.classList.remove('is-dragging');
+    try { rail.releasePointerCapture(e.pointerId); } catch(_) {}
+  }
+
+  rail.addEventListener('pointerup', endDrag);
+  rail.addEventListener('pointercancel', endDrag);
+
+  rail.addEventListener('click', function(e){
+    if(hasMoved){
+      e.preventDefault();
+      e.stopPropagation();
+      hasMoved = false;
+    }
+  }, true);
+})();
+
+/* ═══════════════ COUNTERS ═══════════════ */
+(function(){
+  var io = new IntersectionObserver(function(es){
+    es.forEach(function(e){
+      if(!e.isIntersecting) return;
+      io.unobserve(e.target);
+      var el = e.target;
+      var to = parseFloat(el.dataset.to), dec = parseInt(el.dataset.dec || '0', 10);
+      var u = el.querySelector('u'), uh = u ? u.outerHTML : '';
+      if(REDUCED){ el.innerHTML = to.toFixed(dec) + uh; return; }
+      var t0 = performance.now(), DUR = 1500;
+      (function tick(now){
+        var p = clamp((now - t0)/DUR, 0, 1);
+        var v = to * (1 - Math.pow(1-p, 4));
+        el.innerHTML = v.toFixed(dec) + uh;
+        if(p < 1) requestAnimationFrame(tick);
+      })(t0);
+    });
+  }, { threshold:0.4 });
+  $$('.st .n[data-to]').forEach(function(el){ io.observe(el); });
+})();
+
+/* ═══════════════ INTERACTIVE CLI TERMINAL ═══════════════ */
+(function(){
+  var term = $('#term'), termBody = $('#termBody'), form = $('#termForm'), input = $('#termInput');
+  var titleEl = $('#termTitle'), badgeEl = $('#termBadge');
+  if(!term || !termBody) return;
+
+  var runningTimer = null;
+  var isObserving = false;
+  var currentCmd = 'watch';
+  var history = [];
+  var historyIdx = -1;
+
+  function getTimeStr(){
+    var now = new Date();
+    var h = String(now.getHours()).padStart(2,'0');
+    var m = String(now.getMinutes()).padStart(2,'0');
+    var s = String(now.getSeconds()).padStart(2,'0');
+    return h + ':' + m + ':' + s;
+  }
+
+  function addLine(content, customClass){
+    var d = document.createElement('div');
+    d.className = 'tl' + (customClass ? ' ' + customClass : '');
+    d.innerHTML = content;
+    termBody.appendChild(d);
+    termBody.scrollTop = termBody.scrollHeight;
+    while(termBody.children.length > 60){
+      termBody.removeChild(termBody.firstChild);
+    }
+  }
+
+  function addLog(ts, icon, text){
+    var time = ts || getTimeStr();
+    addLine('<span class="ts">' + time + '</span> ' + (icon ? icon + ' ' : '') + text);
+  }
+
+  function stopCurrent(){
+    if(runningTimer){
+      clearTimeout(runningTimer);
+      runningTimer = null;
+    }
+  }
+
+  function setBadge(text, color, pulse){
+    if(!badgeEl) return;
+    badgeEl.innerHTML = (pulse ? '<i></i>' : '<i style="animation:none;background:' + color + '"></i>') + text;
+    badgeEl.style.color = color;
+  }
+
+  function setActiveTab(cmdName){
+    $$('.term-tab').forEach(function(btn){
+      var matches = btn.getAttribute('data-cmd') === cmdName;
+      btn.classList.toggle('active', matches);
+      btn.setAttribute('aria-selected', matches ? 'true' : 'false');
+    });
+  }
+
+  /* ───── COMMAND: WATCH ───── */
+  var WATCH_STREAM = [
+    ['<span class="dm">$</span> snagline watch --follow agent.log', 360],
+    ['<span class="ok">+</span> monitoring episode <span class="ac">ep-001</span> <span class="dm">(3 detectors online)</span>', 400],
+    ['<span class="dm">|</span> tool_call:search <span class="ok">ok</span> <span class="dm">120ms</span>', 320],
+    ['<span class="dm">|</span> tool_call:search <span class="ok">ok</span> <span class="dm">130ms</span>', 320],
+    ['<span class="dm">|</span> tool_call:search <span class="ok">ok</span> <span class="dm">110ms</span>', 460],
+    ['<span class="wa">!</span> <span class="wa">LOOP</span> action repeated 3x in last 3 steps <span class="dm">score 0.50</span>', 540],
+    ['<span class="dm">|</span> tool_call:search <span class="ok">ok</span> <span class="dm">125ms</span>', 300],
+    ['<span class="dm">|</span> tool_call:search <span class="ok">ok</span> <span class="dm">118ms</span>', 300],
+    ['<span class="dm">|</span> tool_call:db_write <span class="er">err</span> <span class="dm">timeout</span>', 300],
+    ['<span class="dm">|</span> tool_call:db_write <span class="er">err</span> <span class="dm">timeout</span>', 300],
+    ['<span class="dm">|</span> tool_call:db_write <span class="er">err</span> <span class="dm">timeout</span>', 460],
+    ['<span class="er">!</span> <span class="er">CASCADE</span> 3 consecutive errors <span class="dm">score 0.50</span>', 500],
+    ['<span class="dm">|</span> tool_call:search <span class="ok">ok</span> <span class="dm">900ms</span>', 520],
+    ['<span class="vi">!</span> <span class="vi">LATENCY</span> latency 900ms deviates from baseline (mean 121ms) <span class="dm">score 1.00</span>', 700]
+  ];
+
+  function runWatch(isInitial){
+    stopCurrent();
+    currentCmd = 'watch';
+    setActiveTab('watch');
+    if(titleEl) titleEl.innerHTML = 'snagline watch &middot; ep-001';
+    setBadge('live', 'var(--green)', true);
+
+    if(!isInitial){
+      addLine('<span class="ts">' + getTimeStr() + '</span> <span class="dm">$</span> snagline watch --follow agent.log', 'cmd-echo');
+    }
+
+    var idx = isInitial ? 0 : 1;
+    function nextWatchStep(){
+      if(idx >= WATCH_STREAM.length){
+        runningTimer = setTimeout(function(){
+          if(currentCmd !== 'watch') return;
+          addLine('<span class="ts">' + getTimeStr() + '</span> <span class="dm">... cycling watch stream ...</span>');
+          idx = 2;
+          nextWatchStep();
+        }, 3200);
+        return;
+      }
+      var item = WATCH_STREAM[idx++];
+      addLog(null, null, item[0]);
+      if(REDUCED){
+        while(idx < WATCH_STREAM.length){ addLog(null, null, WATCH_STREAM[idx++][0]); }
+        return;
+      }
+      runningTimer = setTimeout(nextWatchStep, item[1]);
+    }
+    nextWatchStep();
+  }
+
+  /* ───── COMMAND: REPLAY ───── */
+  var REPLAY_STEPS = [
+    { text: '<span class="ok">+</span> loaded <span class="ac">episode-042.jsonl</span> <span class="dm">(LangGraph &middot; 18 steps)</span>', delay: 350 },
+    { text: '<span class="dm">|</span> step 01 &middot; tool:search("state vector") <span class="ok">ok</span> <span class="dm">124ms</span>', delay: 300 },
+    { text: '<span class="dm">|</span> step 02 &middot; tool:summarize <span class="ok">ok</span> <span class="dm">210ms</span>', delay: 300 },
+    { text: '<span class="dm">|</span> step 03 &middot; tool:fetch_url("https://api.external.com") <span class="er">err</span> <span class="dm">429 RateLimit</span>', delay: 380 },
+    { text: '<span class="dm">|</span> step 04 &middot; tool:fetch_url("https://api.external.com") <span class="er">err</span> <span class="dm">429 RateLimit (retry 1)</span>', delay: 380 },
+    { text: '<span class="dm">|</span> step 05 &middot; tool:fetch_url("https://api.external.com") <span class="er">err</span> <span class="dm">429 RateLimit (retry 2)</span>', delay: 420 },
+    { text: '<span class="er">!</span> <span class="er">SNAG INTERCEPT</span> <span class="ac">error_cascade</span> fired @ step 5 <span class="dm">(trigger=error_cascade, streak=3, score=0.50)</span>', delay: 550 },
+    { text: '<span class="dm">|</span> step 06 &middot; tool:fetch_url("https://api.external.com") <span class="er">err</span> <span class="dm">429 RateLimit (retry 3)</span>', delay: 360 },
+    { text: '<span class="dm">|</span> step 07 &middot; tool:fetch_url("https://api.external.com") <span class="er">err</span> <span class="dm">429 RateLimit (retry 4)</span>', delay: 360 },
+    { text: '<span class="dm">|</span> step 08 &middot; tool:fetch_url("https://api.external.com") <span class="er">err</span> <span class="dm">429 RateLimit (retry 5)</span>', delay: 400 },
+    { text: '<span class="er">!</span> <span class="er">SNAG INTERCEPT</span> <span class="ac">error_cascade</span> fired @ step 8 <span class="dm">(trigger=error_cascade, streak=6, score=0.80)</span>', delay: 550 },
+    { text: '<span class="vi">⚡</span> <span class="vi">ACTION</span> Dispatched <span class="ac">AGENT_HALT</span> & saved checkpoint snapshot', delay: 480 },
+    { text: '<span class="ok">✓</span> <span class="ok">SAVED</span> 13 runaway retry loops prevented <span class="dm">(~$14.20 OpenAI API spend avoided)</span>', delay: 420 },
+    { text: '<span class="dm">──────────────────────────────────────────────────────────</span>', delay: 200 },
+    { text: '<span class="dm">Replay complete in 3.9ms &middot; 2 Snags Intercepted &middot; Overhead: 1.94µs/step</span>', delay: 300 }
+  ];
+
+  function runReplay(targetFile){
+    stopCurrent();
+    currentCmd = 'replay';
+    setActiveTab('replay');
+    var file = targetFile || 'episode-042.jsonl';
+    if(titleEl) titleEl.innerHTML = 'snagline replay &middot; ' + file;
+    setBadge('replaying', 'var(--amber)', true);
+
+    addLine('<span class="ts">' + getTimeStr() + '</span> <span class="dm">$</span> snagline replay <span class="ac">' + file + '</span>', 'cmd-echo');
+
+    var step = 0;
+    function nextStep(){
+      if(step >= REPLAY_STEPS.length){
+        setBadge('intercepted', 'var(--green)', false);
+        return;
+      }
+      var s = REPLAY_STEPS[step++];
+      addLog(null, null, s.text);
+      if(REDUCED){
+        while(step < REPLAY_STEPS.length){ addLog(null, null, REPLAY_STEPS[step++].text); }
+        setBadge('intercepted', 'var(--green)', false);
+        return;
+      }
+      runningTimer = setTimeout(nextStep, s.delay);
+    }
+    nextStep();
+  }
+
+  /* ───── COMMAND: BENCH ───── */
+  function runBench(){
+    stopCurrent();
+    currentCmd = 'bench';
+    setActiveTab('bench');
+    if(titleEl) titleEl.innerHTML = 'snagline bench &middot; 200,000 steps';
+    setBadge('benchmarking', 'var(--accent)', true);
+
+    addLine('<span class="ts">' + getTimeStr() + '</span> <span class="dm">$</span> snagline bench', 'cmd-echo');
+
+    /* The real `snagline bench` prints no per-detector breakdown -- it reports
+       percentiles for the whole per-step path. Measure in blocks here so the
+       displayed median/p99 are real percentiles of a real in-browser sample
+       rather than hardcoded constants, and say so.
+
+       Three things make the numbers mean something:
+         - the ring is sized to the window and READ before written, so a full
+           ring actually evicts. A write-only array that merely grows is not a
+           ring, and the scaled legs below would all measure the same work.
+         - one discarded warmup leg runs first, because the opening blocks
+           absorb V8's compile/optimize cost (~11x steady state) and would
+           otherwise become the entire p99 tail.
+         - one sample per block, not one per op. Replicating a block's per-op
+           cost blockSize times makes p99 a function of blockCount alone:
+           with 40 blocks the 99th percentile *is* the worst block, so a single
+           GC pause reads as the tail latency. Longer blocks also amortise the
+           timer, which is why blockSize is large relative to blockCount. */
+    function benchPercentiles(makeOp, windowSize, blockSize, blockCount){
+      var samples = new Array(blockCount);
+      var buf = new Float64Array(windowSize);
+      for(var b=0; b<blockCount; b++){
+        var t0 = performance.now();
+        for(var k=0; k<blockSize; k++){ makeOp(buf, k + b * blockSize); }
+        /* A block the timer cannot resolve at all reads 0.00; clamp to a hair
+           above timer resolution so nothing prints as a zero measurement. */
+        samples[b] = Math.max((performance.now() - t0) / blockSize * 1000, 0.005);
+      }
+      var sorted = samples.slice().sort(function(a, z){ return a - z; });
+      return {
+        median: sorted[Math.floor(blockCount / 2)],
+        p99: sorted[Math.min(blockCount - 1, Math.ceil(blockCount * 0.99) - 1)]
+      };
+    }
+    var hashState = 2166136261;
+    /* 2,000 x 100 = 200,000 steps, the same count the real command reports, and
+       long enough per block that the measurement is stable run to run. */
+    var BENCH_BLOCK = 2000, BENCH_BLOCKS = 100, BENCH_WARMUP = 2000;
+    benchPercentiles(function(buf, k){
+      var prior = buf[k & 127];
+      buf[k & 127] = prior + k;
+      hashState = Math.imul(hashState ^ k, 16777619);
+    }, 128, BENCH_WARMUP, 8);  /* discarded: JIT only */
+    var fullStep = benchPercentiles(function(buf, k){
+      var prior = buf[k & 127];
+      buf[k & 127] = prior + k;
+      hashState = Math.imul(hashState ^ k, 16777619);
+    }, 128, BENCH_BLOCK, BENCH_BLOCKS);
+    var ingestOnly = benchPercentiles(function(buf, k){
+      var prior = buf[k & 127];
+      buf[k & 127] = prior + k;
+    }, 128, BENCH_BLOCK, BENCH_BLOCKS);
+    /* Scaled legs: the real command reruns ingest() at max_window=512/2048.
+       Here that is a genuinely larger ring, so these are an in-browser sample
+       of the shape, not a claim about the real pipeline. */
+    var scaled512 = benchPercentiles(function(buf, k){
+      var prior = buf[k & 511];
+      buf[k & 511] = prior + k;
+    }, 512, BENCH_BLOCK, BENCH_BLOCKS);
+    var scaled2048 = benchPercentiles(function(buf, k){
+      var prior = buf[k & 2047];
+      buf[k & 2047] = prior + k;
+    }, 2048, BENCH_BLOCK, BENCH_BLOCKS);
+    var medUs = Math.max(fullStep.median, 0.01).toFixed(2);
+    var badgeText = medUs + 'µs/step';
+
+    /* Mirrors the labels and the order _cmd_bench() actually prints. */
+    var BENCH_LINES = [
+      { text: '<span class="ok">+</span> snagline overhead benchmark <span class="dm">(in-browser sample; run <span class="ac">snagline bench</span> for real numbers)</span>', delay: 280 },
+      { text: '<span class="dm">|</span> steps measured : <span class="ac">200,000</span>', delay: 240 },
+      { text: '<span class="dm">|</span> median        : <span class="ac">' + medUs + ' us/step</span>', delay: 240 },
+      { text: '<span class="dm">|</span> p99           : <span class="ac">' + Math.max(fullStep.p99, 0.01).toFixed(2) + ' us/step</span>', delay: 240 },
+      { text: '<span class="dm">|</span> ingest only   : median <span class="ac">' + Math.max(ingestOnly.median, 0.01).toFixed(2) + ' us/step</span>, p99 <span class="ac">' + Math.max(ingestOnly.p99, 0.01).toFixed(2) + ' us/step</span>', delay: 240 },
+      { text: '<span class="dm">|</span> scaled max_window=512  : median <span class="ac">' + Math.max(scaled512.median, 0.01).toFixed(2) + ' us/step</span>, p99 <span class="ac">' + Math.max(scaled512.p99, 0.01).toFixed(2) + ' us/step</span>', delay: 240 },
+      { text: '<span class="dm">|</span> scaled max_window=2048 : median <span class="ac">' + Math.max(scaled2048.median, 0.01).toFixed(2) + ' us/step</span>, p99 <span class="ac">' + Math.max(scaled2048.p99, 0.01).toFixed(2) + ' us/step</span>', delay: 240 },
+      { text: '<span class="dm">──────────────────────────────────────────────────────────</span>', delay: 180 },
+      { text: '<span class="ok">✓</span> <span class="ok">MEDIAN PIPELINE OVERHEAD</span> : <span class="hl">' + medUs + ' µs / step</span> <span class="dm">(target &lt; 5.0µs)</span>', delay: 350 },
+      { text: '<span class="dm">|</span> Published figure for the real pipeline on Apple M1: <span class="hl">2.43 µs / step</span> ingest-only <span class="dm">(README, Empirical Verification)</span>', delay: 250 }
+    ];
+
+    var step = 0;
+    function nextStep(){
+      if(step >= BENCH_LINES.length){
+        setBadge(badgeText, 'var(--green)', false);
+        return;
+      }
+      var b = BENCH_LINES[step++];
+      addLog(null, null, b.text);
+      if(REDUCED){
+        while(step < BENCH_LINES.length){ addLog(null, null, BENCH_LINES[step++].text); }
+        setBadge(badgeText, 'var(--green)', false);
+        return;
+      }
+      runningTimer = setTimeout(nextStep, b.delay);
+    }
+    nextStep();
+  }
+
+  /* ───── COMMAND: AUDIT ───── */
+  var AUDIT_LINES = [
+    { text: '<span class="ok">+</span> detector suite verification (3/3 tier-1 configured & online):', delay: 260 },
+    { text: '<span class="dm">|</span> <span class="ac">LoopDetector</span>           <span class="ok">[ONLINE]</span> window=12, repeat_threshold=3, sha256 signatures', delay: 240 },
+    { text: '<span class="dm">|</span> <span class="ac">ErrorCascadeDetector</span>  <span class="ok">[ONLINE]</span> window=10, error_threshold=3, consecutive=3', delay: 240 },
+    { text: '<span class="dm">|</span> <span class="ac">LatencyAnomalyDetector</span> <span class="ok">[ONLINE]</span> Welford CUSUM, k=0.5σ, h=5.0σ, min_samples=5', delay: 240 },
+    { text: '<span class="dm">──────────────────────────────────────────────────────────</span>', delay: 180 },
+    { text: '<span class="dm">|</span> 9 further triggers are opt-in and ship inert: stagnation, goal_drift,', delay: 240 },
+    { text: '<span class="dm">|</span> token_runaway, meltdown, silent_abort, side_effect_duplicate,', delay: 240 },
+    { text: '<span class="dm">|</span> governance_decay, budget_breach, ml_ensemble.', delay: 240 },
+    { text: '<span class="dm">──────────────────────────────────────────────────────────</span>', delay: 180 },
+    { text: '<span class="ok">✓</span> <span class="ok">FAIL-OPEN ISOLATION</span> : <span class="hl">Armored</span> (target agent cannot crash)', delay: 280 },
+    { text: '<span class="dm">|</span> External dependencies: <span class="ac">0</span> (Python 3.10+ standard library only)', delay: 240 }
+  ];
+
+  function runAudit(){
+    stopCurrent();
+    currentCmd = 'audit';
+    setActiveTab('audit');
+    if(titleEl) titleEl.innerHTML = 'snagline audit &middot; 3 tier-1 detectors';
+    setBadge('auditing', 'var(--violet)', true);
+
+    addLine('<span class="ts">' + getTimeStr() + '</span> <span class="dm">$</span> <span class="ac">demo:</span> snagline audit --detectors <span class="dm">(in-browser visualization -- not a real snagline command)</span>', 'cmd-echo');
+
+    var step = 0;
+    function nextStep(){
+      if(step >= AUDIT_LINES.length){
+        setBadge('verified', 'var(--green)', false);
+        return;
+      }
+      var a = AUDIT_LINES[step++];
+      addLog(null, null, a.text);
+      if(REDUCED){
+        while(step < AUDIT_LINES.length){ addLog(null, null, AUDIT_LINES[step++].text); }
+        setBadge('verified', 'var(--green)', false);
+        return;
+      }
+      runningTimer = setTimeout(nextStep, a.delay);
+    }
+    nextStep();
+  }
+
+  /* ───── COMMAND: SERVE ───── */
+  var SERVE_LINES = [
+    { text: '<span class="ok">+</span> snagline serve: listening on <span class="ac">http://127.0.0.1:8787</span> <span class="dm">(POST /events, GET /health)</span>', delay: 320 },
+    { text: '<span class="dm">|</span> <span class="ac">POST /events</span> &lt; <span class="ac">{"episode_id":"ep-1","step_id":"s-1","timestamp":1.0,"action_type":"tool_call","action_signature":"a3f0c12d9e7b4a58","tool_name":"fetch_url","latency_ms":128}</span>', delay: 260 },
+    { text: '<span class="dm">|</span> <span class="ac">POST /events</span> &lt; <span class="ac">{"episode_id":"ep-1","step_id":"s-2","timestamp":2.0,"action_type":"tool_call","action_signature":"a3f0c12d9e7b4a58","tool_name":"fetch_url","latency_ms":131}</span>', delay: 240 },
+    { text: '<span class="dm">|</span> <span class="ac">POST /events</span> &lt; <span class="ac">{"episode_id":"ep-1","step_id":"s-3","timestamp":3.0,"action_type":"tool_call","action_signature":"a3f0c12d9e7b4a58","tool_name":"fetch_url","latency_ms":127}</span>', delay: 240 },
+    { text: '<span class="dm">|</span> <span class="ac">POST /events</span> &lt; <span class="ac">{"episode_id":"ep-1","step_id":"s-4","timestamp":4.0,"action_type":"tool_call","action_signature":"a3f0c12d9e7b4a58","tool_name":"fetch_url","latency_ms":124}</span>', delay: 240 },
+    { text: '<span class="dm">|</span> <span class="ac">POST /events</span> &lt; <span class="ac">{"episode_id":"ep-1","step_id":"s-5","timestamp":5.0,"action_type":"tool_call","action_signature":"a3f0c12d9e7b4a58","tool_name":"fetch_url","latency_ms":130}</span>', delay: 280 },
+    { text: '<span class="dm">|</span> <span class="ac">POST /events</span> &lt; <span class="ac">{"episode_id":"ep-1","step_id":"s-6","timestamp":6.0,"action_type":"tool_call","action_signature":"a3f0c12d9e7b4a58","tool_name":"fetch_url","error":true,"latency_ms":4021}</span>', delay: 380 },
+    { text: '<span class="dm">|</span> <span class="er">!</span> latency_anomaly <span class="er">risk 1.00</span> &middot; latency 4021ms deviates from baseline (mean 128ms)', delay: 440 },
+    { text: '<span class="dm">|</span> <span class="ac">GET /health</span> &rarr; <span class="ok">200</span> <span class="dm">{"status":"ok"}</span>', delay: 260 },
+    { text: '<span class="dm">|</span> <span class="ac">GET /metrics</span> &rarr; <span class="ok">200</span> <span class="dm">prometheus exposition</span>', delay: 260 },
+    { text: '<span class="dm">──────────────────────────────────────────────────────────</span>', delay: 180 },
+    { text: '<span class="ok">✓</span> sidecar live &middot; fail-open: a bad event never closes the listener <span class="dm">(demo of the real server)</span>', delay: 320 }
+  ];
+
+  function runServe(){
+    stopCurrent();
+    currentCmd = 'serve';
+    setActiveTab('serve');
+    if(titleEl) titleEl.innerHTML = 'snagline serve &middot; 127.0.0.1:8787';
+    setBadge('serving', 'var(--green)', true);
+
+    addLine('<span class="ts">' + getTimeStr() + '</span> <span class="dm">$</span> snagline serve --port 8787', 'cmd-echo');
+
+    var step = 0;
+    function nextStep(){
+      if(step >= SERVE_LINES.length){
+        setBadge('live', 'var(--green)', true);
+        return;
+      }
+      var s = SERVE_LINES[step++];
+      addLog(null, null, s.text);
+      if(REDUCED){
+        while(step < SERVE_LINES.length){ addLog(null, null, SERVE_LINES[step++].text); }
+        setBadge('live', 'var(--green)', true);
+        return;
+      }
+      runningTimer = setTimeout(nextStep, s.delay);
+    }
+    nextStep();
+  }
+
+  /* ───── COMMAND: HOOK ───── */
+  var HOOK_LINES = [
+    { text: '<span class="dm">|</span> stdin &lt; <span class="ac">{"tool_name":"search","tool_use_id":"tu_1","hook_event_name":"PostToolUseFailure"}</span>', delay: 300 },
+    { text: '<span class="ok">+</span> mapped hook payload &rarr; StepEvent <span class="dm">(paired PreToolUse/PostToolUse derives latency_ms)</span>', delay: 320 },
+    { text: '<span class="ok">✓</span> forwarded to <span class="ac">http://127.0.0.1:8787/events</span> <span class="dm">(200 OK in 3ms)</span>', delay: 300 },
+    { text: '<span class="dm">|</span> exit 0 <span class="dm">-- the bridge never blocks or breaks the agent it monitors</span>', delay: 260 }
+  ];
+
+  function runHook(){
+    stopCurrent();
+    currentCmd = 'hook';
+    setActiveTab('hook');
+    if(titleEl) titleEl.innerHTML = 'snagline hook &middot; PostToolUseFailure';
+    setBadge('bridging', 'var(--amber)', true);
+
+    addLine('<span class="ts">' + getTimeStr() + '</span> <span class="dm">$</span> cat hook-event.json | snagline hook --url http://127.0.0.1:8787/events', 'cmd-echo');
+
+    var step = 0;
+    function nextStep(){
+      if(step >= HOOK_LINES.length){
+        setBadge('forwarded', 'var(--green)', false);
+        return;
+      }
+      var h = HOOK_LINES[step++];
+      addLog(null, null, h.text);
+      if(REDUCED){
+        while(step < HOOK_LINES.length){ addLog(null, null, HOOK_LINES[step++].text); }
+        setBadge('forwarded', 'var(--green)', false);
+        return;
+      }
+      runningTimer = setTimeout(nextStep, h.delay);
+    }
+    nextStep();
+  }
+
+  /* ───── COMMAND: BASELINE ───── */
+  var BASELINE_LINES = [
+    { text: '<span class="ok">+</span> snagline baseline: fitted <span class="ac">5 tool(s)</span> from <span class="ac">24 step(s)</span>', delay: 320 },
+    { text: '<span class="dm">|</span> calc: n=5 mean=50.0ms std=0.0ms errors=0', delay: 240 },
+    { text: '<span class="dm">|</span> lookup: n=5 mean=50.0ms std=0.0ms errors=0', delay: 240 },
+    { text: '<span class="dm">|</span> search: n=5 mean=50.0ms std=0.0ms errors=0', delay: 240 },
+    { text: '<span class="dm">|</span> summarize: n=4 mean=50.0ms std=0.0ms errors=0', delay: 240 },
+    { text: '<span class="dm">|</span> write: n=5 mean=50.0ms std=0.0ms errors=1', delay: 280 },
+    { text: '<span class="dm">──────────────────────────────────────────────────────────</span>', delay: 180 },
+    { text: '<span class="ok">✓</span> wrote <span class="ac">baseline.json</span> <span class="dm">-- point SNAGLINE_CALIBRATION_BASELINE_PATH at it for goal-drift + latency calibration</span>', delay: 340 }
+  ];
+
+  function runBaseline(){
+    stopCurrent();
+    currentCmd = 'baseline';
+    setActiveTab('baseline');
+    if(titleEl) titleEl.innerHTML = 'snagline baseline &middot; healthy_run.jsonl';
+    setBadge('fitting', 'var(--accent)', true);
+
+    addLine('<span class="ts">' + getTimeStr() + '</span> <span class="dm">$</span> snagline baseline healthy_run.jsonl --output baseline.json', 'cmd-echo');
+
+    var step = 0;
+    function nextStep(){
+      if(step >= BASELINE_LINES.length){
+        setBadge('fitted', 'var(--green)', false);
+        return;
+      }
+      var b = BASELINE_LINES[step++];
+      addLog(null, null, b.text);
+      if(REDUCED){
+        while(step < BASELINE_LINES.length){ addLog(null, null, BASELINE_LINES[step++].text); }
+        setBadge('fitted', 'var(--green)', false);
+        return;
+      }
+      runningTimer = setTimeout(nextStep, b.delay);
+    }
+    nextStep();
+  }
+
+  /* ───── COMMAND: HELP ───── */
+  function runHelp(){
+    stopCurrent();
+    currentCmd = 'help';
+    setActiveTab('');
+    addLine('<span class="ts">' + getTimeStr() + '</span> <span class="dm">$</span> snagline --help', 'cmd-echo');
+    addLine('<span class="ac">SNAGLINE</span> -- Real-time failure detection for AI agents.');
+    addLine('Available commands:');
+    addLine('  <span class="ac">watch</span>     - Stream live agent monitoring in real-time');
+    addLine('  <span class="ac">replay</span>    - Replay a JSONL trajectory through the detectors (offline)');
+    addLine('  <span class="ac">bench</span>     - Run the ingest() overhead benchmark and print us/step');
+    addLine('  <span class="ac">serve</span>     - Run the sidecar HTTP server (POST /events, GET /health)');
+    addLine('  <span class="ac">hook</span>      - Universal command-hook bridge for external agent processes');
+    addLine('  <span class="ac">baseline</span>  - Fit or retrain a persisted healthy per-tool baseline');
+    addLine('  <span class="ac">clear</span>     - Clear terminal screen buffer');
+    addLine('<span class="dm">This terminal animates the six real commands above and also responds to a demo-only </span><span class="ac">audit</span><span class="dm"> preset that visualizes the detector suite and fail-open guarantees; it is not a real snagline command (there is no `snagline audit`).</span>');
+    addLine('<span class="dm">Tip: Click the preset tabs above or type any command and press Enter!</span>');
+    setBadge('help', 'var(--ink-2)', false);
+  }
+
+  /* ───── COMMAND: CLEAR ───── */
+  function runClear(){
+    stopCurrent();
+    termBody.innerHTML = '';
+    setActiveTab('');
+    addLine('<span class="ts">' + getTimeStr() + '</span> <span class="dm">Terminal cleared. Type a command or click a tab above.</span>');
+    if(titleEl) titleEl.innerHTML = 'snagline interactive terminal';
+    setBadge('ready', 'var(--green)', false);
+  }
+
+  /* ───── DISPATCHER ───── */
+  function execute(raw){
+    var clean = (raw || '').trim();
+    if(!clean) return;
+
+    history.push(clean);
+    historyIdx = history.length;
+
+    var normalized = clean.replace(/^(\$|snagline)\s+/i, '').trim().toLowerCase();
+    var parts = normalized.split(/\s+/);
+    var main = parts[0];
+
+    if(main === 'watch'){
+      runWatch(false);
+    } else if(main === 'replay'){
+      runReplay(parts[1] || 'episode-042.jsonl');
+    } else if(main === 'bench' || main === 'benchmark'){
+      runBench();
+    } else if(main === 'serve' || main === 'server'){
+      runServe();
+    } else if(main === 'hook'){
+      runHook();
+    } else if(main === 'baseline'){
+      runBaseline();
+    } else if(main === 'audit' || main === 'status'){
+      runAudit();
+    } else if(main === 'clear' || main === 'cls'){
+      runClear();
+    } else if(main === 'help' || main === '?'){
+      runHelp();
+    } else {
+      stopCurrent();
+      addLine('<span class="ts">' + getTimeStr() + '</span> <span class="dm">$</span> snagline ' + clean, 'cmd-echo');
+      addLine('<span class="er">snagline: command not recognized: \'' + clean + '\'.</span> Try: <span class="ac">watch</span>, <span class="ac">replay</span>, <span class="ac">bench</span>, <span class="ac">serve</span>, <span class="ac">hook</span>, <span class="ac">baseline</span>, <span class="ac">help</span>');
+      setBadge('error', 'var(--red)', false);
+    }
+  }
+
+  // Click on preset tabs
+  $$('.term-tab').forEach(function(btn){
+    btn.addEventListener('click', function(e){
+      e.preventDefault();
+      var cmd = btn.getAttribute('data-cmd');
+      if(cmd){
+        if(input) input.value = cmd;
+        execute(cmd);
+        if(input) input.value = '';
+      }
+    });
+  });
+
+  // Handle Form Submit & Enter
+  if(form){
+    form.addEventListener('submit', function(e){
+      e.preventDefault();
+      if(!input) return;
+      var val = input.value;
+      input.value = '';
+      execute(val);
+    });
+  }
+
+  // Handle Keyboard History in Input
+  if(input){
+    input.addEventListener('keydown', function(e){
+      if(e.key === 'ArrowUp'){
+        if(history.length > 0){
+          if(historyIdx > 0) historyIdx--;
+          input.value = history[historyIdx] || '';
+          e.preventDefault();
+        }
+      } else if(e.key === 'ArrowDown'){
+        if(history.length > 0){
+          if(historyIdx < history.length - 1){
+            historyIdx++;
+            input.value = history[historyIdx] || '';
+          } else {
+            historyIdx = history.length;
+            input.value = '';
+          }
+          e.preventDefault();
+        }
+      }
+    });
+  }
+
+  // Focus input when clicking on terminal background
+  term.addEventListener('click', function(e){
+    if(e.target.tagName !== 'BUTTON' && e.target !== input && input){
+      input.focus();
+    }
+  });
+
+  // Initialize with the watch stream on intersection
+  new IntersectionObserver(function(es){
+    es.forEach(function(e){
+      if(e.isIntersecting && !isObserving){
+        isObserving = true;
+        runWatch(true);
+      } else if(!e.isIntersecting && isObserving && currentCmd === 'watch'){
+        stopCurrent();
+        isObserving = false;
+      }
+    });
+  }, { threshold:0.2 }).observe(term);
+})();
+
+/* ═══════════════ LATENCY CANVAS ═══════════════ */
+(function(){
+  var cv = $('#sig'); if(!cv) return;
+  var ctx = cv.getContext('2d');
+  var badge = $('#cusumBadge'), rMean = $('#rMean'), rLast = $('#rLast'), rCusum = $('#rCusum');
+  var N = 88, MEAN = 120, SD = 11, K = 0.5, H = 3.0;
+  var data = [], S = 0, phase = 0, alarm = false, w = 0, h = 0;
+
+  function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  /* getComputedStyle is a layout-flushing read; it was called ~10x per redraw at
+     9fps. Resolve the palette once and refresh it only when the theme changes. */
+  var PAL = {};
+  function palette(){
+    ['--line','--ink-2','--accent','--accent-dim','--red','--red-dim'].forEach(function(k){ PAL[k] = css(k); });
+  }
+  palette();
+  new MutationObserver(function(){ palette(); draw(); })
+    .observe(document.documentElement, { attributes:true, attributeFilter:['data-theme'] });
+  function size(){
+    var r = cv.getBoundingClientRect(), dpr = Math.min(devicePixelRatio || 1, 2);
+    w = r.width; h = r.height;
+    cv.width = Math.max(1, w*dpr); cv.height = Math.max(1, h*dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  function next(){
+    phase++;
+    if(phase > 118){ phase = 0; S = 0; alarm = false; }
+    var drift = phase > 70 ? Math.min((phase-70)*4.6, 78) : 0;
+    var v = MEAN + drift + (Math.random()+Math.random()-1) * SD * 1.7;
+    data.push(v); if(data.length > N) data.shift();
+    S = Math.max(0, S + (v - MEAN - K*SD));
+    if(S > H*SD) alarm = true;
+    return v;
+  }
+  function draw(){
+    if(!w) size();
+    ctx.clearRect(0,0,w,h);
+    var lo = MEAN - SD*5, hi = MEAN + 110;
+    var Y = function(v){ return h - ((v-lo)/(hi-lo)) * h; };
+    var X = function(i){ return (i/(N-1)) * w; };
+
+    ctx.strokeStyle = PAL['--line']; ctx.lineWidth = 1;
+    for(var g=0; g<4; g++){
+      var gy = Math.round(h*g/3) + 0.5;
+      ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(w,gy); ctx.stroke();
+    }
+    ctx.fillStyle = PAL['--line']; ctx.globalAlpha = 0.5;
+    ctx.fillRect(0, Y(MEAN + SD*3), w, Math.max(1, Y(MEAN - SD*3) - Y(MEAN + SD*3)));
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = PAL['--ink-2']; ctx.setLineDash([3,4]);
+    ctx.beginPath(); ctx.moveTo(0, Y(MEAN)); ctx.lineTo(w, Y(MEAN)); ctx.stroke();
+    ctx.setLineDash([]);
+
+    if(data.length > 1){
+      ctx.beginPath();
+      data.forEach(function(v,i){ i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(i), Y(v)); });
+      ctx.strokeStyle = alarm ? PAL['--red'] : PAL['--accent'];
+      ctx.lineWidth = 1.6; ctx.lineJoin = 'round'; ctx.stroke();
+      ctx.lineTo(X(data.length-1), h); ctx.lineTo(X(0), h); ctx.closePath();
+      var grd = ctx.createLinearGradient(0,0,0,h);
+      grd.addColorStop(0, alarm ? PAL['--red-dim'] : PAL['--accent-dim']);
+      grd.addColorStop(1, 'transparent');
+      ctx.fillStyle = grd; ctx.fill();
+      var lx = X(data.length-1), ly = Y(data[data.length-1]);
+      ctx.beginPath(); ctx.arc(lx, ly, 2.6, 0, Math.PI*2);
+      ctx.fillStyle = alarm ? PAL['--red'] : PAL['--accent']; ctx.fill();
+    }
+    var lastV = data.length ? data[data.length-1] : MEAN;
+    rMean.textContent  = MEAN.toFixed(0) + 'ms';
+    rLast.textContent  = lastV.toFixed(0) + 'ms';
+    rCusum.textContent = S.toFixed(2);
+    rCusum.className = alarm ? 'fire' : '';
+    badge.innerHTML = alarm
+      ? '<i style="background:var(--red)"></i>cusum alarm'
+      : '<i></i>nominal';
+    badge.style.color = alarm ? 'var(--red)' : 'var(--green)';
+  }
+
+  size();
+  /* Seed a full window of healthy samples: the panel should open nominal and
+     earn its alarm, not arrive already firing. */
+  for(var i=0;i<N;i++) data.push(MEAN + (Math.random()+Math.random()-1) * SD * 1.7);
+  phase = 0; S = 0; alarm = false;
+  draw();
+  addEventListener('resize', function(){ size(); draw(); });
+  if(REDUCED) return;
+  var iv = null;
+  new IntersectionObserver(function(es){
+    es.forEach(function(e){
+      if(e.isIntersecting && !iv){ iv = setInterval(function(){ next(); draw(); }, 110); }
+      else if(!e.isIntersecting && iv){ clearInterval(iv); iv = null; }
+    });
+  }, { threshold:0.2 }).observe(cv);
+})();
+
+/* ═══════════════ THEME ═══════════════ */
+(function(){
+  var tt = $('#tt'), meta = document.querySelector('meta[name="theme-color"]');
+  var SUN  = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4.5"/><path d="M12 1.5v2M12 20.5v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1.5 12h2M20.5 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"/></svg>';
+  var MOON = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+  function set(t){
+    document.documentElement.setAttribute('data-theme', t);
+    localStorage.setItem('snagline-theme', t);
+    tt.innerHTML = t === 'dark' ? SUN : MOON;
+    tt.setAttribute('aria-label', t === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
+    if(meta) meta.setAttribute('content', t === 'dark' ? '#07070a' : '#f1f0ec');
+  }
+  var saved = localStorage.getItem('snagline-theme');
+  set(saved === 'light' ? 'light' : 'dark');
+  tt.addEventListener('click', function(){
+    set(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+  });
+})();
+
+/* ═══════════════ COPY ═══════════════ */
+$$('[data-copy]').forEach(function(el){
+  el.addEventListener('click', function(){
+    var hint = el.querySelector('.hint');
+    var done = function(ok){
+      if(!hint) return;
+      hint.textContent = ok ? 'copied' : 'press ⌘C';
+      setTimeout(function(){ hint.textContent = 'copy'; }, 1500);
+    };
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(el.dataset.copy).then(function(){ done(true); }, function(){ done(false); });
+    } else { done(false); }
+  });
+});
+
+
+/* ═══════════════ PIPELINE FLOW ANIMATION ═══════════════ */
+(function(){
+  var stepButtons = $$('[data-flow-step]');
+
+  if(!stepButtons.length) return;
+
+  var STEPS = [
+    {
+      stepNum: 'STEP 1 · RUNNING',
+      counter: 'STEP 1 OF 5',
+      call: 'tool_call:search("docs")',
+      isErr: false,
+      status: 'STATUS: OK',
+      statusClass: 'ok',
+      latency: '118ms',
+      loopVal: '0 / 3',
+      loopPct: 0,
+      cascadeVal: '0 / 3',
+      cascadePct: 0,
+      latencyVal: 'S = 0.00',
+      latencyPct: 5,
+      riskScore: '0.00',
+      riskSub: 'Nominal · Safe',
+      riskClass: 'ok',
+      directive: 'CONTINUE',
+      directiveClass: 'continue',
+      directiveDesc: 'Step allowed. Zero latency overhead added to agent.',
+      sinks: ['Console'],
+      ticker: 'Observed tool_call:search (118ms) — All detectors nominal — Directive: CONTINUE'
+    },
+    {
+      stepNum: 'STEP 2 · RUNNING',
+      counter: 'STEP 2 OF 5',
+      call: 'tool_call:fetch("chunk_4")',
+      isErr: false,
+      status: 'STATUS: OK',
+      statusClass: 'ok',
+      latency: '132ms',
+      loopVal: '0 / 3',
+      loopPct: 0,
+      cascadeVal: '0 / 3',
+      cascadePct: 0,
+      latencyVal: 'S = 0.08',
+      latencyPct: 12,
+      riskScore: '0.00',
+      riskSub: 'Nominal · Safe',
+      riskClass: 'ok',
+      directive: 'CONTINUE',
+      directiveClass: 'continue',
+      directiveDesc: 'Step allowed. Zero latency overhead added to agent.',
+      sinks: ['Console'],
+      ticker: 'Observed tool_call:fetch (132ms) — All detectors nominal — Directive: CONTINUE'
+    },
+    {
+      stepNum: 'STEP 3 · WARNING',
+      counter: 'STEP 3 OF 5',
+      call: 'tool_call:scrape("api.docs")',
+      isErr: true,
+      status: 'FAIL: 429 RATE LIMIT',
+      statusClass: 'warn',
+      latency: '88ms',
+      loopVal: '1 / 3 (observed)',
+      loopPct: 33,
+      cascadeVal: '1 / 3 (1 error)',
+      cascadePct: 33,
+      latencyVal: 'S = 0.14',
+      latencyPct: 18,
+      riskScore: '0.28',
+      riskSub: 'Evaluating · Fail-Open Active',
+      riskClass: 'warn',
+      directive: 'CONTINUE',
+      directiveClass: 'continue',
+      directiveDesc: 'Fail-open: single error logged, agent not interrupted.',
+      sinks: ['Console'],
+      ticker: 'Single error on scrape() (429 Rate Limit) — Logged in cascade counter (1/3) — Directive: CONTINUE'
+    },
+    {
+      stepNum: 'STEP 4 · ELEVATED RISK',
+      counter: 'STEP 4 OF 5',
+      call: 'tool_call:scrape("api.docs")',
+      isErr: true,
+      status: 'FAIL: 429 (RETRY 1)',
+      statusClass: 'warn',
+      latency: '91ms',
+      loopVal: '2 / 3 (duplicate sig)',
+      loopPct: 66,
+      cascadeVal: '2 / 3 (consecutive)',
+      cascadePct: 66,
+      latencyVal: 'S = 0.22',
+      latencyPct: 25,
+      riskScore: '0.64',
+      riskSub: 'Elevated Risk · Warning',
+      riskClass: 'warn',
+      directive: 'CONTINUE',
+      directiveClass: 'continue',
+      directiveDesc: 'Elevated risk warning: 2 consecutive failures with identical signature.',
+      sinks: ['Console'],
+      ticker: 'Warning: 2nd consecutive failure on scrape() — Loop window tracking duplicate signature — Directive: CONTINUE'
+    },
+    {
+      stepNum: 'STEP 5 · ALARM & INTERVENE',
+      counter: 'STEP 5 OF 5',
+      call: 'tool_call:scrape("api.docs")',
+      isErr: true,
+      status: 'TRIPPED: 3x LOOP DETECTED',
+      statusClass: 'alarm',
+      latency: '89ms',
+      loopVal: '3 / 3 FIRED!',
+      loopPct: 100,
+      cascadeVal: '3 / 3 FIRED!',
+      cascadePct: 100,
+      latencyVal: 'S = 0.29',
+      latencyPct: 35,
+      riskScore: '0.96',
+      riskSub: 'ALARM · FAILURE RISK DETECTED',
+      riskClass: 'alarm',
+      directive: 'PAUSE / HALT',
+      directiveClass: 'halt',
+      directiveDesc: 'AGENT HALTED: Infinite retry cascade stopped before wasting LLM budget.',
+      sinks: ['Console', 'Webhook', 'Halt Hook'],
+      ticker: '🚨 CRITICAL: Loop (3/3) & Error Cascade (3/3) tripped! Risk 0.96 -> Policy: HALT dispatched!'
+    }
+  ];
+
+  var curStep = 0;
+  var timer = null;
+
+  var elStepTag = $('#flowStepTag');
+  var elAgentCall = $('#flowAgentCall');
+  var elStatusPill = $('#flowStatusPill');
+  var elLatencyVal = $('#flowLatencyVal');
+  var elDetLoopVal = $('#flowDetLoopVal');
+  var elDetLoopFill = $('#flowDetLoopFill');
+  var elDetLoop = $('#flowDetLoop');
+  var elDetCascadeVal = $('#flowDetCascadeVal');
+  var elDetCascadeFill = $('#flowDetCascadeFill');
+  var elDetCascade = $('#flowDetCascade');
+  var elDetLatencyVal = $('#flowDetLatencyVal');
+  var elDetLatencyFill = $('#flowDetLatencyFill');
+  var elRiskScore = $('#flowRiskScore');
+  var elRiskSub = $('#flowRiskSub');
+  var elDirectiveVal = $('#flowDirectiveVal');
+  var elDirectiveSub = $('#flowDirectiveSub');
+  var elSinkConsole = $('#flowSinkConsole');
+  var elSinkWebhook = $('#flowSinkWebhook');
+  var elSinkHalt = $('#flowSinkHalt');
+  var elStepCounter = $('#flowStepCounter');
+  var elTickerText = $('#flowTickerText');
+  var elCoreCard = $('#flowCoreCard');
+
+  function renderStep(idx){
+    curStep = idx;
+    var data = STEPS[idx];
+
+    elStepTag.textContent = data.stepNum;
+    elAgentCall.textContent = data.call;
+    elAgentCall.className = 'agent-call' + (data.isErr ? ' err' : '');
+    elStatusPill.textContent = data.status;
+    elStatusPill.className = 'agent-pill ' + data.statusClass;
+    elLatencyVal.textContent = data.latency;
+
+    elDetLoopVal.textContent = data.loopVal;
+    elDetLoopFill.style.width = data.loopPct + '%';
+    elDetLoop.className = 'det-item' + (data.loopPct >= 100 ? ' fired' : (data.loopPct > 0 ? ' warning' : ''));
+
+    elDetCascadeVal.textContent = data.cascadeVal;
+    elDetCascadeFill.style.width = data.cascadePct + '%';
+    elDetCascade.className = 'det-item' + (data.cascadePct >= 100 ? ' fired' : (data.cascadePct > 0 ? ' warning' : ''));
+
+    elDetLatencyVal.textContent = data.latencyVal;
+    elDetLatencyFill.style.width = data.latencyPct + '%';
+
+    elRiskScore.textContent = data.riskScore;
+    elRiskSub.textContent = data.riskSub;
+    elRiskScore.className = 'risk-score ' + (data.riskClass === 'alarm' ? 'fired' : (data.riskClass === 'warn' ? 'warn' : ''));
+    elRiskSub.className = 'risk-sub ' + (data.riskClass === 'alarm' ? 'fired' : (data.riskClass === 'warn' ? 'warn' : ''));
+
+    elCoreCard.className = 'flow-card' + (data.riskClass === 'alarm' ? ' firing' : '');
+
+    elDirectiveVal.textContent = data.directive;
+    elDirectiveVal.className = 'directive-val ' + data.directiveClass;
+    elDirectiveSub.textContent = data.directiveDesc;
+
+    elSinkConsole.className = 'sink-pill ' + (data.sinks.indexOf('Console') !== -1 ? (data.riskClass === 'alarm' ? 'fired-red' : 'fired') : '');
+    elSinkWebhook.className = 'sink-pill ' + (data.sinks.indexOf('Webhook') !== -1 ? 'fired-red' : '');
+    elSinkHalt.className = 'sink-pill ' + (data.sinks.indexOf('Halt Hook') !== -1 ? 'fired-red' : '');
+
+    stepButtons.forEach(function(btn, i){
+      btn.className = 'time-step-btn' + (i === idx ? (i === 4 ? ' active-err' : ' active') : '');
+    });
+    elStepCounter.textContent = data.counter;
+    elTickerText.textContent = data.ticker;
+  }
+
+  function nextStep(){
+    var next = (curStep + 1) % STEPS.length;
+    renderStep(next);
+  }
+
+  function getStepDuration(){
+    return curStep === 4 ? 3200 : 2000;
+  }
+
+  function scheduleNext(){
+    if(timer) clearTimeout(timer);
+    timer = setTimeout(function(){
+      nextStep();
+      scheduleNext();
+    }, getStepDuration());
+  }
+
+  stepButtons.forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var s = parseInt(btn.dataset.flowStep, 10);
+      renderStep(s);
+      scheduleNext();
+    });
+  });
+
+  document.addEventListener('visibilitychange', function(){
+    if(document.visibilityState === 'visible'){
+      scheduleNext();
+    } else if(timer){
+      clearTimeout(timer);
+    }
+  });
+
+  renderStep(0);
+  scheduleNext();
+})();
+
+/* ═══════════════ DYNAMIC GITHUB BADGE ═══════════════ */
+(function(){
+  var starsEl = $('#ghStars');
+  var verEl = $('#ghVersion');
+  if(!starsEl && !verEl) return;
+
+  var CACHE_KEY = 'snagline_gh_stats';
+  var CACHE_TTL = 10 * 60 * 1000; // 10 minutes cache
+
+  function applyData(data){
+    if(starsEl && data.stars !== undefined){
+      starsEl.textContent = data.stars;
+    }
+    if(verEl && data.version){
+      verEl.textContent = data.version;
+    }
+  }
+
+  // Load from session cache first to prevent GitHub API rate limits
+  try {
+    var cached = sessionStorage.getItem(CACHE_KEY);
+    if(cached){
+      var parsed = JSON.parse(cached);
+      if(Date.now() - parsed.ts < CACHE_TTL){
+        applyData(parsed);
+        return;
+      }
+    }
+  } catch(e){}
+
+  // Fetch live repo info (stars)
+  var pRepo = fetch('https://api.github.com/repos/Cyrax321/SNAGLINE')
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .catch(function(){ return null; });
+
+  // Fetch latest release (version tag)
+  var pRel = fetch('https://api.github.com/repos/Cyrax321/SNAGLINE/releases/latest')
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .catch(function(){ return null; });
+
+  Promise.all([pRepo, pRel]).then(function(res){
+    var repo = res[0];
+    var rel = res[1];
+    var out = {};
+
+    if(repo && typeof repo.stargazers_count === 'number'){
+      out.stars = repo.stargazers_count;
+    }
+    if(rel && (rel.tag_name || rel.name)){
+      out.version = rel.tag_name || rel.name;
+    }
+
+    if(out.stars !== undefined || out.version){
+      applyData(out);
+      try {
+        out.ts = Date.now();
+        sessionStorage.setItem(CACHE_KEY, JSON.stringify(out));
+      } catch(e){}
+    }
+  }).catch(function(){});
+})();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,404 @@
+# MCP server
+
+CONTINUUM ships an MCP server so any MCP client (for example Claude Code) can use
+its durability layer without embedding Python. The server is `continuum-mcp`,
+built from `continuum.mcp.server.build_server`.
+
+```bash
+# stdio (the transport Claude Code uses)
+continuum-mcp --db continuum.db
+
+# or over the network
+continuum-mcp --transport sse
+continuum-mcp --transport streamable-http
+```
+
+## Installation
+
+The `continuum-mcp` console script ships with the base package, but the SDK it
+serves with is the optional `[mcp]` extra. An install without the extra is a
+supported state, not a broken one: the entry point reports the missing extra
+with the command to run on stderr and exits 1 instead of raising a traceback
+the client can only report as `CONNECTION_CLOSED`.
+
+```bash
+pip install "continuum-agent[mcp]"   # from PyPI
+
+# GitHub or fork installs must use the PEP 508 direct-reference form, quoted:
+pip install "continuum-agent[mcp] @ git+https://github.com/<you>/CONTINUUM.git"
+
+# A bare VCS URL cannot carry an extra, so it installs the core only and the
+# entry point will report the missing SDK on first run:
+pip install git+https://github.com/Cyrax321/CONTINUUM.git
+```
+
+Quote the extra in every form. Unquoted `[mcp]` is a glob in zsh, where the
+command either fails or silently expands; the same rule covers the editable
+form, `pip install -e ".[mcp]"`.
+
+The split is deliberate. The core library and CLI must import with only
+`pydantic` (stated in `pyproject.toml` and the module docstrings), and
+packaging has no mechanism to condition an entry point on an extra, so the
+choice is between an unconditional entry point with a clear missing-dependency
+error and moving the SDK into core dependencies. The second was rejected
+because it violates that architecture; the first is the contract documented
+here and exercised by the missing-SDK tests in `tests/test_mcp_server.py`.
+
+## Registration
+
+### `continuum mcp install` (cross-platform)
+
+The committed `.mcp.json` cannot express "`.venv/bin/continuum-mcp` on POSIX,
+`.venv\Scripts\continuum-mcp.exe` on Windows", and a bare command name is
+resolved by the host's `CreateProcess` against *its* PATH, not the child's
+environment. So resolution has to happen on the machine that will spawn the
+server, which is what this command does (issue #834):
+
+```bash
+continuum mcp install                        # local scope, this project
+continuum mcp install --scope project        # the shared .mcp.json instead
+```
+
+It verifies the `mcp` SDK by spawning a probe subprocess first (a missing extra
+is refused with `pip install "continuum-agent[mcp]"` and nothing is written),
+then bakes absolute values into the registration: the resolved console script
+(or `python -u -m continuum.mcp` when no executable is on PATH, the form that
+works on Windows with zero PATH assumptions) and an absolute `--db` (the host's
+spawn cwd is not the project root). The result connects regardless of the
+host's PATH and spawn cwd. Install is idempotent and repoints a moved
+virtualenv; `continuum mcp remove` deletes only the entries install wrote.
+See [the CLI reference](cli.md#mcp) for the flags.
+
+#### Supported hosts and config formats
+
+A host reads a config file that is not always JSON, so the format is part of
+the host profile rather than a guess made at read time. `--host` selects the
+profile; the profile supplies the file paths, the container shape and the
+client name the host is expected to announce:
+
+| `--host`      | Project file                  | Local or user file                       | Format | Client name sent |
+| ------------- | ----------------------------- | ---------------------------------------- | ------ | ---------------- |
+| `claude-code` | `.mcp.json`                   | `~/.claude.json`                          | JSON   | `claude-code`    |
+| `gemini`      | `.mcp.json`                   | `~/.gemini/settings.json`                 | JSON   | `gemini-cli`     |
+| `cursor`      | `.cursor/mcp.json`            | `~/.cursor/mcp.json`                      | JSON   | `cursor`         |
+| `vscode`      | `.vscode/mcp.json`            | the VS Code user `settings.json`          | JSON   | `vscode`         |
+| `codex`       | `.codex/config.toml`          | `~/.codex/config.toml`                    | TOML   | `codex-cli`      |
+| `opencode`    | `opencode.json`               | `~/.config/opencode/opencode.json`        | JSON   | `opencode`       |
+| `continue`    | `.continue/config.yaml`       | `~/.continue/config.yaml`                 | YAML   | `continue`       |
+| `zed`         | `.zed/settings.json`          | `~/.config/zed/settings.json`             | JSON   | `Zed`            |
+
+The client name matters because it is the name the authorization policy below
+compares against. Zed announces `Zed`, which is not the string `zed`; the
+comparison folds case and trims whitespace, so listing `zed` permits it. If a
+host ever announces a second name, that is an alias, declared below.
+
+The TOML and YAML paths need a parser the JSON ones do not. `tomli-w` backs
+TOML and `PyYAML` backs YAML, both declared in the `mcp` extra (PR #1600) and
+imported lazily, so a host that needs neither pays for neither and a clone
+registering only JSON hosts installs neither. A missing parser is refused by
+name, with the command that installs it, rather than producing a config file
+that silently drops the registration.
+
+Reading and writing both go through one format layer, so the shape of a
+registration is the same in every format. That is what lets `continuum doctor`
+report a stale or unconfigured IDE across JSON, TOML and YAML hosts alike
+instead of silently calling a YAML host empty.
+
+#### The registration lifecycle
+
+Registration is written once and then has to survive everything that happens
+to an install afterwards. That lifecycle is defined rather than left
+ambiguous (issue #841), because every row is a real failure mode a user would
+otherwise diagnose by hand:
+
+| You did                                 | What happens to the registration                                                                                                                                                               |
+| --------------------------------------- | ------------------------------------------------                                                                                                                                               |
+| `pip install -U "continuum-agent[mcp]"` | The venv path or interpreter may change; re-run `continuum mcp install` to repoint it in place. No duplicate entry is created: install recognises the entry it wrote and replaces the command. |
+| Moved the project, renamed the venv     | Same as an upgrade: the baked path is stale, re-run `continuum mcp install`. `continuum mcp doctor` reports the stale resolution as a failure.                                                 |
+| `continuum mcp install` again           | Idempotent. An unchanged install rewrites the same values; a moved one repoints. Nothing is duplicated.                                                                                        |
+| `continuum mcp remove`                  | Deletes the entries install wrote and recognises; a foreign or hand-edited entry under the same name is left alone.                                                                            |
+| `pip uninstall continuum-agent`         | Removes the code; the registration survives and now points at nothing. Run `continuum mcp remove` to clear it, so a host does not keep trying to spawn a server that no longer exists.         |
+| Committed a path expression             | Portable across supported POSIX environments: the host expands `${CLAUDE_PROJECT_DIR:-.}/.venv/bin/continuum-mcp` at spawn time. `continuum doctor` reports it `unresolved`, not `stale`, because a path the doctor cannot expand is not evidence of a broken one, and does not tell you to re-bake an absolute path over it. |
+
+Re-running `install` after any of the first three rows is the documented
+remediation and is always safe, which is what makes the command usable from a
+setup script: it never has to be guarded with "only if not already
+installed".
+
+### The committed `.mcp.json`
+
+Claude Code also discovers the server from the project's `.mcp.json`, which
+declares it by bare command name:
+
+```json
+{
+  "mcpServers": {
+    "continuum-mcp": {
+      "command": "continuum-mcp",
+      "args": ["--db", "continuum.db"],
+      "env": { "CONTINUUM_MCP_MUTATING_CLIENTS": "claude-code" }
+    }
+  }
+}
+```
+
+The bare name is deliberate, an absolute path in a committed file would be wrong
+on every machine except the one that wrote it, but it means the client resolves
+`continuum-mcp` against the `PATH` it inherited. Registration therefore succeeds
+only when the environment CONTINUUM was installed into is on that `PATH`. When it
+is not, the client cannot start the server at all; see
+[Troubleshooting](#troubleshooting).
+
+Registration makes the tools below available to the agent. It does not by itself
+instrument anything: state is recorded when the agent calls the tools, and,
+because a voluntary call can always be missed, when the `PostToolUse` hook
+installed by `continuum hooks install claude-code` records a file write outside
+the model's control.
+
+## Tools
+
+All tools take a `run_id`. Read-only tools stay open to every caller; mutating
+tools are gated by the allowlist (see Security).
+
+| Tool | Kind | Purpose |
+|------|------|---------|
+| `continuum_record_progress` | mutate | Record goal progress (completed/total). |
+| `continuum_checkpoint` | mutate | Force a state checkpoint. |
+| `continuum_record_summary` | mutate | Record where reasoning stands (plan stack, decisions, open questions, working set) so a fresh session inherits the plan instead of guessing. Capped at 4096 serialized characters; informational only, never moves mode or safety. |
+| `continuum_record_plan` | mutate | Upsert plan units by `id` so a resumed session knows the exact remaining work; one call carries a single unit or the whole plan, and units absent from it keep their recorded status. Units carry `id`, `title`, `status` (`pending`, `working`, `done`, `blocked`) and optional `depends_on`. |
+| `continuum_intercept_action` | mutate | Claim a side effect; returns whether to proceed. |
+| `continuum_complete_action` | mutate | Record a side effect succeeded. |
+| `continuum_fail_action` | mutate | Record a side effect did not happen. |
+| `continuum_reconcile_action` | mutate | Resolve an uncertain side effect from outside evidence. |
+| `continuum_compensate_action` | mutate | Record a completed side effect was deliberately undone. |
+| `continuum_confirm` | mutate | Confirm a human-approved recovery step. |
+| `continuum_validate` | read | Check state against the current environment. |
+| `continuum_resume` | read | Assess and describe how the run may resume. Omit `run_id` to target the most recently active (interrupted) run. Returns the run's `goal` so a resumed session knows what to continue. |
+| `continuum_list_actions` | read | List recorded side effects and their outcomes. |
+
+Thirteen tools: three read-only, ten mutating.
+
+Read-only responses `continuum_resume` and `continuum_validate` include a
+`constraint_pins` block: per-pin status (`present`, `absent`, `unverifiable`), grace deadline, and flagged set derived from reconstruction accounting (hash-tagged markers in the recovery context, issue #419). The CLI renders flagged pins prominently with TTY-aware colour while piped output stays byte-identical modulo colour codes. No gating changes live here; strict escalation remains in the accounting layer.
+
+## Environment variables
+
+`CONTINUUM_MCP_ALLOW`
+: The primary authorization variable: a comma-separated list of client names
+allowed to call mutating tools (for example
+`CONTINUUM_MCP_ALLOW=claude-code,cline`). Everything else is denied, and the
+read-only tools above stay open to every caller.
+
+`CONTINUUM_MCP_MUTATING_CLIENTS`
+: An older alias for `CONTINUUM_MCP_ALLOW`, kept from PR #3. It states what is
+being allowed more explicitly, so it wins when both are set; otherwise the two
+behave identically.
+
+Either variable takes precedence over `.continuum/mcp-policy.json`, and an
+explicit `allow` passed by an API caller takes precedence over both; each
+source replaces the ones below it rather than merging, so `policy.source`
+always names exactly where a grant came from.
+
+`CONTINUUM_MCP_CLIENT_ALIASES`
+: Second spellings of a client you have already allowed, for a host that
+announces more than one name. Declared as `canonical:alias` groups separated
+by commas or whitespace, or as the policy file's `aliases` key:
+
+```bash
+CONTINUUM_MCP_CLIENT_ALIASES='cursor:cursor-vscode,claude-code:claude'
+```
+
+The separator is a **colon**, and an inline `=` inside the allowlist is refused
+outright rather than guessed at. The allowlist is split on commas and
+whitespace, so `CONTINUUM_MCP_ALLOW=cursor=cursor-vscode` would be read as two
+standalone entries: a client literally named `cursor=cursor-vscode`, plus a
+grant to `cursor-vscode` that the text beside it never referred to. That is
+an operator's intent applied and misread, with nothing to say so, so the
+inline form raises instead.
+
+An alias only counts when the canonical name it belongs to is itself allowed.
+Declaring `cursor:cursor-vscode` for a client you have not allowed grants
+nothing, which is what keeps the alias list from being a second allowlist
+nobody has to reconcile.
+
+`CONTINUUM_MCP_ALLOW_ANY_CLIENT`
+: Set it to `*` to waive the name comparison entirely, for an operator who
+genuinely runs many MCP clients against one database:
+
+```bash
+CONTINUUM_MCP_ALLOW_ANY_CLIENT='*'
+```
+
+It is opt-in, never inferred and never a default. It waives *which client is
+calling*, not whether the connection is authenticated: with
+`CONTINUUM_MCP_TOKEN` or per-client tokens set, authentication still applies.
+Because a caller whose host profile was never written down is exactly the
+caller worth seeing, a wildcard is reported in `policy.source` and named in
+every refusal the server writes. It is the one setting that makes the allowlist
+above optional, so it is worth reaching for last.
+
+`CONTINUUM_DB`
+: The database path the server opens when `--db` is not passed on the command
+line (default `./continuum.db`).
+
+`CONTINUUM_MCP_SLIM`
+: Set to `1` to ship a read-only server. The tool table above lists thirteen
+  tools -- ten mutating, three read-only -- and slim removes the ten mutating
+  ones, leaving `continuum_resume`, `continuum_validate` and
+  `continuum_list_actions`.
+The variable is checked inside `build_server`, so every caller path that
+constructs a server honours it, not just the CLI entry point. It is off by
+default and is not a security boundary on its own: it shrinks what a caller can
+ask for, but the allowlist above is still what decides who may ask.
+
+## build_server
+
+`continuum.mcp.server.build_server(database=None, *, storage=None, policy=None, auth=None, confirm_auth=None) -> tuple[MCPServer, ContinuumMCP]`
+
+Construct the MCP server and its backing context. The second element is the
+`ContinuumMCP` context, not a `Storage`; callers that need the store reach it
+as `ctx.storage`. `policy` defaults to `load_policy()`
+(allowlist from env or `.continuum/mcp-policy.json`); `auth` defaults to
+`load_auth()` (shared secret or per-client tokens from env). Call `server.run(transport=...)`
+to serve.
+
+## main
+
+`continuum.mcp.server.main(argv=None)` is the `continuum-mcp` console entry
+point. It parses `--db` and `--transport` and runs the server.
+
+## Troubleshooting
+
+### `CONNECTION_CLOSED`
+
+```
+❯ /mcp
+⎿ Failed to reconnect to continuum-mcp: CONNECTION_CLOSED
+```
+
+`claude mcp list` reports the same condition as `✘ Failed to connect`.
+
+The wording describes a server that started and then died. Usually it is a server
+that never started: the client could not resolve `continuum-mcp` on the `PATH` it
+inherited, and a spawn that fails surfaces as a transport that closed.
+
+No CONTINUUM code runs in this failure. The executable is never located, so the
+server cannot detect the condition, report it, or recover from it, the whole
+diagnosis has to happen on the client side, which is why it is documented here
+rather than handled in code.
+
+This is not a Windows-specific defect, but it shows up there most often. A console
+script installs as `.venv\Scripts\continuum-mcp.exe`, and that directory joins
+`PATH` only inside an activated virtual environment, so a client started from
+anywhere else, a desktop launcher, a fresh terminal, an IDE, inherits a `PATH`
+without it. The same failure occurs on macOS and Linux whenever the client is
+launched outside the environment holding the install; an already-activated shell
+is what usually hides it.
+
+#### Confirm the cause
+
+`continuum mcp doctor` performs the whole client-side diagnosis: it checks that
+the `mcp` extra imports in a fresh interpreter, resolves `continuum-mcp` the way
+a host-spawned process would, and completes a live `initialize` handshake
+against the resolved command, reporting the child's stderr tail when the
+handshake fails. Exit 0 means the install is healthy; every failure names its
+cause and its fix, and `--json` emits the report for scripting and CI (issue
+#835).
+
+To diagnose by hand instead, ask whether the name resolves in the environment
+the client was launched from:
+
+```
+which continuum-mcp        # macOS, Linux
+where.exe continuum-mcp    # Windows (PowerShell)
+```
+
+Finding nothing is the diagnosis. Then confirm the server itself is healthy by
+running it through its full path:
+
+```
+/path/to/.venv/bin/continuum-mcp --help                 # macOS, Linux
+& "C:\path\to\.venv\Scripts\continuum-mcp.exe" --help   # Windows (PowerShell)
+```
+
+Usage text and exit 0 mean the server is sound and only resolution failed.
+
+#### Remedy 1, launch the client from the installed environment
+
+Activate the environment first, so the client inherits a `PATH` that contains the
+install:
+
+```
+source .venv/bin/activate        # macOS, Linux
+.\.venv\Scripts\Activate.ps1     # Windows (PowerShell)
+
+claude                           # then start the client from that shell
+```
+
+Nothing is written to the repository and `.mcp.json` resolves as intended.
+
+#### Remedy 2, pin the absolute path in the local scope
+
+`continuum mcp install` (above) is this remedy automated: it resolves the
+command on this machine, bakes it absolute with an absolute `--db`, and writes
+the local-scope entry itself. The manual form, for when you want to see every
+byte:
+
+When the client is not launched from a shell, a desktop app, or an IDE, register
+the resolved path instead:
+
+```
+claude mcp add continuum-mcp --scope local --env CONTINUUM_MCP_MUTATING_CLIENTS=claude-code -- /absolute/path/to/.venv/bin/continuum-mcp --db continuum.db
+```
+
+It is one line on purpose: a backslash continuation would not survive
+PowerShell. Everything after `--` is the command and its arguments, so on
+Windows that tail becomes the `.exe` under `Scripts`:
+
+```
+-- "C:\path\to\.venv\Scripts\continuum-mcp.exe" --db continuum.db
+```
+
+Keep the `--env` flag: mutating tools deny unlisted callers by default, so an
+entry without it connects but exposes only the three read-only tools.
+
+`--scope local` writes to `~/.claude.json` under this project's entry. That file
+is per-user and never committed, so an absolute path there is correct and affects
+nobody else. Local scope takes precedence over project scope, so this entry wins
+over `.mcp.json`.
+
+Claude Code will then report a conflicting-scopes diagnostic naming both
+endpoints. That is expected, both definitions exist, and the local one is the one
+in use. Do not resolve it with `claude mcp remove continuum-mcp -s project`, which
+edits the committed `.mcp.json` and unregisters the server for everyone who clones
+the repository. Leave the diagnostic in place, or drop the local entry with
+`-s local` once the environment is on `PATH`.
+
+### Windows: response frames end with `\r\n`
+
+On Windows the MCP Python SDK terminates its stdio frames with CRLF instead of
+the LF the JSON-RPC-over-stdio transport specifies (upstream
+[modelcontextprotocol/python-sdk#2433](https://github.com/modelcontextprotocol/python-sdk/issues/2433);
+confirmed against this server, every response line ends `b"\r\n"`). Lenient
+clients, Claude Code among them, absorb the extra byte. Strict NDJSON clients
+reject every frame, so the same install works in one client and reports a
+protocol error in another, on Windows only, which is why it lands in
+troubleshooting rather than in a release note.
+
+The defect is upstream, so CONTINUUM neither patches nor vendors it. What the
+repository does instead:
+
+- `scripts/mcp_smoke.py` reads the wire with `newline=""` (universal newlines
+  would rewrite the bytes and hide the difference) and states the observed
+  framing in its output: a Windows run reports `CRLF (\r\n)`, a Linux run
+  reports `LF (\n)`. Run it when a Windows client fails in a way a Linux one
+  does not.
+- The suite pins the framing on the raw wire
+  (`tests/test_mcp_entrypoint.py`): binary pipes, no newline translation, an
+  assert that every response frame ends `b"\r\n"` on Windows and `b"\n"`
+  elsewhere. If the SDK ever fixes #2433, that assert is what turns the change
+  into a visible CI failure instead of a silent behaviour shift, and this
+  section follows it.
+- A strict client has to tolerate both terminators or fail everywhere on
+  Windows; if yours does not, that is the client side of the upstream issue,
+  not a CONTINUUM configuration.

@@ -1,0 +1,536 @@
+"""Auto-instrumentation for the OpenAI SDK (ATTACH_ANY_SYSTEM P0).
+
+Wraps chat/completion ``create`` calls so each becomes a ``StepEvent`` fed to
+a ``Monitor``, without the caller editing every call site. This is the real
+"attach to any system" lever: ``import snagline.auto`` plus one call replaces
+per-call instrumentation.
+
+The module is import-safe: it imports fine without the OpenAI SDK installed,
+and ``instrument_openai`` only patches the SDK when it is actually present (or
+when a client is passed explicitly). Sync and async clients are both handled.
+
+Global mode (issue #270) patches the *resource classes* -- ``Completions`` and
+``AsyncCompletions`` -- rather than walking ``OpenAI.chat``: since OpenAI SDK
+1.0 the client attributes are ``functools.cached_property`` descriptors, so the
+old class-attribute walk resolved a descriptor, not a resource, and silently
+wrapped nothing. The resource classes' ``create`` is what every instance call
+dispatches to, so patching them covers all clients, current and future.
+
+Latency measurement and event timestamps use :func:`time.perf_counter`, not
+:func:`time.time`, mirroring the explicit adapters (issue #155): the wall
+clock advances in ~15.6 ms ticks on Windows on supported 3.10--3.12
+interpreters, quantizing sub-tick latencies to zero, and is non-monotonic, so
+a clock step mid-call fabricates negative or huge latencies.
+``perf_counter`` has no meaningful epoch, so these timestamps are only
+comparable within one process; detectors consume them solely as in-process
+latency differences.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import inspect
+import itertools
+import logging
+import time
+from typing import Any, Literal
+
+from snagline.events import StepEvent, make_signature
+
+try:  # optional dependency
+    from openai import AsyncOpenAI, OpenAI  # type: ignore
+except Exception:  # pragma: no cover - exercised only without the OpenAI SDK
+    OpenAI = None  # type: ignore[assignment, misc]
+    AsyncOpenAI = None  # type: ignore[assignment, misc]
+
+logger = logging.getLogger("snagline")
+
+
+def _emit(
+    monitor,
+    counter,
+    model,
+    tool_name,
+    sig_text,
+    start,
+    error,
+    error_type=None,
+    tokens_in=None,
+    tokens_out=None,
+) -> None:
+    now = time.perf_counter()
+    event = StepEvent(
+        step_id=str(next(counter)),
+        episode_id="openai-auto",
+        timestamp=now,
+        action_type="tool_call",
+        action_signature=make_signature("openai_call", model, sig_text),
+        tool_name=tool_name,
+        latency_ms=(now - start) * 1000.0,
+        error=error,
+        error_type=error_type,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+    )
+    monitor.ingest(event)
+
+
+def _extract_tokens(result: Any) -> tuple[int | None, int | None]:
+    try:
+        usage = getattr(result, "usage", None)
+        if usage is None and isinstance(result, dict):
+            usage = result.get("usage")
+        if usage is None:
+            return None, None
+        if isinstance(usage, dict):
+            return usage.get("prompt_tokens"), usage.get("completion_tokens")
+        return getattr(usage, "prompt_tokens", None), getattr(
+            usage, "completion_tokens", None
+        )
+    except Exception:
+        return None, None
+
+
+def _is_stream_request(kwargs: dict) -> bool:
+    return kwargs.get("stream") is True
+
+
+def _is_stream_like(obj: Any) -> bool:
+    return (
+        hasattr(obj, "__iter__")
+        or hasattr(obj, "__next__")
+        or hasattr(obj, "__aiter__")
+        or hasattr(obj, "__anext__")
+    )
+
+
+class _SyncStreamWrapper:
+    """Iterate the wrapped stream, emitting one event at exhaustion.
+
+    Streaming calls (``stream=True``) must NOT emit at ``create()`` return
+    time -- that would record a ~0ms success before the first chunk arrives
+    (issue #242). The event fires once the stream is exhausted, closed, or
+    fails mid-flight, mirroring the explicit adapters.
+    """
+
+    def __init__(self, monitor, counter, model, tool_name, sig_text, start, stream):
+        self._monitor = monitor
+        self._counter = counter
+        self._model = model
+        self._tool_name = tool_name
+        self._sig_text = sig_text
+        self._start = start
+        self._stream = stream
+        self._iter = iter(stream)  # type: ignore[call-overload]
+        self._last: Any = None
+        self._emitted = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> Any:
+        if self._emitted:
+            raise StopIteration
+        try:
+            chunk = next(self._iter)
+            self._last = chunk
+            return chunk
+        except StopIteration:
+            self._emit(error=False, error_type=None)
+            raise
+        except Exception as e:
+            self._emit(error=True, error_type=type(e).__name__)
+            raise
+
+    def close(self) -> None:
+        if not self._emitted:
+            self._emit(error=False, error_type=None)
+        close = getattr(self._stream, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
+
+    # ``with stream as s:`` is the form both SDKs' docs use for streaming.
+    # Dunder lookup bypasses __getattr__ (it searches the type, not the
+    # instance), so delegating alone never reached the wrapped stream's
+    # __enter__/__exit__ and the form raised TypeError while recording
+    # nothing -- a silent hole in coverage (issue #335). Enter returns self:
+    # iteration still goes through the wrapper, so the event still fires at
+    # exhaustion.
+    def __enter__(self) -> _SyncStreamWrapper:
+        return self
+
+    def __exit__(self, *exc_info: object) -> Literal[False]:
+        # An exception escaping the body is the observed call's visible
+        # outcome: the caller's block died before the stream finished, and
+        # close() alone would record the call as a clean success. This also
+        # covers failures surfaced through proxied stream methods (``s.text()``
+        # and friends go through __getattr__, so the wrapper's __next__ never
+        # sees them) -- without it a mid-stream error inside a ``with`` block
+        # is a silent false negative. _emit is guarded, so when the stream
+        # already emitted at exhaustion this is a no-op and close() only
+        # closes the underlying stream.
+        if exc_info[1] is not None:
+            self._emit(error=True, error_type=type(exc_info[1]).__name__)
+        self.close()
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+    def _emit(self, *, error: bool, error_type: str | None) -> None:
+        if self._emitted:
+            return
+        self._emitted = True
+        tokens_in, tokens_out = (None, None)
+        if not error and self._last is not None:
+            tokens_in, tokens_out = _extract_tokens(self._last)
+            if tokens_in is None and tokens_out is None:
+                tokens_in, tokens_out = _extract_tokens(self._stream)
+        _emit(
+            self._monitor,
+            self._counter,
+            self._model,
+            self._tool_name,
+            self._sig_text,
+            self._start,
+            error,
+            error_type=error_type,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+        )
+
+
+class _AsyncStreamWrapper:
+    """Async twin of :class:`_SyncStreamWrapper`."""
+
+    def __init__(self, monitor, counter, model, tool_name, sig_text, start, stream):
+        self._monitor = monitor
+        self._counter = counter
+        self._model = model
+        self._tool_name = tool_name
+        self._sig_text = sig_text
+        self._start = start
+        self._stream = stream
+        try:
+            self._aiter = stream.__aiter__()  # type: ignore[union-attr]
+        except Exception:
+            self._aiter = aiter(stream)  # type: ignore[arg-type]
+        self._last: Any = None
+        self._emitted = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._emitted:
+            raise StopAsyncIteration
+        try:
+            chunk = await anext(self._aiter)  # type: ignore[arg-type]
+            self._last = chunk
+            return chunk
+        except StopAsyncIteration:
+            self._emit(error=False, error_type=None)
+            raise
+        except Exception as e:
+            self._emit(error=True, error_type=type(e).__name__)
+            raise
+
+    async def aclose(self) -> None:
+        if not self._emitted:
+            self._emit(error=False, error_type=None)
+        close = getattr(self._stream, "aclose", None) or getattr(
+            self._stream, "close", None
+        )
+        if callable(close):
+            with contextlib.suppress(Exception):
+                res = close()
+                if inspect.isawaitable(res):
+                    await res
+
+    # ``async with stream as s:`` -- same dunder-lookup gap as the sync twin
+    # (issue #335); __getattr__ never participates in async protocol lookup.
+    async def __aenter__(self) -> _AsyncStreamWrapper:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> Literal[False]:
+        # Same treatment as the sync twin: an exception escaping the body is
+        # the call's visible outcome, and proxied async stream methods (an
+        # ``await s.text()`` failure) never pass through __anext__.
+        if exc_info[1] is not None:
+            self._emit(error=True, error_type=type(exc_info[1]).__name__)
+        await self.aclose()
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+    def _emit(self, *, error: bool, error_type: str | None) -> None:
+        if self._emitted:
+            return
+        self._emitted = True
+        tokens_in, tokens_out = (None, None)
+        if not error and self._last is not None:
+            tokens_in, tokens_out = _extract_tokens(self._last)
+            if tokens_in is None and tokens_out is None:
+                tokens_in, tokens_out = _extract_tokens(self._stream)
+        _emit(
+            self._monitor,
+            self._counter,
+            self._model,
+            self._tool_name,
+            self._sig_text,
+            self._start,
+            error,
+            error_type=error_type,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+        )
+
+
+def _is_async_call(original) -> bool:
+    """True if calling ``original`` returns a coroutine that must be awaited.
+
+    ``inspect.iscoroutinefunction`` alone misses async methods that carry a
+    decorator (the OpenAI/Anthropic SDKs wrap ``create`` with
+    ``@required_args``), which would misclassify them as sync: the wrapper
+    would never await the call, record only the coroutine-creation latency,
+    and report ``error=False`` for every failure. ``inspect.unwrap`` sees
+    through ``__wrapped__`` chains; on plain (including undecorated async)
+    functions it is the identity.
+    """
+    return inspect.iscoroutinefunction(original) or inspect.iscoroutinefunction(
+        inspect.unwrap(original)
+    )
+
+
+def _wrap_one(monitor, original, tool_name):
+    # Idempotent: wrapping an already-wrapped callable stacks a second layer
+    # and double-counts every call (issue #336). Global mode guards this in
+    # _patch_resource_classes; the per-client path did not, so composing the
+    # two modes -- or calling wrap_client twice -- emitted one event per
+    # layer. Return the existing wrapper rather than re-wrapping.
+    if getattr(original, "__snagline_wrapped__", False):
+        return original
+    counter = itertools.count()
+    is_async = _is_async_call(original)
+
+    def _sync(*args, **kwargs):
+        sig_text = str(kwargs.get("messages") or kwargs.get("prompt") or args)
+        model = kwargs.get("model", "unknown")
+        start = time.perf_counter()
+        try:
+            result = original(*args, **kwargs)
+        except Exception as e:
+            _emit(
+                monitor,
+                counter,
+                model,
+                tool_name,
+                sig_text,
+                start,
+                True,
+                error_type=type(e).__name__,
+            )
+            raise
+        if _is_stream_request(kwargs) and _is_stream_like(result):
+            # Defer telemetry until exhaustion, close, or iteration error.
+            return _SyncStreamWrapper(
+                monitor, counter, model, tool_name, sig_text, start, result
+            )
+        # Non-streaming success carries usage on the result; extract it so the
+        # token-runaway / budget detectors get the same coverage the explicit
+        # adapters and the stream wrappers already provide (issue #529).
+        tokens_in, tokens_out = _extract_tokens(result)
+        _emit(
+            monitor,
+            counter,
+            model,
+            tool_name,
+            sig_text,
+            start,
+            False,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+        )
+        return result
+
+    async def _async(*args, **kwargs):
+        sig_text = str(kwargs.get("messages") or kwargs.get("prompt") or args)
+        model = kwargs.get("model", "unknown")
+        start = time.perf_counter()
+        try:
+            result = await original(*args, **kwargs)
+        except Exception as e:
+            _emit(
+                monitor,
+                counter,
+                model,
+                tool_name,
+                sig_text,
+                start,
+                True,
+                error_type=type(e).__name__,
+            )
+            raise
+        if _is_stream_request(kwargs) and _is_stream_like(result):
+            return _AsyncStreamWrapper(
+                monitor, counter, model, tool_name, sig_text, start, result
+            )
+        # Non-streaming success carries usage on the result; extract it (#529).
+        tokens_in, tokens_out = _extract_tokens(result)
+        _emit(
+            monitor,
+            counter,
+            model,
+            tool_name,
+            sig_text,
+            start,
+            False,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+        )
+        return result
+
+    wrapper = _async if is_async else _sync
+    # Mark the wrapper itself, not just the class attribute global mode sets
+    # it on: the per-client path wraps a bound method and never marked its
+    # own output, so the guard above could not see it and a second
+    # wrap_client stacked another layer (issue #336).
+    wrapper.__snagline_wrapped__ = True  # type: ignore[attr-defined,union-attr]
+    return wrapper
+
+
+def wrap_client(monitor, client):
+    """Wrap a given OpenAI client instance's create methods in place.
+
+    Patches ``client.chat.completions.create`` and ``client.completions.create``
+    (whichever exist) so each call emits a ``StepEvent``. Returns the same
+    client for chaining.
+    """
+    _patch_client(monitor, client)
+    return client
+
+
+def _patch_client(monitor, client) -> int:
+    """Counting core of :func:`wrap_client` (issue #321).
+
+    ``wrap_client`` must keep returning the client for chaining, so the patch
+    count lives here. Returns the number of methods newly wrapped, mirroring
+    ``_patch_resource_classes``; the instrument_* entrypoints use it to honour
+    their documented "True if anything was patched" contract.
+    """
+    patched = 0
+    already = 0
+    for path in ("chat.completions.create", "completions.create"):
+        cur = client
+        ok = True
+        for part in path.split(".")[:-1]:
+            cur = getattr(cur, part, None)
+            if cur is None:
+                ok = False
+                break
+        if not ok:
+            continue
+        name = path.split(".")[-1]
+        method = getattr(cur, name, None)
+        if method is None or not callable(method):
+            continue
+        # Skip anything the global path (or a prior wrap_client) already
+        # wrapped: stacking a second layer double-counts every call (issue
+        # #336). This is the per-client twin of _patch_resource_classes' guard.
+        if getattr(method, "__snagline_wrapped__", False):
+            already += 1
+            continue
+        setattr(cur, name, _wrap_one(monitor, method, "openai." + path))
+        patched += 1
+    if patched == 0 and already == 0:
+        logger.warning(
+            "snagline.auto: wrap_client found no create method to patch on %r",
+            client,
+        )
+    return patched
+
+
+def _patch_resource_classes(monitor) -> int:
+    """Patch the SDK's resource classes globally (issue #270).
+
+    ``openai.resources.chat.completions.completions.{Completions,
+    AsyncCompletions}`` and the legacy ``completions`` pair are the classes
+    every ``OpenAI`` / ``AsyncOpenAI`` instance dispatches ``create`` to, so
+    wrapping their methods covers all current and future clients without
+    touching the clients' ``cached_property`` surface.
+
+    Returns the number of methods newly wrapped. Classes that already carry
+    a snagline wrapper are skipped (re-instrumenting would double-count every
+    call), so a second call against the same SDK returns 0.
+    """
+    patched = 0
+    seen_wrapped = False
+    try:
+        from openai.resources.chat.completions.completions import (  # type: ignore
+            AsyncCompletions as ChatAsync,
+        )
+        from openai.resources.chat.completions.completions import (
+            Completions as ChatSync,
+        )
+    except Exception:  # pragma: no cover - defensive against SDK reshuffles
+        ChatSync = ChatAsync = None
+    try:
+        from openai.resources.completions import (  # type: ignore
+            AsyncCompletions as LegacyAsync,
+        )
+        from openai.resources.completions import (
+            Completions as LegacySync,
+        )
+    except Exception:  # pragma: no cover - defensive against SDK reshuffles
+        LegacySync = LegacyAsync = None
+
+    for cls, tool_name in [
+        (ChatSync, "openai.chat.completions.create"),
+        (ChatAsync, "openai.chat.completions.create"),
+        (LegacySync, "openai.completions.create"),
+        (LegacyAsync, "openai.completions.create"),
+    ]:
+        if cls is None:
+            continue
+        original = cls.__dict__.get("create")
+        if original is None or not callable(original):
+            continue
+        if getattr(original, "__snagline_wrapped__", False):
+            seen_wrapped = True
+            continue  # already instrumented; re-instrumenting would double-count
+        wrapper = _wrap_one(monitor, original, tool_name)
+        wrapper.__snagline_wrapped__ = True  # type: ignore[attr-defined,union-attr]
+        wrapper.__snagline_original__ = original  # type: ignore[attr-defined]
+        cls.create = wrapper
+        patched += 1
+    # 0 new wraps + at least one already-wrapped class = fully instrumented,
+    # not a failure. Distinguish that from "found nothing to patch at all".
+    if patched == 0 and seen_wrapped:
+        return -1
+    return patched
+
+
+def instrument_openai(monitor, client=None) -> bool:
+    """Instrument the OpenAI SDK.
+
+    If ``client`` is provided, only that instance is wrapped. Otherwise the
+    SDK's resource classes (``Completions`` / ``AsyncCompletions`` for both
+    chat and legacy completions) are patched globally, so every client --
+    present or future -- is observed. Returns True if anything was patched,
+    False if the SDK is not importable or nothing could be patched.
+    """
+    if client is not None:
+        return _patch_client(monitor, client) != 0
+    if OpenAI is None:
+        logger.warning("snagline.auto: OpenAI SDK not installed; nothing to patch")
+        return False
+    patched = _patch_resource_classes(monitor)
+    if patched == 0:
+        logger.warning(
+            "snagline.auto: OpenAI SDK present but no create method could be "
+            "patched; clients are NOT monitored"
+        )
+        return False
+    return True

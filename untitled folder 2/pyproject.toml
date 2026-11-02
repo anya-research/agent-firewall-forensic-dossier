@@ -1,0 +1,204 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "continuum-agent"
+version = "0.1.2"
+description = "Verifiable semantic recovery layer for long-running AI agents."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "CONTINUUM contributors" }]
+keywords = [
+    "ai-agents",
+    "durable-execution",
+    "checkpointing",
+    "recovery",
+    "resumable-agents",
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = ["pydantic>=2.7"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-asyncio>=0.23",
+    "hypothesis>=6.0",
+    "ruff==0.16.10",
+    "mypy>=1.13",
+    "mcp>=2.0",
+    # The adapter packages are optional runtime dependencies (see [project.optional-dependencies])
+    # but installed in dev so mypy can type-check the adapter modules in CI.
+    "langgraph>=0.2",
+    "openai-agents>=0.2",
+    "langchain>=0.3",
+    # Attestation tests (continuum attest / attest-verify) exercise the optional
+    # Ed25519 signing path, so the crypto dependency is needed in the dev/test
+    # environment even though runtime installs stay dependency-free.
+    "cryptography>=45.0",
+]
+# The MCP server is optional: the core library and CLI never import it, so
+# installing CONTINUUM does not pull in a server stack you may not want.
+# tomli-w and PyYAML are here because `continuum mcp install` registers with
+# hosts whose own config files are not JSON (Codex CLI writes TOML, Continue
+# writes YAML). Both are imported lazily and only when such a host is
+# registered, so a host that needs neither pays for neither, and a missing one
+# is reported by name with the command that installs it.
+mcp = ["mcp>=2.0", "tomli-w>=1.0", "PyYAML>=6.0"]
+# The browser adapter is optional: it drives a real page through Playwright.
+# The package is imported lazily so the core library stays dependency-free.
+browser = ["playwright>=1.40"]
+# The Kubernetes adapter is optional: it runs one-shot jobs with the kubectl CLI
+# and requires the Kubernetes client to be importable. The client is imported
+# lazily so the core library stays dependency-free.
+kubernetes = ["kubernetes>=29"]
+# The OpenTelemetry bridge is optional: the core library never imports it.
+otel = ["opentelemetry-api>=1.20"]
+# The LangGraph adapter is optional: it wraps langgraph's StateGraph and tool
+# decorators with CONTINUUM's durability layer.
+langgraph = ["langgraph>=0.2"]
+# The OpenAI Agents SDK adapter is optional: it wraps function_tool and RunHooks
+# with CONTINUUM's action ledger and checkpointing.
+openai = ["openai-agents>=0.2"]
+# The LangChain adapter is optional: it wraps LCEL runnable pipelines and the
+# langchain.agents.create_agent tool-calling loop with CONTINUUM's durability layer.
+langchain = ["langchain>=0.3"]
+# The CLI uses only the standard library: a recovery tool must not fail to
+# import when you most need it. No extra is required.
+# Optional Ed25519 attestation of the event chain (continuum attest), kept out
+# of the core so the recovery path needs no crypto dependency.
+attest = ["cryptography>=45.0"]
+# The PostgreSQL storage backend (B2.3) for multi-process / multi-host durability.
+# The core stays SQLite-only so a plain install needs no database driver.
+postgres = ["psycopg>=3.2"]
+
+[project.scripts]
+continuum = "continuum.cli.main:main"
+continuum-mcp = "continuum.mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/Cyrax321/CONTINUUM"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/continuum"]
+artifacts = ["src/continuum/py.typed"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [".venv", "tests", "examples", "benchmarks"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+"src/continuum/adapters/base.py" = ["B027"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_configs = true
+plugins = ["pydantic.mypy"]
+files = ["src/continuum"]
+
+# Every optional dependency is imported lazily, behind a `try` or under
+# `TYPE_CHECKING`, so each module that reaches for one still has to type-check on
+# an install that does not have it. A plain `pip install -e .` clone has only
+# pydantic, and the families below are what stand between that clone and 26
+# errors from `mypy src/continuum` that say nothing about the code (#315). An
+# optional import added without a family here brings the errors back.
+
+# psycopg is an optional runtime dependency (the [postgres] extra). It is
+# imported lazily, so the module must type-check without it installed.
+[[tool.mypy.overrides]]
+module = ["psycopg", "psycopg.*"]
+ignore_missing_imports = true
+
+# playwright and kubernetes are optional dependencies of the browser and
+# kubernetes environment adapters. They are imported lazily, so the modules
+# must type-check without them installed.
+[[tool.mypy.overrides]]
+module = ["playwright", "playwright.*", "kubernetes"]
+ignore_missing_imports = true
+
+# opentelemetry backs the [otel] span bridge and crewai the thin hook adapter.
+[[tool.mypy.overrides]]
+module = ["opentelemetry.*", "crewai", "crewai.*", "crewai.hooks"]
+ignore_missing_imports = true
+
+# cryptography signs the event chain for `continuum attest` (the [attest]
+# extra). The recovery path must import with no crypto installed, so the import
+# sits inside the signing call.
+[[tool.mypy.overrides]]
+module = ["cryptography.*"]
+ignore_missing_imports = true
+
+# The MCP server stack (the [mcp] extra). The core library and CLI never import
+# it, so a dependency-free install must still type-check the server module.
+[[tool.mypy.overrides]]
+module = ["mcp.*"]
+ignore_missing_imports = true
+
+# The framework adapters: langgraph, openai-agents (imported as `agents`) and
+# langchain-core. Each has its own extra and its own availability guard, so none
+# of the three is present in a core install.
+[[tool.mypy.overrides]]
+module = ["langgraph.*", "agents", "agents.*", "langchain_core"]
+ignore_missing_imports = true
+
+# Silencing the missing import is half the job: the names it supplied are now
+# `Any`, and two strict checks refuse `Any` where these three modules need it.
+# `langgraph_store` subclasses LangGraph's `BaseCheckpointSaver` and the openai
+# adapter subclasses `RunHooks`, which `disallow_subclassing_any` rejects; every
+# MCP tool is registered through the server's own decorator, which
+# `disallow_untyped_decorators` rejects. Both are checked in CI, where the
+# packages are installed and the real signatures apply. Scoped to the three
+# modules that hold an optional seam so strict stays whole everywhere else.
+[[tool.mypy.overrides]]
+module = ["continuum.adapters.langgraph_store", "continuum.adapters.openai"]
+disallow_subclassing_any = false
+
+[[tool.mypy.overrides]]
+module = ["continuum.mcp.server"]
+disallow_untyped_decorators = false
+
+[tool.pydantic.mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: integration test that takes more than about 2 seconds. Deselect it during development with `pytest -m 'not slow'`; CI runs the suite unfiltered.",
+]
+# The MCP server's tools are async; without this, pytest silently skips them
+# as "not natively supported" rather than failing, which would let the whole
+# suite pass while testing nothing.
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["continuum"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

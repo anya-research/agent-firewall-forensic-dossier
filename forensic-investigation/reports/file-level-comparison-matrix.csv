@@ -1,0 +1,42 @@
+project_a_path,project_b_path,match_type,exact_similarity_pct,normalized_similarity_pct,token_jaccard_pct,semantic_similarity,evidence_level,notes
+pyproject.toml,pyproject.toml,Functional / Category Correspondence,0.00%,25.73%,30.90%,Superficial domain vocabulary overlap,Level 4 (Weak),Packaging manifest
+README.md,README.md,Functional / Category Correspondence,0.00%,2.16%,11.29%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Project documentation
+LICENSE,LICENSE,Functional / Category Correspondence,0.00%,0.00%,9.65%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),License file
+src/snagline/py.typed,src/agent_firewall/py.typed,Functional / Category Correspondence,100.00%,100.00%,0.00%,Identical boilerplate / marker,Level 4 (Boilerplate),PEP 561 marker
+src/snagline/cli.py,src/agent_firewall/cli.py,Functional / Category Correspondence,0.00%,2.08%,8.10%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),CLI entry point
+src/snagline/config.py,src/agent_firewall/config.py,Functional / Category Correspondence,0.00%,1.06%,3.83%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Configuration management
+src/snagline/authorize.py,src/agent_firewall/authorization.py,Functional / Category Correspondence,0.00%,1.40%,9.64%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Authorization gate
+src/snagline/shell_security.py,src/agent_firewall/detection/command_rules.py,Functional / Category Correspondence,0.00%,4.44%,17.51%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Shell command rules
+src/snagline/path_security.py,src/agent_firewall/detection/filesystem_rules.py,Functional / Category Correspondence,0.00%,3.81%,15.82%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Filesystem path rules
+src/snagline/secret_security.py,src/agent_firewall/detection/secrets.py,Functional / Category Correspondence,0.00%,4.06%,19.84%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Secret detection
+src/snagline/dlp_security.py,src/agent_firewall/detection/dlp.py,Functional / Category Correspondence,0.00%,1.75%,11.19%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Data loss prevention
+src/snagline/prompt_injection.py,src/agent_firewall/detection/prompt_injection.py,Functional / Category Correspondence,0.00%,15.58%,22.54%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Prompt injection detection
+src/snagline/security_audit.py,src/agent_firewall/audit/writer.py,Functional / Category Correspondence,0.00%,4.47%,21.35%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Audit logging writer
+src/snagline/security_audit.py,src/agent_firewall/audit/verifier.py,Functional / Category Correspondence,0.00%,7.28%,23.64%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Audit log verifier
+src/snagline/security_scoring.py,src/agent_firewall/risk/scorer.py,Functional / Category Correspondence,0.00%,5.58%,17.36%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Risk scoring engine
+src/snagline/security_evaluation.py,src/agent_firewall/engine.py,Functional / Category Correspondence,0.00%,3.75%,17.44%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Core evaluation engine
+src/snagline/adapters/mcp_gateway.py,src/agent_firewall/integrations/mcp/server.py,Functional / Category Correspondence,0.00%,5.81%,15.94%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),MCP gateway server
+src/snagline/adapters/claude_code.py,src/agent_firewall/integrations/claude_code/hook.py,Functional / Category Correspondence,0.00%,5.51%,17.01%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),Claude Code integration
+src/snagline/server/http_server.py,src/agent_firewall/api/app.py,Functional / Category Correspondence,0.00%,1.11%,7.96%,Distinct implementations of separate designs,Level 4 (Weak/No Derivation),HTTP API service
+NONE (No equivalent component),PKG-INFO,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (9510 bytes)
+NONE (No equivalent component),setup.cfg,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (38 bytes)
+NONE (No equivalent component),src/agent_firewall/__init__.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (948 bytes)
+NONE (No equivalent component),src/agent_firewall/api/__init__.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (230 bytes)
+NONE (No equivalent component),src/agent_firewall/api/__main__.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (555 bytes)
+NONE (No equivalent component),src/agent_firewall/api/db.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (3561 bytes)
+NONE (No equivalent component),src/agent_firewall/api/schemas.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (1165 bytes)
+NONE (No equivalent component),src/agent_firewall/audit/__init__.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (430 bytes)
+NONE (No equivalent component),src/agent_firewall/audit/schemas.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (2551 bytes)
+NONE (No equivalent component),src/agent_firewall/detection/__init__.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (867 bytes)
+NONE (No equivalent component),src/agent_firewall/integrations/__init__.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (180 bytes)
+NONE (No equivalent component),src/agent_firewall/integrations/claude_code/__init__.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (129 bytes)
+NONE (No equivalent component),src/agent_firewall/integrations/mcp/__init__.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (251 bytes)
+NONE (No equivalent component),src/agent_firewall/integrations/mcp/__main__.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (188 bytes)
+NONE (No equivalent component),src/agent_firewall/models.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (3845 bytes)
+NONE (No equivalent component),src/agent_firewall/normalize.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (2810 bytes)
+NONE (No equivalent component),src/agent_firewall/policies/__init__.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (527 bytes)
+NONE (No equivalent component),src/agent_firewall/policies/evaluator.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (4786 bytes)
+NONE (No equivalent component),src/agent_firewall/policies/loader.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (2229 bytes)
+NONE (No equivalent component),src/agent_firewall/policies/schema.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (2974 bytes)
+NONE (No equivalent component),src/agent_firewall/risk/__init__.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (134 bytes)
+NONE (No equivalent component),src/agent_firewall/risk/factors.py,No correspondence,0.00%,0.00%,0.00%,Component unique to Project B,Level 4 (No Derivation),Unique Project B file (1484 bytes)

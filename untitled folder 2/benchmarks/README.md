@@ -1,0 +1,64 @@
+# Unscripted autonomous agent test (issue #6)
+
+This directory holds a reproducible harness for issue #6: an *unscripted* run of
+an independent LLM agent (Claude Code, the same CLI already wired to this project
+via `.mcp.json`) against the `continuum-mcp` server, with no step-by-step
+instructions. We record the tool-call sequence so we can verify the agent
+autonomously checkpoints, validates, and resumes.
+
+## Run it
+
+```bash
+export ANTHROPIC_API_KEY=sk-...      # required; the agent needs a real LLM
+bash benchmarks/unscripted_resume.sh
+```
+
+The script:
+
+1. Creates a fresh `continuum.db` and an MCP-connected Claude Code session.
+2. Phase 1: hands the agent `task.md` (a goal, not a script) and lets it drive
+   the `continuum_*` MCP tools however it sees fit.
+3. Phase 2: opens a *fresh* session on the same `RUN_ID` and asks it to resume,
+   checking whether it calls `continuum_resume` before acting.
+4. Records both the agent's tool calls (`run1.stream.jsonl`, `run2.stream.jsonl`)
+   and CONTINUUM's own view of what happened (`agent_trail.txt`, captured from
+   the event log, which is the ground-truth record).
+
+The deliverable for #6 is the captured sequence plus the deviations noted in the
+issue, not a passing unit test.
+
+## Hook-path speedup micro-benchmark
+
+`speedup_demo.py` measures checkpoint/ledger machinery cost with no LLM: five
+per-section sync checkpoints versus one async checkpoint at the end, then prints
+the wall-clock ratio.
+
+```bash
+PYTHONPATH=src python benchmarks/speedup_demo.py
+```
+
+## Scripted suites via `run.py`
+
+The phase-6, byte-count, fault-injection, and horizon suites run scripted
+(no LLM, no API key) through one runner. With no arguments it executes every
+suite in order and writes all reports under `benchmarks/out/`; `--list`
+prints the suites and their report paths without running anything:
+
+```bash
+PYTHONPATH=src python benchmarks/run.py --list
+PYTHONPATH=src python benchmarks/run.py
+```
+
+| Suite | What it runs | Report lands in |
+|:--|:--|:--|
+| `phase6` | Recovery-correctness scenarios | `benchmarks/out/report.{json,md}` |
+| `continuum-bench` | Crash-recovery byte counts | Merged into `benchmarks/out/report.json` |
+| `fault-injection` | Chaos suite (#397) | `benchmarks/out/fault_injection_report.{json,md}` |
+| `horizon` | Horizon-scale suite (#398) | `benchmarks/out/horizon_report.{json,md}`; also regenerates the README bench table |
+
+The full run takes minutes. The horizon suite's numbers feed the bench
+table in the top-level README (marked `BENCH:START`/`BENCH:END` there).
+Pass `--publish` to also refresh the latest-results block in
+`references/bench.md`; plain runs leave that file alone. The nightly publish
+CI (`.github/workflows/bench-nightly.yml`) runs with `--publish` and commits
+both files when the numbers move.

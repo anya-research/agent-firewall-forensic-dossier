@@ -1,0 +1,1676 @@
+"""CONTINUUM data models.
+
+Phase 1 defines the *shape* of durable task state: enums, the semantic state
+tree, ledger records, environment snapshots, validation reports and recovery
+contracts. No storage or recovery logic lives here: these are pure data
+structures (mostly immutable) so they can be serialized, versioned, hashed and
+diffed without side effects.
+
+Conventions
+-----------
+* All times are timezone-aware UTC.
+* All IDs are stable strings (``run_..``, ``action_..``, ``finding_..``).
+* Enums are ``str`` subclasses so they serialize to readable JSON.
+* State-bearing models are frozen: mutations must produce a new version via
+  ``model_copy``; the versioning phase builds on this property.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any, ClassVar
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from continuum.security.hashing import make_id, stable_hash
+
+#: The recovery-contract compatibility version this build speaks (issue #764).
+#:
+#: It names the field set a sealed contract's integrity hash covers, and it is
+#: carried on every contract so a verifier can pick the right digest input
+#: without guessing. See ``continuum.recovery.contract`` for the version table
+#: and the forward/backward compatibility rules. Bump it only when a field
+#: changes whether it is hash-covered, never for a content change.
+CONTRACT_VERSION = 1
+
+__all__ = [
+    "RunStatus",
+    "CONTRACT_VERSION",
+    "StateStatus",
+    "ActionStatus",
+    "RecoveryMode",
+    "RecoverySafety",
+    "Component",
+    "DiffKind",
+    "ApprovalStatus",
+    "PlanStepStatus",
+    "utcnow",
+    "DecisionPayload",
+    "ActionRecordPayload",
+    "Goal",
+    "PlanStep",
+    "Progress",
+    "Decision",
+    "Evidence",
+    "Finding",
+    "PendingWork",
+    "Approval",
+    "ExternalDependency",
+    "ConstraintPinned",
+    "ConstraintRetracted",
+    "ConstraintPin",
+    "AttemptLesson",
+    "AuthorityConsumed",
+    "AuthorityReconciled",
+    "ModelSpecificState",
+    "ModelState",
+    "Run",
+    "SemanticState",
+    "SubagentSpan",
+    "ConsumedInputs",
+    "Action",
+    "EnvResource",
+    "EnvironmentSnapshot",
+    "ComponentValidationEntry",
+    "StateValidationResult",
+    "RecoveryContract",
+    "StateCheckpoint",
+    "DiffEntry",
+    "StateDiff",
+    "UnknownSideEffect",
+    "Frozen",
+    "Origin",
+    "Provenance",
+    "TrajectoryReport",
+    "RiskObservedPayload",
+    "ObservedRisk",
+    "validate_caused_by",
+    "PROJECTION_BOOKKEEPING",
+]
+
+Frozen = ConfigDict(frozen=True, extra="forbid")
+
+
+def utcnow() -> datetime:
+    """Return current UTC timestamp with timezone information."""
+    return datetime.now(UTC)
+
+
+class RunStatus(StrEnum):
+    """Execution status of an agent run lifecycle."""
+
+    PLANNED = "planned"
+    STARTED = "started"
+    RUNNING = "running"
+    CHECKPOINTED = "checkpointed"
+    SUSPENDED = "suspended"
+    COMPLETED = "completed"
+    CRASHED = "crashed"
+    ABORTED = "aborted"
+    FAILED = "failed"
+
+
+class StateStatus(StrEnum):
+    """Validity status of semantic state entities."""
+
+    VALID = "valid"
+    PARTIAL = "partial"
+    STALE = "stale"
+    CONFLICTED = "conflicted"
+    UNKNOWN = "unknown"
+    INVALID = "invalid"
+    REQUIRES_REVIEW = "requires_review"
+    EXPIRED = "expired"
+
+
+class ActionStatus(StrEnum):
+    """Lifecycle and execution status of a recorded action."""
+
+    PLANNED = "planned"
+    STARTED = "started"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+    COMPENSATED = "compensated"
+    REQUIRES_REVIEW = "requires_review"
+    EXPIRED = "expired"
+
+
+class RecoveryMode(StrEnum):
+    """Strategy for recovering an agent execution run."""
+
+    RESUME = "resume"
+    REPAIR_AND_RESUME = "repair_and_resume"
+    ROLLBACK = "rollback"
+    WAIT = "wait"
+    REQUEST_HUMAN = "request_human"
+    REPLAN = "replan"
+    ABORT = "abort"
+
+
+class RecoverySafety(StrEnum):
+    """Assessment of whether and how safely a run can be resumed."""
+
+    SAFE_TO_RESUME = "safe_to_resume"
+    REQUIRES_REPAIR = "requires_repair"
+    REQUIRES_REVALIDATION = "requires_revalidation"
+    REQUIRES_HUMAN = "requires_human"
+    BLOCKED = "blocked"
+    UNSAFE = "unsafe"
+
+
+class Component(StrEnum):
+    """Semantic state component types tracked by CONTINUUM."""
+
+    GOAL = "goal"
+    PROGRESS = "progress"
+    PLAN = "plan"
+    DECISION = "decision"
+    FINDING = "finding"
+    EVIDENCE = "evidence"
+    PENDING_WORK = "pending_work"
+    EXTERNAL_DEPENDENCY = "external_dependency"
+    ACTION = "action"
+    MODEL = "model"
+    APPROVAL = "approval"
+    ENVIRONMENT = "environment"
+    PIN = "pin"
+    VALIDATION_RULE = "validation_rule"
+    """A finding reported by a registered domain rule, not a state component.
+
+    Used when a rule fails closed (issue #761): the entry then names the rule
+    itself, because that is what needs attention. Well-behaved rules report
+    against the component they examined and never use this value.
+    """
+
+
+class DiffKind(StrEnum):
+    """Classification of a change between two state snapshots."""
+
+    ADDED = "added"
+    REMOVED = "removed"
+    CHANGED = "changed"
+    INVALIDATED = "invalidated"
+
+
+class ApprovalStatus(StrEnum):
+    """Current state of a requested human approval."""
+
+    PENDING = "pending"
+    GRANTED = "granted"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+    REQUIRES_REVIEW = "requires_review"
+
+
+class PlanStepStatus(StrEnum):
+    """Progress status of an individual execution plan step."""
+
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    BLOCKED = "blocked"
+    VERIFIED = "verified"
+    COMPLETED = "completed"
+
+
+class Origin(StrEnum):
+    """Who asserted a fact, which decides how much it can be trusted.
+
+    This describes the *writer*, not the derivation. Folding a fabricated event
+    is still a faithful fold, so "the projection is reproducible" says nothing
+    about whether the underlying claim is true. Provenance has to be captured
+    where the claim enters the system and carried forward from there.
+    """
+
+    DETERMINISTIC = "deterministic"
+    """Recorded by trusted local code: the CLI, or CONTINUUM's own in-process
+    orchestration (serve loop, replay guard, benchmarks).
+
+    Not a claim that the fact is *correct*, only that it was not asserted by an
+    autonomous agent reporting on itself. Framework adapters that execute tools
+    on an agent's behalf record EXTERNAL_AGENT instead (issue #612).
+    """
+
+    HUMAN = "human"
+    """Asserted by a person."""
+
+    LLM = "llm"
+    """Inferred by a model. Never authoritative; always requires review."""
+
+    EXTERNAL_AGENT = "external_agent"
+    """Asserted by an autonomous agent over a remote interface such as MCP.
+
+    An agent reporting its own progress is marking its own homework. The claim
+    may well be true, but nothing has verified it, so it cannot on its own
+    establish that a run is safe to resume.
+    """
+
+    IMPORTED = "imported"
+    """Loaded from a foreign checkpoint whose event history is unavailable."""
+
+    EXTERNAL_MONITOR = "external_monitor"
+    """Asserted by an external risk monitor such as SNAGLINE. A witness, not an authority."""
+
+    @property
+    def self_certified(self) -> bool:
+        """Whether this origin is an unverified self-report.
+
+        Such state is usable (it is often correct) but it cannot be the
+        grounds for declaring a run verified.
+        """
+        return self in (Origin.LLM, Origin.EXTERNAL_AGENT, Origin.IMPORTED)
+
+
+class Provenance(BaseModel):
+    """Trace from a state component back to the event that produced it."""
+
+    model_config = Frozen
+
+    origin: Origin = Origin.DETERMINISTIC
+    source_sequence: int | None = None
+    source_event_id: str | None = None
+    extractor: str | None = None
+
+    @property
+    def reproducible(self) -> bool:
+        """True when the component can be re-derived from the event log alone."""
+        return self.origin is Origin.DETERMINISTIC and self.source_sequence is not None
+
+
+# --------------------------------------------------------------------------- #
+# Goal / plan / progress
+# --------------------------------------------------------------------------- #
+
+
+class Goal(BaseModel):
+    """High-level objective and constraints governing an agent run."""
+
+    model_config = Frozen
+
+    description: str
+    version: int = 1
+    constraints: list[str] = Field(default_factory=list)
+    provenance: Provenance = Field(default_factory=Provenance)
+
+    @field_validator("version")
+    @classmethod
+    def _version_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("goal version must be >= 1")
+        return v
+
+
+class PlanStep(BaseModel):
+    """A discrete execution step within an agent plan."""
+
+    model_config = Frozen
+
+    step_id: str = Field(default_factory=lambda: make_id("step"))
+    description: str
+    status: PlanStepStatus = PlanStepStatus.PENDING
+    depends_on: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    provenance: Provenance = Field(default_factory=Provenance)
+
+
+class Progress(BaseModel):
+    """Quantitative metrics tracking completion of tasks within a run."""
+
+    model_config = Frozen
+
+    total: int | None = None
+    completed: int = 0
+    pending: int = 0
+    failed: int = 0
+    provenance: Provenance = Field(default_factory=Provenance)
+
+    @field_validator("total", "completed", "pending", "failed")
+    @classmethod
+    def _non_negative(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("progress counters must be non-negative")
+        return v
+
+    @model_validator(mode="after")
+    def _bounded(self) -> Progress:
+        if self.total is not None and self.completed + self.pending + self.failed > self.total:
+            raise ValueError("completed + pending + failed exceeds total")
+        return self
+
+
+# --------------------------------------------------------------------------- #
+# Semantic state components
+# --------------------------------------------------------------------------- #
+
+
+class Decision(BaseModel):
+    """A durable decision the agent made, with its evidence trail."""
+
+    model_config = Frozen
+
+    decision_id: str = Field(default_factory=lambda: make_id("decision"))
+    decision: str
+    reason: str = ""
+    evidence: list[str] = Field(default_factory=list)
+    status: StateStatus = StateStatus.VALID
+    created_at: datetime = Field(default_factory=utcnow)
+    invalidated_at: datetime | None = None
+    invalidated_reason: str | None = None
+    provenance: Provenance = Field(default_factory=Provenance)
+
+
+class DecisionPayload(BaseModel):
+    """Payload for DECISION_CREATED (issue #551).
+
+    ``caused_by`` records the event ids that caused this decision, enabling
+    the causal graph evidence -> finding -> decision -> action. Optional,
+    at most 32 ids of 1-128 chars each, defaults to [] for backward compat.
+    Unknown ids are refused by the writer (ValueError).
+    """
+
+    model_config = Frozen
+
+    decision_id: str = Field(default_factory=lambda: make_id("decision"))
+    decision: str
+    reason: str = ""
+    evidence: list[str] = Field(default_factory=list)
+    caused_by: list[str] = Field(default_factory=list)
+
+    @field_validator("caused_by")
+    @classmethod
+    def _validate_caused_by(cls, value: list[str]) -> list[str]:
+        if len(value) > 32:
+            raise ValueError("caused_by must contain at most 32 ids")
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("caused_by entries must be strings")
+            if not 1 <= len(item) <= 128:
+                raise ValueError("caused_by entries must be 1-128 chars")
+        return value
+
+
+class Evidence(BaseModel):
+    """Verifiable artifact or source data supporting findings and decisions."""
+
+    model_config = Frozen
+
+    evidence_id: str = Field(default_factory=lambda: make_id("evidence"))
+    summary: str = ""
+    source: str | None = None
+    checksum: str | None = None
+    status: StateStatus = StateStatus.VALID
+    added_at: datetime = Field(default_factory=utcnow)
+    provenance: Provenance = Field(default_factory=Provenance)
+
+
+class Finding(BaseModel):
+    """An assertion or discovered fact backed by cited evidence."""
+
+    model_config = Frozen
+
+    finding_id: str = Field(default_factory=lambda: make_id("finding"))
+    claim: str
+    evidence: list[str] = Field(default_factory=list)
+    confidence: float = 1.0
+    status: StateStatus = StateStatus.VALID
+    created_at: datetime = Field(default_factory=utcnow)
+    provenance: Provenance = Field(default_factory=Provenance)
+
+    @field_validator("confidence")
+    @classmethod
+    def _confidence_unit(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("confidence must be within [0, 1]")
+        return v
+
+
+class PendingWork(BaseModel):
+    """An outstanding task queued for execution with optional prerequisites."""
+
+    model_config = Frozen
+
+    task_id: str = Field(default_factory=lambda: make_id("task"))
+    description: str
+    prerequisite: list[str] = Field(default_factory=list)
+    status: StateStatus = StateStatus.VALID
+    created_at: datetime = Field(default_factory=utcnow)
+    provenance: Provenance = Field(default_factory=Provenance)
+
+
+class Approval(BaseModel):
+    """A human approval with a lifetime; approvals can expire."""
+
+    model_config = Frozen
+
+    approval_id: str = Field(default_factory=lambda: make_id("approval"))
+    subject: str
+    status: ApprovalStatus = ApprovalStatus.PENDING
+    granted_at: datetime | None = None
+    granted_by: str | None = None
+    expires_at: datetime | None = None
+    reason: str | None = None
+
+
+class ExternalDependency(BaseModel):
+    """An external system, API, or resource dependency required by a run."""
+
+    model_config = Frozen
+
+    resource: str
+    kind: str = "resource"
+    version: str | None = None
+    checksum: str | None = None
+    status: StateStatus = StateStatus.VALID
+    metadata: Mapping[str, Any] = Field(default_factory=dict)
+    last_verified_at: datetime | None = None
+    provenance: Provenance = Field(default_factory=Provenance)
+
+
+# --------------------------------------------------------------------------- #
+# Constraint pins (issues #391, #416)
+# --------------------------------------------------------------------------- #
+
+#: A constraint id is a machine label, never prose: 1 to 128 characters from
+#: ASCII letters, digits and ``.`` ``_`` ``:`` ``-``. The tight charset and
+#: bound are deliberate. Hashing exists so the constraint text is never
+#: stored, which leaves the id as the only free-text-shaped field on the
+#: event; restricting it to labels keeps that field unusable as a side
+#: channel for the very text the hash replaces.
+_CONSTRAINT_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+
+#: Digests are recorded exactly as hashlib produces them: 64 lowercase hex
+#: characters. Anything else (uppercase, short, prefixed, non-hex) is refused
+#: at the boundary rather than normalised, so every stored pin compares equal
+#: byte for byte against a recomputed digest.
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+def _validated_constraint_id(value: str) -> str:
+    if not _CONSTRAINT_ID_PATTERN.fullmatch(value):
+        raise ValueError("constraint_id must be 1-128 chars from ASCII letters, digits and . _ : -")
+    return value
+
+
+class ConstraintPinned(BaseModel):
+    """Payload of ``CONSTRAINT_PINNED``: a standing constraint, pinned by digest.
+
+    Constraints are issued once at session start and vanish precisely when
+    they matter most: context reconstruction (briefing, compaction, resume).
+    Pinning makes them first-class events while storing only the SHA-256 of
+    the constraint text (issue #391). The plaintext is forgettable at pin
+    time by everyone except the pinner; verification later compares digests.
+    """
+
+    model_config = Frozen
+
+    constraint_id: str = Field(strict=True)
+    """Stable label for the constraint within the run.
+
+    1-128 chars from ASCII letters, digits and ``.`` ``_`` ``:`` ``-`` (see
+    ``_CONSTRAINT_ID_PATTERN`` for why it is deliberately narrow). Strict
+    typing: labels are strings, and silently decoding bytes into one would
+    blur the boundary that keeps ids out of the content business.
+    """
+
+    sha256: str = Field(strict=True)
+    """SHA-256 of the exact constraint text (UTF-8 bytes), lowercase hex.
+
+    Never the text itself. The full text lives nowhere in CONTINUUM: not in
+    payloads, logs or reprs, and callers are encouraged to forget it too.
+    Strict typing so a bytes argument is refused rather than decoded into a
+    digest that then looks validated.
+    """
+
+    @field_validator("constraint_id")
+    @classmethod
+    def _constraint_id_is_a_label(cls, value: str) -> str:
+        return _validated_constraint_id(value)
+
+    @field_validator("sha256")
+    @classmethod
+    def _sha256_is_lowercase_hex(cls, value: str) -> str:
+        if not _SHA256_PATTERN.fullmatch(value):
+            raise ValueError("sha256 must be exactly 64 lowercase hex characters")
+        return value
+
+
+class ConstraintRetracted(BaseModel):
+    """Payload of ``CONSTRAINT_RETRACTED``: a previously pinned constraint withdrawn.
+
+    Retraction records the id alone. It is storable even when the id was never
+    pinned in this log (for instance across an anchored prefix); how an
+    unmatched retraction projects is decided downstream (#417), not here.
+    """
+
+    model_config = Frozen
+
+    constraint_id: str = Field(strict=True)
+    """Id of the retracted constraint, same rules as on ``ConstraintPinned``."""
+
+    @field_validator("constraint_id")
+    @classmethod
+    def _constraint_id_is_a_label(cls, value: str) -> str:
+        return _validated_constraint_id(value)
+
+
+class ConstraintPin(BaseModel):
+    """Projected view of an active constraint pin (issue #417).
+
+    A pin is the durable memory of a standing instruction. The text never
+    enters the log; only the digest does. The projector keeps the active set
+    in ``SemanticState.pins`` so downstream checks can ask which constraints
+    survive context reconstruction without re-reading the whole log.
+    """
+
+    model_config = Frozen
+
+    constraint_id: str = Field(strict=True)
+    """Label of the constraint, same charset as the pinned event."""
+
+    sha256: str = Field(strict=True)
+    """Digest of the exact constraint text, lowercase hex."""
+
+    status: str = "active"
+    """Lifecycle status, always ``active`` for members of the active set."""
+
+    provenance: Provenance = Field(default_factory=Provenance)
+    """Where the pin was asserted, carried from the pin event."""
+
+    pinned_at: datetime = Field(default_factory=utcnow)
+    """When the pin event was recorded."""
+
+    @field_validator("constraint_id")
+    @classmethod
+    def _pin_id_is_a_label(cls, value: str) -> str:
+        return _validated_constraint_id(value)
+
+    @field_validator("sha256")
+    @classmethod
+    def _pin_sha_is_lowercase_hex(cls, value: str) -> str:
+        if not _SHA256_PATTERN.fullmatch(value):
+            raise ValueError("sha256 must be exactly 64 lowercase hex characters")
+        return value
+
+
+class AttemptLesson(BaseModel):
+    """Durable lesson from a failed attempt (issue #313).
+
+    System-derived from RecoveryDecision.rationale, RecoveryLedger and
+    ActionLedger, never from LLM. Bounded to 512 chars per field and 2KB
+    total so it survives as an artifact without becoming a transcript dump.
+    Origin.DETERMINISTIC, hash-chained via ATTEMPT_LESSON event.
+    """
+
+    model_config = Frozen
+
+    attempt_id: str = Field(min_length=1)
+    falsified: str = Field(default="")
+    env_delta: str = Field(default="")
+    scar_action_ids: list[str] = Field(default_factory=list)
+    next_avoid: str = Field(default="")
+    source_evidence: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utcnow)
+
+    @field_validator("falsified", "env_delta", "next_avoid")
+    @classmethod
+    def _field_bounded(cls, value: str) -> str:
+        if len(value) > 512:
+            return value[:512]
+        return value
+
+    @field_validator("source_evidence")
+    @classmethod
+    def _evidence_bounded(cls, value: list[str]) -> list[str]:
+        return [str(v)[:512] for v in value]
+
+    @field_validator("scar_action_ids")
+    @classmethod
+    def _scar_bounded(cls, value: list[str]) -> list[str]:
+        return [str(v) for v in value]
+
+
+class AuthorityConsumed(BaseModel):
+    """Payload of AUTHORITY_CONSUMED: one-time authority was consumed (issue #289/#555).
+
+    Each consumption is a distinct hash-chained row with Origin.DETERMINISTIC,
+    so replay never deduplicates and the audit trail is append-only. The
+    authority_id is bounded to 1-128 characters and carried in the hash,
+    keeping the event size small and deterministic.
+    """
+
+    model_config = Frozen
+
+    authority_id: str = Field(min_length=1, max_length=128)
+    consumer_run_id: str = Field(min_length=1)
+    consumed_at: datetime = Field(default_factory=utcnow)
+    via_action_id: str | None = None
+
+    @field_validator("authority_id")
+    @classmethod
+    def _authority_id_valid(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("authority_id must be non-empty")
+        if len(cleaned) > 128:
+            raise ValueError("authority_id must be 1-128 characters")
+        return cleaned
+
+    @field_validator("consumer_run_id")
+    @classmethod
+    def _consumer_run_id_valid(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("consumer_run_id must be non-empty")
+        return cleaned
+
+    @field_validator("via_action_id")
+    @classmethod
+    def _via_action_id_valid(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("via_action_id must be non-empty when provided")
+        if len(cleaned) > 256:
+            raise ValueError("via_action_id must be at most 256 characters")
+        return cleaned
+
+
+class AuthorityReconciled(BaseModel):
+    """Payload of AUTHORITY_RECONCILED: external probe result for an authority (issue #289/#557).
+
+    Records the probe's verdict about whether a previously consumed authority
+    is still valid on the external system. The event is hash-chained and
+    never deduplicates, so the audit trail preserves every probe result.
+    """
+
+    model_config = Frozen
+
+    authority_id: str = Field(min_length=1, max_length=128)
+    valid: bool | None = None
+    reason: str = Field(default="")
+    probed_at: str = Field(default="")
+
+    @field_validator("authority_id")
+    @classmethod
+    def _authority_id_valid(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("authority_id must be non-empty")
+        if len(cleaned) > 128:
+            raise ValueError("authority_id must be 1-128 characters")
+        return cleaned
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_bounded(cls, value: str) -> str:
+        if len(value) > 512:
+            return value[:512]
+        return value
+
+
+class TrajectoryReport(BaseModel):
+    """Deterministic trajectory report distilled from archived history (issue #393).
+
+    Computed from the archive plus ledger, no LLM, no network. Bounded size,
+    one per compaction window, digest-auditable via TRAJECTORY_REPORT event.
+    Stored alongside attempt lessons but derived from a different window, so
+    the two never compete for authority.
+
+    The on-demand analyser (issue #1427) folds the whole run history, not just
+    the quiet compaction windows, so an operator can ask for the same figures
+    while the run is still busy. ``total_attempts`` and ``uncertain_count``
+    carry the two counts that fold over: how much was attempted at all, and how
+    much of it left a side effect reconciliation still has to settle. They
+    default to zero so a report written before they existed still loads; the
+    digest recomputes from whatever a payload carries.
+    """
+
+    model_config = Frozen
+
+    report_id: str = Field(min_length=1)
+    window_start: int = Field(ge=0)
+    window_end: int = Field(ge=0)
+    compaction_seq: int = Field(ge=0)
+    attempts: int = Field(ge=0)
+    total_attempts: int = Field(default=0, ge=0)
+    uncertain_count: int = Field(default=0, ge=0)
+    scar_rate: float = Field(ge=0.0, le=1.0)
+    stall_sites: list[str] = Field(default_factory=list)
+    top_failure_action_types: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utcnow)
+    derived_origin: str = Field(default="")
+
+    @field_validator("stall_sites", "top_failure_action_types")
+    @classmethod
+    def _list_bounded(cls, value: list[str]) -> list[str]:
+        trimmed = [str(v)[:128] for v in value]
+        if len(trimmed) > 5:
+            trimmed = trimmed[:5]
+        return trimmed
+
+    #: The fields the digest covers: everything that describes what the run did.
+    #: ``report_id`` is the digest's own prefix and ``created_at`` is a
+    #: write-time stamp, so neither can be an input to the hash that names them.
+    _DIGEST_FIELDS: ClassVar[tuple[str, ...]] = (
+        "window_start",
+        "window_end",
+        "compaction_seq",
+        "attempts",
+        "total_attempts",
+        "uncertain_count",
+        "scar_rate",
+        "stall_sites",
+        "top_failure_action_types",
+        "derived_origin",
+    )
+
+    def digest(self) -> str:
+        """Deterministic content hash over the report's analytical fields.
+
+        Stable across processes and machines: the same folded events yield the
+        same digest, so a report read back from storage can be checked against
+        the events it claims to summarise.
+        """
+        return stable_hash({name: getattr(self, name) for name in self._DIGEST_FIELDS})
+
+    def digest_matches(self) -> bool:
+        """True if ``report_id`` is the prefix of the digest its content yields.
+
+        A report that drifted from its own events, or one whose fields were
+        hand-edited after the fact, fails this check. Reports written before
+        the model computed its own digest also fail: their id came from a hash
+        that included the run id, which the stored payload no longer carries.
+        Those are recognised by :meth:`legacy_digest_matches` instead, so an
+        auditor can tell an older report apart from a tampered one.
+        """
+        return self.report_id == self.digest()[: len(self.report_id)]
+
+    #: The field set a pre-#1461 id was derived from (issue #1462). Kept only so
+    #: reports written before the model computed its own digest can be told
+    #: apart from tampered ones: the older basis hashed the run id alongside the
+    #: analytical fields, and sorted the two lists rather than keeping fold order.
+    _LEGACY_DIGEST_FIELDS: ClassVar[tuple[str, ...]] = (
+        "window_start",
+        "window_end",
+        "attempts",
+        "scar_rate",
+    )
+
+    def legacy_digest(self, run_id: str) -> str:
+        """Content hash over the field set a pre-#1461 id was derived from.
+
+        The older basis is reproducible because the run id is the one piece the
+        stored payload does not carry, and the caller auditing a run knows it.
+        It is also exact: that writer derived the id before a budget loop that
+        shed trailing list entries to fit 2048 bytes without recomputing it, but
+        the field validators bound both lists to five 128-character entries
+        beforehand, so a maximally-sized report still fits the budget and the
+        stored lists are always the ones the id was hashed from.
+        """
+        return stable_hash(
+            {
+                "run_id": run_id,
+                **{name: getattr(self, name) for name in self._LEGACY_DIGEST_FIELDS},
+                # The old derivation hashed the lists after truncation and sorted
+                # them, so the same entries hash the same in either order.
+                "stalls": sorted(self.stall_sites),
+                "top": sorted(self.top_failure_action_types),
+            }
+        )
+
+    def legacy_digest_matches(self, run_id: str) -> bool:
+        """True if ``report_id`` is the prefix of the older basis' digest.
+
+        A report that satisfies this but not :meth:`digest_matches` was written
+        by a version that hashed different fields, not edited after the fact:
+        its analytical fields still hash to the id it carries, so it is an
+        authentic summary rather than a tampered one.
+        """
+        return self.report_id == self.legacy_digest(run_id)[: len(self.report_id)]
+
+
+# --------------------------------------------------------------------------- #
+# Risk observation (issue #303, #1421)
+# --------------------------------------------------------------------------- #
+
+#: Bounds on a monitor's diagnostic detail. Monitors vary wildly in what they
+#: report, so the field is free-form but bounded, the same trade every other
+#: generously-shaped surface in this file makes.
+_RISK_DETAIL_MAX_KEYS = 32
+_RISK_DETAIL_MAX_STR = 512
+_RISK_DETAIL_MAX_DEPTH = 4
+
+_EPOCH_TEXT = re.compile(r"-?\d+(?:\.\d+)?$")
+
+
+def _risk_trigger(value: Any) -> str:
+    """Normalise a risk class name: non-empty, lowercase, bounded."""
+    if value is None:
+        raise ValueError("trigger must name a risk class")
+    cleaned = str(value).strip().lower()
+    if not cleaned:
+        raise ValueError("trigger must name a risk class")
+    return cleaned[:128]
+
+
+def _risk_score(value: Any) -> float:
+    """Clamp a monitor's confidence into [0, 1] rather than reject it.
+
+    A monitor reporting 1.4 or -0.1 is reporting nonsense, but the observation
+    behind it is still a signal worth keeping, and ingestion is fail-open. A
+    ``None``, unparseable or non-finite score therefore maps to ``0.0``, the
+    same fallback the pre-#1421 writer used, so a malformed score neither drops
+    the event on the write path nor blows up a later ``project()`` of a log
+    that already carries one.
+    """
+    if value is None or isinstance(value, bool):
+        return 0.0
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(score) or math.isinf(score):
+        return 0.0
+    if score < 0.0:
+        return 0.0
+    if score > 1.0:
+        return 1.0
+    return score
+
+
+def _risk_optional_id(value: Any) -> str | None:
+    """Tolerate a monitor that sends an identifier as something other than text."""
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned[:128] or None
+
+
+def _risk_detail(value: Any) -> dict[str, Any]:
+    """Bound a monitor's structured diagnostics, tolerating a legacy string.
+
+    Pre-#1421 ingestion truncated ``detail`` to a plain string, and those
+    events are still on the wire, so a scalar is wrapped rather than dropped.
+    """
+    if value is None or value == "":
+        return {}
+    if not isinstance(value, Mapping):
+        return {"message": str(value)[:_RISK_DETAIL_MAX_STR]}
+
+    def clamp(node: Any, depth: int) -> Any:
+        if isinstance(node, Mapping):
+            if depth >= _RISK_DETAIL_MAX_DEPTH:
+                return {}
+            clamped: dict[str, Any] = {}
+            for key, item in node.items():
+                if len(clamped) >= _RISK_DETAIL_MAX_KEYS:
+                    break
+                clamped[str(key)[:128]] = clamp(item, depth + 1)
+            return clamped
+        if isinstance(node, (list, tuple)):
+            if depth >= _RISK_DETAIL_MAX_DEPTH:
+                return []
+            return [clamp(item, depth + 1) for item in node[:_RISK_DETAIL_MAX_KEYS]]
+        if isinstance(node, str):
+            return node[:_RISK_DETAIL_MAX_STR]
+        if node is None or isinstance(node, (int, float, bool)):
+            return node
+        return str(node)[:_RISK_DETAIL_MAX_STR]
+
+    clamped_root = clamp(value, 0)
+    return dict(clamped_root) if isinstance(clamped_root, Mapping) else {}
+
+
+def _risk_ts(value: Any) -> datetime | None:
+    """Parse an epoch number or an ISO 8601 string, or ``None`` if neither.
+
+    Pre-#1421 ingestion copied the caller's ``ts`` onto the wire verbatim, so
+    arbitrary strings are already sitting in logs. Returning ``None`` lets each
+    caller pick its own fallback instead of forcing one on it: the writer dates
+    the observation at ingestion time, the fold dates it at the event's own
+    hash-chained timestamp so a re-projection still reproduces bit for bit.
+    """
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=UTC)
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    if _EPOCH_TEXT.match(text):
+        return datetime.fromtimestamp(float(text), tz=UTC)
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+class RiskObservedPayload(BaseModel):
+    """Typed payload schema for ``RISK_OBSERVED`` (issue #1421).
+
+    A witness report from a real-time behavioural monitor: SNAGLINE, a
+    watchdog sidecar, a runtime anomaly detector. It is not a state mutation
+    and not a side effect, it is an observation, which is exactly why the event
+    is stamped ``Origin.EXTERNAL_MONITOR`` at write time and can never be
+    self-certified by the agent it describes (issue #303).
+
+    The schema is tolerant by design: it normalises what monitors send rather
+    than refusing it, so payloads written before it existed still validate.
+    """
+
+    model_config = Frozen
+
+    trigger: str = Field(min_length=1, max_length=128)
+    """Risk class the monitor detected: ``loop``, ``error_cascade``,
+    ``latency_anomaly``, ``token_runaway``, ``silent_abort``, ``meltdown``,
+    ``side_effect_duplicate`` or ``governance_decay`` under the default policy.
+    Not restricted to that set: a monitor may name a class the installed policy
+    has not mapped yet, and the signal is recorded and ignored until it does."""
+    score: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Confidence the monitor assigns to the observation, clamped to [0, 1]."""
+    episode_id: str | None = Field(default=None, max_length=128)
+    """Execution episode the risk was seen in, when the monitor reports one."""
+    step_id: str | None = Field(default=None, max_length=128)
+    """Action or tool call where the risk was detected, when known."""
+    detail: dict[str, Any] = Field(default_factory=dict)
+    """Structured diagnostic metadata. Free-form by design: monitors vary."""
+    ts: datetime = Field(default_factory=utcnow)
+    """When the monitor made the observation, on the monitor's own clock.
+    Accepts an epoch number or an ISO 8601 string (issue #1075)."""
+
+    @field_validator("trigger", mode="before")
+    @classmethod
+    def _trigger(cls, value: Any) -> str:
+        return _risk_trigger(value)
+
+    @field_validator("score", mode="before")
+    @classmethod
+    def _score(cls, value: Any) -> float:
+        return _risk_score(value)
+
+    @field_validator("episode_id", "step_id", mode="before")
+    @classmethod
+    def _optional_id(cls, value: Any) -> str | None:
+        return _risk_optional_id(value)
+
+    @field_validator("detail", mode="before")
+    @classmethod
+    def _detail(cls, value: Any) -> dict[str, Any]:
+        return _risk_detail(value)
+
+    @field_validator("ts", mode="before")
+    @classmethod
+    def _ts(cls, value: Any) -> datetime:
+        # An uninterpretable timestamp falls back to now rather than refusing
+        # the observation: a monitor that reports "yesterday" has still
+        # reported something. The fold pre-parses and passes a datetime, so
+        # this fallback is a write-path convenience that never touches it.
+        return _risk_ts(value) or utcnow()
+
+
+class ObservedRisk(BaseModel):
+    """A risk observation folded into :class:`SemanticState` (issue #1421).
+
+    The projected view of one ``RISK_OBSERVED`` event: what an external monitor
+    said it saw, when it said it saw it, and with what provenance. Provenance
+    is carried forward because the whole point of the event is that an
+    observation is a witness report, never a certificate: the projection must
+    still say who asserted it after the event itself has scrolled out of view.
+    """
+
+    model_config = Frozen
+
+    trigger: str = Field(min_length=1, max_length=128)
+    score: float = Field(default=0.0, ge=0.0, le=1.0)
+    episode_id: str | None = Field(default=None, max_length=128)
+    step_id: str | None = Field(default=None, max_length=128)
+    detail: dict[str, Any] = Field(default_factory=dict)
+    ts: datetime = Field(default_factory=utcnow)
+    provenance: Provenance = Field(default_factory=Provenance)
+
+    @field_validator("trigger", mode="before")
+    @classmethod
+    def _trigger(cls, value: Any) -> str:
+        return _risk_trigger(value)
+
+    @field_validator("score", mode="before")
+    @classmethod
+    def _score(cls, value: Any) -> float:
+        return _risk_score(value)
+
+    @field_validator("episode_id", "step_id", mode="before")
+    @classmethod
+    def _optional_id(cls, value: Any) -> str | None:
+        return _risk_optional_id(value)
+
+    @field_validator("detail", mode="before")
+    @classmethod
+    def _detail(cls, value: Any) -> dict[str, Any]:
+        return _risk_detail(value)
+
+    @field_validator("ts", mode="before")
+    @classmethod
+    def _ts(cls, value: Any) -> datetime:
+        # An uninterpretable timestamp falls back to now rather than refusing
+        # the observation: a monitor that reports "yesterday" has still
+        # reported something. The fold pre-parses and passes a datetime, so
+        # this fallback is a write-path convenience that never touches it.
+        return _risk_ts(value) or utcnow()
+
+
+class ModelSpecificState(BaseModel):
+    """An assumption tied to a specific model; switching models must revalidate."""
+
+    model_config = Frozen
+
+    item_id: str = Field(default_factory=lambda: make_id("model_state"))
+    description: str
+    required_validation: str = "Must be revalidated after model change."
+
+
+class ModelState(BaseModel):
+    """Model configuration, provider identity, and model-specific assumptions."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", protected_namespaces=())
+
+    model: str | None = None
+    provider: str | None = None
+    fingerprint: str | None = None
+    model_specific_state: list[ModelSpecificState] = Field(default_factory=list)
+
+
+class SubagentSpan(BaseModel):
+    """Tracks a subagent delegation within a parent run.
+
+    When a main agent spawns a subagent, CONTINUUM records a SUBAGENT_SPAWNED
+    event. The subagent runs in its own run_id but is linked back to the parent
+    via this span, enabling end-to-end tracing of delegation chains.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    span_id: str = Field(default_factory=lambda: make_id("span"))
+    parent_run_id: str
+    subagent_run_id: str
+    task_description: str
+    spawned_at: datetime = Field(default_factory=utcnow)
+    completed_at: datetime | None = None
+    status: str = "active"  # active, completed, failed
+    result_summary: str | None = None
+
+
+class SemanticState(BaseModel):
+    """The compact, durable representation of task state.
+
+    This is what survives crashes and context loss, NOT the transcript.
+
+    A state is a *projection* of an event prefix. ``source_sequence`` records
+    how far into the log the projection consumed, which makes the state
+    reproducible: folding the same prefix again must yield an equal state.
+
+    A state whose log stopped folding partway (issue #383) is marked
+    ``status=INVALID`` and names the break in the ``unprojectable_*`` fields.
+    Such a state reports what was known through its last good event; it must
+    never be read as a complete picture of the run.
+    """
+
+    model_config = Frozen
+
+    run_id: str
+    goal: Goal
+    progress: Progress = Field(default_factory=Progress)
+    plan: list[PlanStep] = Field(default_factory=list)
+    decisions: list[Decision] = Field(default_factory=list)
+    findings: list[Finding] = Field(default_factory=list)
+    evidence: list[Evidence] = Field(default_factory=list)
+    pending_work: list[PendingWork] = Field(default_factory=list)
+    approvals: list[Approval] = Field(default_factory=list)
+    external_dependencies: list[ExternalDependency] = Field(default_factory=list)
+    pins: dict[str, ConstraintPin] = Field(default_factory=dict)
+    """Active constraint pins, keyed by constraint id (issue #417)."""
+    unmatched_pin_retractions: list[str] = Field(default_factory=list)
+    """Constraint ids retracted without a matching active pin.
+
+    Retraction of an unknown id is not a crash; it degrades gracefully and
+    is noted here so the operator can see a mismatch without the fold
+    guessing whether the pin lived in an archived prefix or never existed.
+    """
+    attempt_lessons: list[AttemptLesson] = Field(default_factory=list)
+    """Structured lessons from failed attempts (issue #313), sorted by created_at."""
+    trajectory_reports: list[TrajectoryReport] = Field(default_factory=list)
+    """Sleep-time trajectory reports distilled from archived history (issue #393), sorted by window."""
+    observed_risks: list[ObservedRisk] = Field(default_factory=list)
+    """Risk observations folded from ``RISK_OBSERVED`` events (issue #1421).
+
+    Witness reports from external monitors, so the projection states what the
+    run was seen doing. An observation changes what is known, not what the run
+    is, so this field is excluded from the state fingerprint: folding one must
+    not mint a semantic version. Mitigation that actually alters the run still
+    bumps the version through whatever it changed. Re-derivable from the log,
+    hence omitted from persisted bodies alongside the other bookkeeping."""
+    model: ModelState | None = None
+    version: int = 0
+    source_sequence: int = 0
+    """Highest event sequence folded into this state (0 = nothing consumed)."""
+    status: StateStatus = StateStatus.VALID
+    """VALID for a complete fold. INVALID marks a degraded projection that
+    stopped at ``unprojectable_at_sequence``."""
+    unprojectable_at_sequence: int | None = None
+    """Sequence of the earliest event the fold refused, or None when the whole
+    log folded."""
+    unprojectable_event_type: str | None = None
+    """Type of the refused event, as ``unprojectable_reason`` alone may not name it."""
+    unprojectable_reason: str | None = None
+    """Single-line statement of the constraint the refused event violated."""
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+    @field_validator("version", "source_sequence")
+    @classmethod
+    def _non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("must be >= 0")
+        return v
+
+    def next_version(self, **overrides: Any) -> SemanticState:
+        """Produce the next versioned state from this one (immutable update)."""
+        return self.model_copy(
+            update={
+                "version": self.version + 1,
+                "updated_at": utcnow(),
+                **overrides,
+            }
+        )
+
+    # -- lookups used by validation and recovery -------------------------- #
+
+    def decision(self, decision_id: str) -> Decision | None:
+        """Look up a decision by its unique identifier, or return None."""
+        return next((d for d in self.decisions if d.decision_id == decision_id), None)
+
+    def finding(self, finding_id: str) -> Finding | None:
+        """Look up a finding by its unique identifier, or return None."""
+        return next((f for f in self.findings if f.finding_id == finding_id), None)
+
+    def dependency(self, resource: str) -> ExternalDependency | None:
+        """Look up an external dependency by its resource name, or return None."""
+        return next((d for d in self.external_dependencies if d.resource == resource), None)
+
+    def pin(self, constraint_id: str) -> ConstraintPin | None:
+        """Look up an active constraint pin by its identifier, or return None."""
+        return self.pins.get(constraint_id)
+
+    def active_pins(self) -> tuple[ConstraintPin, ...]:
+        """Return all currently active constraint pins as a tuple."""
+        return tuple(self.pins.values())
+
+    def evidence_ids(self) -> frozenset[str]:
+        """Return the set of all evidence identifiers present in this state."""
+        return frozenset(e.evidence_id for e in self.evidence)
+
+    def valid_decisions(self) -> tuple[Decision, ...]:
+        """Return all decisions with valid status as a tuple."""
+        return tuple(d for d in self.decisions if d.status is StateStatus.VALID)
+
+    def open_work(self) -> tuple[PendingWork, ...]:
+        """Return all pending work items whose status is not invalid."""
+        return tuple(w for w in self.pending_work if w.status is not StateStatus.INVALID)
+
+    def dangling_evidence(self) -> frozenset[str]:
+        """Support cited by decisions or findings that the state cannot produce.
+
+        A decision may cite either raw evidence or a finding derived from it;
+        both are legitimate provenance. Only references matching neither are
+        dangling. Treating a cited finding as missing evidence would raise a
+        false alarm on every well-formed reasoning chain, and false alarms are
+        how real ones get ignored.
+        """
+        known = self.evidence_ids() | frozenset(f.finding_id for f in self.findings)
+        cited: set[str] = set()
+        for decision in self.decisions:
+            cited.update(decision.evidence)
+        for finding in self.findings:
+            cited.update(finding.evidence)
+        return frozenset(cited - known)
+
+
+# --------------------------------------------------------------------------- #
+# Action ledger
+# --------------------------------------------------------------------------- #
+
+
+class ConsumedInputs(BaseModel):
+    """Commitment inputs consumed by a completed action (issue #295).
+
+    Records which checkpoint components and prior action outputs were used
+    to produce this action. Caller supplied at completion time, validated
+    but optional for backward compatibility. An absent or empty value is
+    admissible (no commitments), so old ledger rows without the field
+    remain admissible and round-trip.
+
+    This is the DART commitment graph edge, distinct from causal
+    ``caused_by``: ``caused_by`` traces why an action was decided,
+    ``consumed_inputs`` records what state it committed to.
+    """
+
+    model_config = Frozen
+
+    checkpoint_seq: int = Field(default=0, ge=0)
+    """Checkpoint sequence consumed, 0 means none."""
+    event_positions: list[int] = Field(default_factory=list)
+    """Event sequence positions consumed."""
+    component_ids: list[str] = Field(default_factory=list)
+    """Checkpoint component ids consumed (e.g., decision ids, finding ids)."""
+    action_ids: list[str] = Field(default_factory=list)
+    """Prior action ids consumed."""
+
+    @field_validator("event_positions")
+    @classmethod
+    def _positions_valid(cls, v: list[int]) -> list[int]:
+        if len(v) > 128:
+            raise ValueError("event_positions must contain at most 128 entries")
+        for pos in v:
+            if not isinstance(pos, int):
+                raise ValueError("event_positions must be integers")
+            if pos < 0:
+                raise ValueError("event_positions must be >= 0")
+        return v
+
+    @field_validator("component_ids")
+    @classmethod
+    def _component_ids_valid(cls, v: list[str]) -> list[str]:
+        if len(v) > 32:
+            raise ValueError("component_ids must contain at most 32 entries")
+        for cid in v:
+            if not isinstance(cid, str):
+                raise ValueError("component_ids must be strings")
+            if not (1 <= len(cid) <= 128):
+                raise ValueError("component_id must be 1-128 characters")
+        return v
+
+    @field_validator("action_ids")
+    @classmethod
+    def _action_ids_valid(cls, v: list[str]) -> list[str]:
+        if len(v) > 32:
+            raise ValueError("action_ids must contain at most 32 entries")
+        for aid in v:
+            if not isinstance(aid, str):
+                raise ValueError("action_ids must be strings")
+            if not (1 <= len(aid) <= 128):
+                raise ValueError("action_id must be 1-128 characters")
+        return v
+
+
+class Action(BaseModel):
+    """A record of an external side effect, for idempotent reconciliation."""
+
+    model_config = Frozen
+
+    action_id: str = Field(default_factory=lambda: make_id("action"))
+    run_id: str
+    action_type: str
+    dep_scope: str | None = None
+    arguments: Mapping[str, Any] = Field(default_factory=dict)
+    arguments_hash: str | None = None
+    status: ActionStatus = ActionStatus.PLANNED
+    external_id: str | None = None
+    result: Mapping[str, Any] | None = None
+    result_hash: str | None = None
+    side_effect_uncertain: bool = False
+    compensated_by: list[str] = Field(default_factory=list)
+    last_error: str | None = None
+    origin_digest: str | None = None
+    """Optional hash of the originating observation that motivated this write.
+
+    Stored as 64 lowercase hex (SHA-256) when present. Gives poisoning
+    forensics: a bad record can be joined back to the perception or
+    tool result that caused it, then sibling writes from the same
+    contaminated origin can be enumerated. Round-tripped via the ledger
+    payload and ``Action`` so the chain keeps the attribution.
+    """
+    created_at: datetime = Field(default_factory=utcnow)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    consumed_inputs: ConsumedInputs = Field(default_factory=ConsumedInputs)
+    """Commitment inputs consumed to produce this action (issue #295)."""
+    budget_authorization_id: str | None = None
+    """The retry-budget bucket this attempt draws from (issue #1052).
+
+    Persisted rather than re-derived so the bucket survives whatever the caller
+    sends next. Token derivation reads the arguments, which are caller-controlled
+    noise plus the real resource, and the caller's ``volatile`` declaration names
+    which fields to drop; a retry that changes either one would otherwise compute
+    a different bucket from the same stored record and start its count over.
+    Pinning the id at first claim makes a retry and its settlement share one
+    counter by construction. ``None`` is a record that draws no authorization
+    budget at all, and is also the pre-#1052 legacy value, re-derived on the next
+    claim.
+    """
+
+    @field_validator("origin_digest")
+    @classmethod
+    def _origin_digest_is_sha256(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not _SHA256_PATTERN.fullmatch(value):
+            raise ValueError("origin_digest must be 64 lowercase hex characters")
+        return value
+
+
+class ActionRecordPayload(BaseModel):
+    """Payload for ACTION_RECORDED (issue #551).
+
+    ``caused_by`` records the event ids that caused this action, completing
+    the causal chain. Same caps as DecisionPayload: optional, max 32 ids
+    of 1-128 chars, default [], unknown ids raise ValueError.
+    """
+
+    model_config = Frozen
+
+    action_id: str = Field(default_factory=lambda: make_id("action"))
+    action_type: str
+    arguments: Mapping[str, Any] = Field(default_factory=dict)
+    caused_by: list[str] = Field(default_factory=list)
+
+    @field_validator("caused_by")
+    @classmethod
+    def _validate_caused_by(cls, value: list[str]) -> list[str]:
+        if len(value) > 32:
+            raise ValueError("caused_by must contain at most 32 ids")
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("caused_by entries must be strings")
+            if not 1 <= len(item) <= 128:
+                raise ValueError("caused_by entries must be 1-128 chars")
+        return value
+
+
+def _validate_caused_by_known(caused_by: list[str], known_ids: set[str]) -> None:
+    """Raise ValueError if any id in caused_by is not in known_ids."""
+    for cid in caused_by:
+        if cid not in known_ids:
+            raise ValueError(f"unknown caused_by id {cid!r}")
+
+
+def validate_caused_by(caused_by: list[str] | None, known_ids: set[str] | None = None) -> list[str]:
+    """Validate caused_by list and optionally check existence.
+
+    Caps are enforced (max 32, each 1-128 chars). When known_ids is given,
+    every entry must be present or ValueError is raised. Empty or None
+    returns [] for backward compat.
+    """
+    if not caused_by:
+        return []
+    if len(caused_by) > 32:
+        raise ValueError("caused_by must contain at most 32 ids")
+    for cid in caused_by:
+        if not isinstance(cid, str) or not 1 <= len(cid) <= 128:
+            raise ValueError("caused_by entries must be 1-128 chars")
+    if known_ids is not None:
+        _validate_caused_by_known(caused_by, known_ids)
+    return list(caused_by)
+
+
+class UnknownSideEffect(RuntimeError):
+    """Raised when CONTINUUM cannot determine whether an external side effect occurred.
+
+    The caller must reconcile (do not blindly retry).
+
+    ``action_key`` and ``action_id`` carry the identity of the action needing
+    reconciliation, when the raiser knows it. Telling a caller to reconcile
+    without telling it *what* to reconcile is not actionable, and a recovering
+    session is by definition the one least able to reconstruct that identity for
+    itself (issue #367). Both are optional: a cross-run refusal is raised about
+    another run's record, which this ledger has no standing to settle.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        action_key: str | None = None,
+        action_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.action_key = action_key
+        self.action_id = action_id
+
+
+# --------------------------------------------------------------------------- #
+# Environment
+# --------------------------------------------------------------------------- #
+
+
+class EnvResource(BaseModel):
+    """Captured state of an external environment resource or tool."""
+
+    model_config = Frozen
+
+    name: str
+    kind: str = "resource"
+    version: str | None = None
+    checksum: str | None = None
+    metadata: Mapping[str, Any] = Field(default_factory=dict)
+
+
+class EnvironmentSnapshot(BaseModel):
+    """Collection of environment resource states captured at a point in time."""
+
+    model_config = Frozen
+
+    env_id: str = Field(default_factory=lambda: make_id("env"))
+    run_id: str
+    captured_at: datetime = Field(default_factory=utcnow)
+    resources: Mapping[str, EnvResource] = Field(default_factory=dict)
+    integrity_hash: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Validation + recovery
+# --------------------------------------------------------------------------- #
+
+
+class ComponentValidationEntry(BaseModel):
+    """Validation assessment for an individual state component."""
+
+    model_config = Frozen
+
+    component: Component
+    component_id: str | None = None
+    status: StateStatus
+    detail: str = ""
+    #: Identifier of the registered rule that produced this entry, or None
+    #: when built-in validation produced it (issue #761). Findings a rule
+    #: reports are namespaced by this identifier in the contract and every
+    #: diagnostic surface, and are covered by the contract's integrity seal.
+    rule: str | None = None
+
+
+class StateValidationResult(BaseModel):
+    """Overall validation outcome evaluating if a state checkpoint is safe to resume."""
+
+    model_config = Frozen
+
+    run_id: str
+    checkpoint_version: int = 0
+    statuses: list[ComponentValidationEntry] = Field(default_factory=list)
+    safe_to_resume: bool = False
+    recovery_mode: RecoveryMode | None = None
+    reason: str = ""
+    validated_at: datetime = Field(default_factory=utcnow)
+
+
+class RecoveryContract(BaseModel):
+    """The machine-readable answer to "what am I allowed to do now, and why?".
+
+    ``evidence`` and ``reason`` are additive, backward-compatible fields added
+    in Phase 1 so a contract can explain *why* CONTINUUM reached its decision
+    and *what* evidence drove it. They are threaded from the existing
+    validation report and recovery rationale; nothing here is invented. Both
+    default to empty so contracts serialized before they existed still load.
+    """
+
+    model_config = Frozen
+
+    run_id: str
+    checkpoint_version: int = 0
+    #: The compatibility version whose digest rules this contract was sealed
+    #: under (issue #764). ``build_contract`` always writes the current one.
+    #: An absent key on the wire means the payload predates versioning, so the
+    #: field defaults to 0 and verifies against the pre-Phase-1 digest rules
+    #: rather than being read as a claim about the current field set.
+    #: Excluded from the hash payload: it selects the payload, it is not part
+    #: of it.
+    contract_version: int = Field(default=0)
+    recovery_status: RecoverySafety
+    verified: list[str] = Field(default_factory=list)
+    invalidated: list[str] = Field(default_factory=list)
+    required_actions: list[str] = Field(default_factory=list)
+    next_allowed_action: str | None = None
+    evidence: list[str] = Field(default_factory=list)
+    reason: str = ""
+    #: File observations recorded by host hooks (#210) after the latest
+    #: checkpoint, disk-checked at assess time (#208). Informational only:
+    #: never affects the recovery decision. Newest first; a trailing row with
+    #: ``truncated`` marks omitted older rows when the cap bites.
+    post_checkpoint_observations: list[dict[str, Any]] = Field(default_factory=list)
+    #: Liveness advisory (issue #302): last append age and breach count, informational only.
+    liveness: dict[str, Any] | None = None
+    #: Triggering risks (issue #303): RISK_OBSERVED ids that caused this decision.
+    triggering_risks: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utcnow)
+    integrity_hash: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoints + diffs
+# --------------------------------------------------------------------------- #
+
+
+class Run(BaseModel):
+    """A single long-running task, and the anchor for everything durable."""
+
+    model_config = Frozen
+
+    run_id: str = Field(default_factory=lambda: make_id("run"))
+    goal: str
+    status: RunStatus = RunStatus.STARTED
+    parent_run_id: str | None = None
+    """Set on child runs in a multi-agent hierarchy (issue #243). Children
+    aggregate into the parent's resume contract; siblings share nothing."""
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+    metadata: Mapping[str, Any] = Field(default_factory=dict)
+
+    def touch(self, **overrides: Any) -> Run:
+        """Return an updated copy of the run with updated_at set to now."""
+        return self.model_copy(update={"updated_at": utcnow(), **overrides})
+
+
+#: Fields that describe how an event log was *read*, not what a run's state
+#: is (issue #383). They live on SemanticState so a degraded fold can carry
+#: its diagnosis, but they are outside every durable identity of a state:
+#: excluded from the version fingerprint and from checkpoint integrity hashes
+#: (both predate #383; hashing them would brand every existing record as
+#: tampered), and omitted from persisted bodies so readers built before #383,
+#: whose SemanticState forbids extra inputs, can still load newer databases.
+#: ``observed_risks`` joins them for a second reason (issue #1421): a risk
+#: observation changes what the projection knows, not what the run is, so
+#: folding one must not mint a semantic version. It is re-derivable from the
+#: log, so omitting it from a persisted body costs nothing a re-projection
+#: cannot restore.
+PROJECTION_BOOKKEEPING: set[str] = {
+    "status",
+    "unprojectable_at_sequence",
+    "unprojectable_event_type",
+    "unprojectable_reason",
+    "observed_risks",
+}
+
+
+class StateCheckpoint(BaseModel):
+    """Durable, self-verifying snapshot of semantic state and environment."""
+
+    model_config = Frozen
+
+    checkpoint_id: str = Field(default_factory=lambda: make_id("checkpoint"))
+    run_id: str
+    version: int = 0
+    trigger: str = "manual"
+    reason: str = ""
+    state: SemanticState
+    environment: EnvironmentSnapshot | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+    integrity_hash: str | None = None
+
+    def content(self) -> dict[str, Any]:
+        """The sealed portion of the checkpoint (everything but the hash).
+
+        Projection bookkeeping is excluded beside the hash itself: it was added
+        after these checkpoints existed (#383), it is default in anything that
+        can be persisted (every capture path refuses a degraded fold), and
+        hashing it would report every checkpoint written by earlier builds as
+        tampered, which is exactly the alarm this hash exists to mean.
+        """
+        return self.model_dump(
+            mode="json", exclude={"integrity_hash": True, "state": PROJECTION_BOOKKEEPING}
+        )
+
+    def canonical_json(self) -> str:
+        """The serialised form written to storage.
+
+        Omits projection bookkeeping for the same reasons ``content`` does,
+        plus one more: readers built before #383 validate ``SemanticState``
+        with ``extra="forbid"`` and would refuse a body carrying fields they
+        have never heard of. Omitting them costs nothing, since they are
+        always default in anything persistable.
+        """
+        return self.model_dump_json(exclude={"state": PROJECTION_BOOKKEEPING})
+
+    def digest(self) -> str:
+        """Compute the stable cryptographic digest of the checkpoint content."""
+        return stable_hash(self.content())
+
+    def sealed(self) -> StateCheckpoint:
+        """Return a copy carrying its integrity hash.
+
+        A checkpoint is the thing recovery trusts, so it is sealed the same way
+        events are: the hash is over the content, and a mismatch on read means
+        the record was changed outside CONTINUUM.
+        """
+        return self.model_copy(update={"integrity_hash": self.digest()})
+
+    def verify(self) -> bool:
+        """Verify that the stored integrity hash matches the computed content digest."""
+        return self.integrity_hash is not None and self.integrity_hash == self.digest()
+
+
+class DiffEntry(BaseModel):
+    """Individual component modification between two semantic states."""
+
+    model_config = Frozen
+
+    kind: DiffKind
+    component: Component
+    component_id: str | None = None
+    detail: str = ""
+    before: Any = None
+    after: Any = None
+
+
+class StateDiff(BaseModel):
+    """Collection of diff entries comparing two versions of semantic state."""
+
+    model_config = Frozen
+
+    run_id: str
+    from_version: int
+    to_version: int
+    entries: list[DiffEntry] = Field(default_factory=list)

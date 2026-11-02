@@ -1,0 +1,1356 @@
+"""PostgreSQL storage engine (B2.3).
+
+Shares the exact contract and hash-chain semantics of ``SQLiteStorage`` so the
+two are interchangeable behind ``Storage``. It exists for the multi-process,
+multi-host case SQLite cannot serve: several ``continuum serve`` sidecars or
+agents pointing at one durable store.
+
+Implementation notes
+--------------------
+* **Driver.** Synchronous ``psycopg`` (the plan's recommendation), matching the
+  existing sync ``Storage`` surface. Pulled in via the optional ``[postgres]``
+  extra so the core install stays lean.
+* **JSON.** Stored as ``TEXT`` and round-tripped with ``json`` exactly like the
+  SQLite engine, so payload/state/checkpoint bytes are identical across engines.
+* **Concurrency.** Sequence allocation relies on the ``UNIQUE`` constraint on
+  ``(run_id, sequence)`` (and ``event_id``), the same backstop SQLite uses; a
+  racing writer hits the constraint and is reported as ``ConcurrentWriteError``
+  rather than silently overwriting.
+* **Connection.** One autocommit connection guarded by a lock, mirroring the
+  single-connection SQLite design.
+
+The engine is exercised by ``tests/test_storage_postgres.py``, which skips
+cleanly when ``CONTINUUM_TEST_POSTGRES_DSN`` is unset or ``psycopg`` is absent,
+so it runs for real in CI against a Postgres service.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
+from pathlib import Path
+from typing import Any
+
+from pydantic import ValidationError
+
+from continuum.environment.snapshot import EnvironmentSnapshot
+from continuum.events import CAUSED_BY_TYPES, Event, EventType, IntegrityReport, IntegrityViolation
+from continuum.models import (
+    Action,
+    Origin,
+    Run,
+    RunStatus,
+    SemanticState,
+    StateCheckpoint,
+    utcnow,
+)
+from continuum.security.hashing import make_id
+from continuum.state.versioning import canonical_state_json, state_fingerprint
+from continuum.storage.actionindex import index_entry_from_payload, index_order_for
+from continuum.storage.base import (
+    CheckpointNotFound,
+    ConcurrentWriteError,
+    CorruptedRecord,
+    RunNotFound,
+    Storage,
+)
+from continuum.storage.blob import (
+    audit_blob_descriptor,
+    get_payload_offload_threshold,
+    is_offload_descriptor,
+    load_blob_payload,
+    maybe_offload_payload,
+)
+from continuum.storage.compaction import resolve_compaction_bound
+
+__all__ = [
+    "PostgresStorage",
+]
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS continuum_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id     TEXT PRIMARY KEY,
+    parent_run_id TEXT REFERENCES runs(run_id),
+    goal       TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    metadata   TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    run_id          TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    sequence        INTEGER NOT NULL,
+    event_id        TEXT NOT NULL UNIQUE,
+    type            TEXT NOT NULL,
+    timestamp       TEXT NOT NULL,
+    payload         TEXT NOT NULL,
+    causer_event_id TEXT,
+    source          TEXT NOT NULL DEFAULT 'deterministic',
+    prev_hash       TEXT,
+    hash            TEXT NOT NULL,
+    PRIMARY KEY (run_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS events_by_type ON events(run_id, type);
+
+CREATE TABLE IF NOT EXISTS versions (
+    run_id           TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    version          INTEGER NOT NULL,
+    fingerprint      TEXT NOT NULL,
+    prev_fingerprint TEXT,
+    reason           TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    PRIMARY KEY (run_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+    checkpoint_id  TEXT PRIMARY KEY,
+    run_id         TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    version        INTEGER NOT NULL,
+    trigger        TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    integrity_hash TEXT NOT NULL,
+    body           TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS checkpoints_by_run ON checkpoints(run_id, version);
+
+CREATE TABLE IF NOT EXISTS events_archive (
+    run_id       TEXT NOT NULL,
+    sequence     INTEGER NOT NULL,
+    event_id     TEXT NOT NULL,
+    type         TEXT NOT NULL,
+    timestamp    TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    causer_event_id TEXT,
+    source       TEXT NOT NULL,
+    prev_hash    TEXT,
+    hash         TEXT NOT NULL,
+    archived_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS lg_checkpoints (
+    id            BIGSERIAL PRIMARY KEY,
+    thread_id     TEXT NOT NULL,
+    checkpoint_id TEXT NOT NULL,
+    parent_id     TEXT,
+    type          TEXT NOT NULL,
+    checkpoint    BYTEA NOT NULL,
+    meta_type     TEXT NOT NULL DEFAULT 'json',
+    metadata      BYTEA,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS lg_checkpoints_thread ON lg_checkpoints(thread_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS lg_writes (
+    id            BIGSERIAL PRIMARY KEY,
+    thread_id     TEXT NOT NULL,
+    checkpoint_id TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    idx           INTEGER NOT NULL,
+    channel       TEXT NOT NULL,
+    type          TEXT NOT NULL,
+    blob          BYTEA NOT NULL,
+    UNIQUE (thread_id, checkpoint_id, task_id, idx)
+);
+
+CREATE TABLE IF NOT EXISTS action_index (
+    key TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    action_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    updated_seq BIGINT NOT NULL,
+    action_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS action_index_run ON action_index(run_id);
+"""
+
+
+def _require_psycopg() -> Any:
+    """Import ``psycopg`` on demand; fail with a helpful message if absent."""
+    try:
+        import psycopg
+    except ImportError as exc:  # pragma: no cover - depends on environment
+        raise RuntimeError(
+            "PostgreSQL storage requires the 'psycopg' extra: pip install continuum-agent[postgres]"
+        ) from exc
+    return psycopg
+
+
+class PostgresStorage(Storage):
+    """Multi-process durable storage backed by PostgreSQL."""
+
+    supports_action_index = True
+    supports_compaction = True
+
+    def __init__(
+        self,
+        url: str | Any,
+        *,
+        timeout: float = 30.0,
+        storage_dir: str | Path | None = None,
+        payload_offload_bytes: int | None = None,
+    ) -> None:
+        psycopg = _require_psycopg()
+        self._psycopg = psycopg
+        from psycopg.rows import dict_row
+
+        dsn = self._normalize_dsn(str(url))
+        try:
+            self._connection = psycopg.connect(
+                dsn, autocommit=True, row_factory=dict_row, connect_timeout=int(timeout)
+            )
+        except Exception as exc:  # connection refused, auth, missing driver, etc.
+            raise RuntimeError(f"could not connect to PostgreSQL at {dsn!r}: {exc}") from exc
+        # The normalised locator, kept verbatim: connection.info.dsn redacts the
+        # password, so a caller that reopens from it cannot authenticate.
+        self.dsn = dsn
+        self._storage_dir = Path(storage_dir) if storage_dir is not None else None
+        self._payload_offload_bytes = (
+            max(int(payload_offload_bytes), 0) if payload_offload_bytes is not None else None
+        )
+        self._lock = threading.RLock()
+        self._configure()
+        self._create_schema()
+
+    @property
+    def storage_dir(self) -> Path:
+        """Directory used for auxiliary files (such as blobs)."""
+        if self._storage_dir is not None:
+            return self._storage_dir
+        if os.environ.get("CONTINUUM_STORAGE_DIR"):
+            return Path(os.environ["CONTINUUM_STORAGE_DIR"])
+        return Path(".continuum")
+
+    @property
+    def payload_offload_bytes(self) -> int:
+        """Payload offload threshold in bytes (0 = disabled)."""
+        if self._payload_offload_bytes is not None:
+            return self._payload_offload_bytes
+        return get_payload_offload_threshold()
+
+    @staticmethod
+    def _normalize_dsn(url: str) -> str:
+        """Accept ``postgres://`` as an alias for ``postgresql://``."""
+        if url.startswith("postgres://"):
+            return "postgresql://" + url[len("postgres://") :]
+        return url
+
+    def _configure(self) -> None:
+        # Foreign keys are honoured by default in Postgres; nothing to toggle.
+        pass
+
+    def _create_schema(self) -> None:
+        with self._lock:
+            self._connection.execute(_SCHEMA)
+            self._backfill_action_index()
+
+    def _backfill_action_index(self) -> None:
+        """Seed the projection from the log when it is empty (issue #216).
+
+        The table is a derived projection: an empty index over existing
+        ACTION_* events means the database predates the index or lost its
+        rows, and rebuilding from events is always safe. Payload is stored as
+        TEXT, so it is cast to ``jsonb`` before the ``->``/``->>`` accessors
+        apply (Postgres has no ``json_extract``; that is the SQLite spelling in
+        ``migrations.py``).
+
+        The number comes from :func:`index_order_for`, read row by row, for the
+        same reason the writer uses it: the value has to be reproducible by
+        the fold from the stored ``timestamp`` alone. It is also the only way
+        to get microsecond resolution -- ``EXTRACT(EPOCH FROM ...)`` on this
+        engine and ``strftime`` on SQLite both round, and a rounded number is
+        not the number the fold reproduces.
+        """
+        has_events = self._connection.execute(
+            "SELECT 1 FROM events WHERE type IN "
+            "('ACTION_RECORDED', 'ACTION_RECONCILED', 'ACTION_COMPENSATED') LIMIT 1"
+        ).fetchone()
+        if has_events is None:
+            return
+        empty = self._connection.execute("SELECT 1 FROM action_index LIMIT 1").fetchone()
+        if empty is not None:
+            return
+        rows = self._connection.execute(
+            "SELECT timestamp, type, payload FROM events "
+            "WHERE type IN ('ACTION_RECORDED', 'ACTION_RECONCILED', 'ACTION_COMPENSATED') "
+            "ORDER BY timestamp, run_id, sequence"
+        ).fetchall()
+        for row in rows:
+            payload = (
+                row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
+            )
+            entry = index_entry_from_payload(EventType(row["type"]), payload)
+            if entry is None:
+                continue
+            key, run_id, action_id, status, action_json = entry
+            self._connection.execute(
+                "INSERT INTO action_index(key, run_id, action_id, status, "
+                "updated_seq, action_json) VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET run_id = EXCLUDED.run_id, "
+                "action_id = EXCLUDED.action_id, status = EXCLUDED.status, "
+                "updated_seq = EXCLUDED.updated_seq, action_json = EXCLUDED.action_json",
+                (key, run_id, action_id, status, index_order_for(row["timestamp"]), action_json),
+            )
+
+    # -- transactions ----------------------------------------------------- #
+
+    def _write(self) -> Any:
+        return self._lock
+
+    def _read(self) -> Any:
+        return self._lock
+
+    @contextmanager
+    def atomic_claim(self, run_id: str, key: str | None = None) -> Iterator[None]:
+        """Wrap resolve and append in an atomic Postgres transaction with advisory lock.
+
+        Uses pg_advisory_xact_lock on the action key or run_id inside an explicit
+        transaction to ensure strict mutual exclusion during claim resolution and write.
+        """
+        lock_target = key or run_id
+        with self._write():
+            txn = self._connection.transaction()
+            txn.__enter__()
+            commit_on_exit = False
+            try:
+                self._connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"continuum:claim:{lock_target}",),
+                )
+                yield
+                commit_on_exit = True
+            except BaseException as exc:
+                if type(exc).__name__ in ("UnknownSideEffect", "GrantDenied", "LedgerError"):
+                    commit_on_exit = True
+                raise
+            finally:
+                if commit_on_exit:
+                    txn.__exit__(None, None, None)
+                else:
+                    txn.__exit__(Exception, Exception("rollback"), None)
+
+    def close(self) -> None:
+        """Close the connection. Later use raises from the driver."""
+        with self._lock:
+            self._connection.close()
+
+    def __del__(self) -> None:
+        connection = getattr(self, "_connection", None)
+        if connection is not None:
+            with suppress(Exception):
+                connection.close()
+
+    # -- runs ------------------------------------------------------------- #
+
+    def create_run(self, run: Run) -> Run:
+        """Insert the run row. Raises ConcurrentWriteError when the id exists."""
+        self.require_usable_run_id(run)
+        with self._write():
+            try:
+                self._connection.execute(
+                    "INSERT INTO runs(run_id, goal, status, created_at, updated_at, metadata, parent_run_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        run.run_id,
+                        run.goal,
+                        run.status.value,
+                        run.created_at.isoformat(),
+                        run.updated_at.isoformat(),
+                        json.dumps(dict(run.metadata), sort_keys=True),
+                        run.parent_run_id,
+                    ),
+                )
+            except self._psycopg.IntegrityError as exc:
+                raise ConcurrentWriteError(f"run {run.run_id!r} already exists") from exc
+        return run
+
+    def create_run_started(self, run: Run, *, source: Origin = Origin.DETERMINISTIC) -> Run:
+        """Create the run row and its first event in one transaction.
+
+        The connection runs autocommit, so an explicit ``transaction()`` block
+        is what makes the two inserts atomic here.
+        """
+        self.require_usable_run_id(run)
+        with self._write(), self._connection.transaction():
+            try:
+                self._connection.execute(
+                    "INSERT INTO runs(run_id, goal, status, created_at, updated_at, metadata, parent_run_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        run.run_id,
+                        run.goal,
+                        run.status.value,
+                        run.created_at.isoformat(),
+                        run.updated_at.isoformat(),
+                        json.dumps(dict(run.metadata), sort_keys=True),
+                        run.parent_run_id,
+                    ),
+                )
+            except self._psycopg.IntegrityError as exc:
+                raise ConcurrentWriteError(f"run {run.run_id!r} already exists") from exc
+            event = Event(
+                event_id=make_id("event"),
+                run_id=run.run_id,
+                sequence=1,
+                type=EventType.RUN_STARTED,
+                timestamp=utcnow(),
+                payload={"goal": run.goal},
+                source=source,
+                prev_hash=None,
+            ).sealed()
+            self._insert_event(event)
+        return run
+
+    def get_run(self, run_id: str) -> Run:
+        """Return the run row. Raises RunNotFound for a missing id."""
+        with self._read():
+            row = self._connection.execute(
+                "SELECT * FROM runs WHERE run_id = %s", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise RunNotFound(run_id)
+        return self._row_to_run(row)
+
+    def update_run(self, run: Run) -> Run:
+        """Persist run changes with a refreshed timestamp. Raises RunNotFound when no row matches."""
+        updated = run.touch()
+        with self._write():
+            cursor = self._connection.execute(
+                "UPDATE runs SET goal = %s, status = %s, updated_at = %s, metadata = %s "
+                "WHERE run_id = %s",
+                (
+                    updated.goal,
+                    updated.status.value,
+                    updated.updated_at.isoformat(),
+                    json.dumps(dict(updated.metadata), sort_keys=True),
+                    updated.run_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise RunNotFound(run.run_id)
+        return updated
+
+    def list_runs(self, *, limit: int | None = None) -> Sequence[Run]:
+        """Newest runs first by creation time, at most ``limit`` when given."""
+        query = "SELECT * FROM runs ORDER BY created_at DESC, run_id DESC"
+        params: tuple[Any, ...] = ()
+        if limit is not None:
+            query += " LIMIT %s"
+            params = (limit,)
+        with self._read():
+            rows = self._connection.execute(query, params).fetchall()
+        return [self._row_to_run(row) for row in rows]
+
+    def get_active_run(self) -> Run | None:
+        """Most recently updated non-terminal run, or None when there is none."""
+        terminal = (
+            RunStatus.COMPLETED.value,
+            RunStatus.CRASHED.value,
+            RunStatus.ABORTED.value,
+            RunStatus.FAILED.value,
+        )
+        with self._read():
+            rows = self._connection.execute(
+                "SELECT * FROM runs WHERE status NOT IN (%s, %s, %s, %s) "
+                "ORDER BY updated_at DESC, run_id DESC LIMIT 1",
+                terminal,
+            ).fetchall()
+        return self._row_to_run(rows[0]) if rows else None
+
+    @staticmethod
+    def _row_to_run(row: Any) -> Run:
+        try:
+            return Run(
+                run_id=row["run_id"],
+                goal=row["goal"],
+                status=row["status"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+                metadata=json.loads(row["metadata"]),
+                parent_run_id=row["parent_run_id"],
+            )
+        except (ValueError, json.JSONDecodeError, TypeError) as exc:
+            raise CorruptedRecord(f"run {row['run_id']!r} failed to load: {exc}") from exc
+
+    # -- events ----------------------------------------------------------- #
+
+    def append_event(
+        self,
+        run_id: str,
+        type: EventType,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        causer_event_id: str | None = None,
+        expected_sequence: int | None = None,
+        source: Origin = Origin.DETERMINISTIC,
+    ) -> Event:
+        """Append one chained event in a write transaction and return it.
+
+        The connection runs autocommit, so an explicit ``transaction()`` block
+        is what makes the ``events`` INSERT and its ``action_index`` upsert
+        (via ``_insert_event`` -> ``_maintain_action_index``) commit atomically,
+        matching SQLite's single ``BEGIN IMMEDIATE`` (issue #1371).
+        """
+        with self._write(), self._connection.transaction():
+            event = self._append_chained(
+                run_id,
+                type,
+                payload,
+                causer_event_id=causer_event_id,
+                expected_sequence=expected_sequence,
+                source=source,
+            )
+        return event
+
+    def _append_chained(
+        self,
+        run_id: str,
+        type: EventType,
+        payload: Mapping[str, Any] | None,
+        *,
+        causer_event_id: str | None,
+        expected_sequence: int | None,
+        source: Origin,
+    ) -> Event:
+        """Build and insert the next chained event on the open transaction.
+
+        Callers that need an event appended atomically with other statements
+        (compaction) reuse this instead of :meth:`append_event`, which would
+        commit the marker in its own autocommit transaction.
+        """
+        if type in CAUSED_BY_TYPES and payload is not None:
+            caused_by = payload.get("caused_by") if isinstance(payload, dict) else None
+            if caused_by is not None:
+                if not isinstance(caused_by, list):
+                    raise ValueError("caused_by must be a list")
+                if len(caused_by) > 32:
+                    raise ValueError("caused_by must contain at most 32 ids")
+                for cid in caused_by:
+                    if not isinstance(cid, str) or not 1 <= len(cid) <= 128:
+                        raise ValueError("caused_by entries must be 1-128 chars")
+                    exists = self._connection.execute(
+                        "SELECT 1 FROM events WHERE run_id = %s AND event_id = %s UNION ALL "
+                        "SELECT 1 FROM events_archive WHERE run_id = %s AND event_id = %s LIMIT 1",
+                        (run_id, cid, run_id, cid),
+                    ).fetchone()
+                    if exists is None:
+                        raise ValueError(f"unknown caused_by id {cid!r}")
+        self._require_run(self._connection, run_id)
+        head = self._connection.execute(
+            "SELECT sequence, hash FROM events WHERE run_id = %s ORDER BY sequence DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        current = int(head["sequence"]) if head else 0
+
+        if expected_sequence is not None and expected_sequence != current:
+            raise ConcurrentWriteError(
+                f"run {run_id!r} is at sequence {current}, caller expected {expected_sequence}"
+            )
+
+        raw_payload = payload
+        effective_payload: Mapping[str, Any] = dict(payload or {})
+        if self.payload_offload_bytes > 0:
+            effective_payload, _ = maybe_offload_payload(
+                effective_payload,
+                storage_dir=self.storage_dir,
+                threshold=self.payload_offload_bytes,
+            )
+
+        event = Event(
+            event_id=make_id("event"),
+            run_id=run_id,
+            sequence=current + 1,
+            type=type,
+            timestamp=utcnow(),
+            payload=effective_payload,
+            causer_event_id=causer_event_id,
+            source=source,
+            prev_hash=head["hash"] if head else None,
+        ).sealed()
+        self._insert_event(event, raw_payload=raw_payload)
+        return event
+
+    def append_sealed(self, event: Event) -> Event:
+        """Store a pre-sealed event as-is, preserving its chain.
+
+        Wrapped in an explicit ``transaction()`` for the same reason as
+        :meth:`append_event`: the ``events`` INSERT and the ``action_index``
+        upsert must commit together on the autocommit connection (issue #1371).
+        """
+        if event.type in CAUSED_BY_TYPES:
+            caused_by = event.payload.get("caused_by") if isinstance(event.payload, dict) else None
+            if caused_by is not None:
+                if not isinstance(caused_by, list):
+                    raise ValueError("caused_by must be a list")
+                if len(caused_by) > 32:
+                    raise ValueError("caused_by must contain at most 32 ids")
+                for cid in caused_by:
+                    if not isinstance(cid, str) or not 1 <= len(cid) <= 128:
+                        raise ValueError("caused_by entries must be 1-128 chars")
+        with self._write(), self._connection.transaction():
+            if event.type in CAUSED_BY_TYPES:
+                caused_by = (
+                    event.payload.get("caused_by") if isinstance(event.payload, dict) else None
+                )
+                if caused_by:
+                    for cid in caused_by:
+                        exists = self._connection.execute(
+                            "SELECT 1 FROM events WHERE run_id = %s AND event_id = %s UNION ALL "
+                            "SELECT 1 FROM events_archive WHERE run_id = %s AND event_id = %s LIMIT 1",
+                            (event.run_id, cid, event.run_id, cid),
+                        ).fetchone()
+                        if exists is None:
+                            raise ValueError(f"unknown caused_by id {cid!r}")
+            self._require_run(self._connection, event.run_id)
+            head = self._connection.execute(
+                "SELECT sequence, hash FROM events WHERE run_id = %s "
+                "ORDER BY sequence DESC LIMIT 1",
+                (event.run_id,),
+            ).fetchone()
+            expected_sequence = (int(head["sequence"]) if head else 0) + 1
+            expected_prev = head["hash"] if head else None
+
+            if event.sequence != expected_sequence:
+                raise ConcurrentWriteError(
+                    f"run {event.run_id!r}: expected sequence {expected_sequence}, "
+                    f"got {event.sequence}"
+                )
+            if event.prev_hash != expected_prev:
+                raise CorruptedRecord(f"run {event.run_id!r} seq {event.sequence}: broken chain")
+            if event.hash != event.digest():
+                raise CorruptedRecord(
+                    f"run {event.run_id!r} seq {event.sequence}: hash does not match content"
+                )
+            self._insert_event(event)
+        return event
+
+    def _insert_event(self, event: Event, raw_payload: Mapping[str, Any] | None = None) -> None:
+        try:
+            self._connection.execute(
+                "INSERT INTO events(run_id, sequence, event_id, type, timestamp, payload, "
+                "causer_event_id, source, prev_hash, hash) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    event.run_id,
+                    event.sequence,
+                    event.event_id,
+                    event.type.value,
+                    event.timestamp.isoformat(),
+                    json.dumps(dict(event.payload), sort_keys=True),
+                    event.causer_event_id,
+                    event.source.value,
+                    event.prev_hash,
+                    event.hash,
+                ),
+            )
+        except self._psycopg.IntegrityError as exc:
+            raise ConcurrentWriteError(
+                f"run {event.run_id!r} sequence {event.sequence} was taken by another writer"
+            ) from exc
+        self._maintain_action_index(event, payload=raw_payload)
+
+    def _maintain_action_index(
+        self, event: Event, payload: Mapping[str, Any] | None = None
+    ) -> None:
+        """Upsert the projection row for an ACTION_* event, same txn (#216).
+
+        ``updated_seq`` is epoch microseconds of the event's own timestamp, so
+        it is a property of the event rather than of a table position; see
+        :func:`continuum.storage.actionindex.index_order_for` for why that is
+        what makes the projection survive compaction.
+        """
+        target_payload = dict(payload if payload is not None else event.payload)
+        entry = index_entry_from_payload(event.type, target_payload)
+        if entry is None:
+            return
+        key, run_id, action_id, status, action_json = entry
+        try:
+            self._connection.execute(
+                "INSERT INTO action_index(key, run_id, action_id, status, "
+                "updated_seq, action_json) VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET run_id = EXCLUDED.run_id, "
+                "action_id = EXCLUDED.action_id, status = EXCLUDED.status, "
+                "updated_seq = EXCLUDED.updated_seq, action_json = EXCLUDED.action_json",
+                (key, run_id, action_id, status, index_order_for(event.timestamp), action_json),
+            )
+        except self._psycopg.IntegrityError as exc:
+            raise CorruptedRecord(
+                f"action index maintenance failed for key {key[:12]}...: {exc}"
+            ) from exc
+
+    def compact_run(
+        self,
+        run_id: str,
+        *,
+        through_sequence: int | None = None,
+        environment: EnvironmentSnapshot | None = None,
+    ) -> dict[str, int]:
+        """Archive the pre-anchor prefix of a run's log (issue #239).
+
+        A forced anchor checkpoint first records state at the boundary (its
+        STATE_CHECKPOINTED marker joins the log like any event). Then one
+        transaction appends the EVENT_LOG_ANCHORED marker and moves the prefix
+        up to the boundary into ``events_archive`` verbatim. The single
+        transaction matters: committing the marker separately would let a
+        crash in between leave an anchored live log whose prefix never
+        reached the archive, so verify would trust a genesis that was never
+        earned. The connection runs in autocommit mode, so the explicit
+        ``transaction()`` block is what makes the three writes atomic.
+
+        The bound is resolved by :func:`continuum.storage.compaction.
+        resolve_compaction_bound`, shared with the SQLite engine, so an
+        explicit ``through_sequence`` at or above the anchor marker is
+        rejected here too instead of archiving and deleting it (issue #1078).
+        """
+        storage_version, through = resolve_compaction_bound(
+            self, run_id, through_sequence, environment=environment
+        )
+
+        with self._write(), self._connection.transaction():
+            self._append_chained(
+                run_id,
+                EventType.EVENT_LOG_ANCHORED,
+                {"anchored_through": through, "version": storage_version.version},
+                causer_event_id=None,
+                expected_sequence=None,
+                source=Origin.DETERMINISTIC,
+            )
+            cur = self._connection.execute(
+                "INSERT INTO events_archive"
+                " (run_id, sequence, event_id, type, timestamp, payload,"
+                "  causer_event_id, source, prev_hash, hash)"
+                " SELECT run_id, sequence, event_id, type, timestamp, payload,"
+                "        causer_event_id, source, prev_hash, hash"
+                " FROM events WHERE run_id = %s AND sequence <= %s",
+                (run_id, through),
+            )
+            archived = cur.rowcount
+            self._connection.execute(
+                "DELETE FROM events WHERE run_id = %s AND sequence <= %s",
+                (run_id, through),
+            )
+
+        return {"archived": max(archived, 0)}
+
+    def read_archived_events(
+        self,
+        run_id: str,
+        *,
+        upto: int | None = None,
+        rehydrate: bool = True,
+    ) -> Sequence[Event]:
+        """Compacted events from the archive, oldest first."""
+        query = "SELECT * FROM events_archive WHERE run_id = %s"
+        params: list[Any] = [run_id]
+        if upto is not None:
+            query += " AND sequence <= %s"
+            params.append(upto)
+        query += " ORDER BY sequence ASC"
+        with self._read():
+            rows = self._connection.execute(query, params).fetchall()
+        return [self._row_to_event(row, rehydrate=rehydrate) for row in rows]
+
+    def foreign_action(self, key: str, *, exclude_run: str) -> Action | None:
+        """Indexed cross-run ledger lookup (issue #216)."""
+        with self._read():
+            row = self._connection.execute(
+                "SELECT action_json FROM action_index WHERE key = %s AND run_id != %s "
+                "ORDER BY updated_seq DESC LIMIT 1",
+                (key, exclude_run),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return Action.model_validate(json.loads(row["action_json"]))
+        except (ValueError, TypeError) as exc:
+            raise CorruptedRecord(
+                f"action index row for key {key[:12]}... failed to load: {exc}"
+            ) from exc
+
+    def rebuild_action_index(self) -> int:
+        """Recompute the whole index from the log; returns corrected rows.
+
+        Always global by design: keys live in one store-wide namespace, so a
+        per-run rewrite could collide with another run's legitimate row of
+        the same key. Mirrors the SQLite engine's count so ``verify --repair-index``
+        reports the same number from either backend (#1267). A correction is any
+        key whose stored row was missing, stale, or spurious: changed-or-added
+        rows plus rows the rebuild removed.
+        """
+        canonical = self._canonical_index_rows()
+        with self._write():
+            # Snapshot the stored rows under the write lock and ahead of the
+            # DELETE, so the count measures the index the rebuild replaced
+            # rather than one a concurrent writer shifted underneath it.
+            before = {
+                r["key"]: (int(r["updated_seq"]), r["status"])
+                for r in self._connection.execute(
+                    "SELECT key, updated_seq, status FROM action_index"
+                ).fetchall()
+            }
+            self._connection.execute("DELETE FROM action_index")
+            # psycopg's Connection has no executemany; the cursor does.
+            with self._connection.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO action_index(key, run_id, action_id, status, "
+                    "updated_seq, action_json) VALUES (%s, %s, %s, %s, %s, %s)",
+                    [
+                        (key, entry[1], entry[2], entry[3], seq, entry[4])
+                        for key, (entry, seq) in canonical.items()
+                    ],
+                )
+        corrections = sum(
+            1
+            for k, val in ((k, (seq, entry[3])) for k, (entry, seq) in canonical.items())
+            if before.get(k) != val
+        )
+        corrections += len(set(before) - set(canonical))
+        return corrections
+
+    def action_index_drift(self) -> int:
+        """Count index rows that disagree with the log. Read-only.
+
+        Store-wide by design, mirroring the SQLite engine: keys live in one
+        namespace, so a run-scoped comparison would falsely flag rows owned
+        by another run's later write of the same key.
+        """
+        expected = {
+            key: (seq, entry[3]) for key, (entry, seq) in self._canonical_index_rows().items()
+        }
+        with self._read():
+            stored = {
+                r["key"]: (int(r["updated_seq"]), r["status"])
+                for r in self._connection.execute(
+                    "SELECT key, updated_seq, status FROM action_index"
+                ).fetchall()
+            }
+        extra = set(stored) - set(expected)
+        changed = sum(1 for k, val in expected.items() if stored.get(k) != val)
+        return len(extra) + changed
+
+    def _canonical_index_rows(self) -> dict[str, tuple[tuple[str, str, str, str, str], int]]:
+        """Fold every run's action events; global last-write-per-key wins.
+
+        The order value is not a position in the row stream -- it has to be
+        the same number :meth:`_maintain_action_index` stored, or
+        :meth:`action_index_drift` compares two unrelated figures and reports
+        a dirty index on a healthy store (#1321). That number is
+        :func:`index_order_for` of the event's own append time, so the fold
+        reproduces it by reading the row's ``timestamp`` and the writer by
+        reading the same field of the event it is storing. A position could
+        never do this: counting action events matched ``nextval`` only while
+        the store was untouched, and every row here was equally unreachable
+        once a run was compacted (#1322).
+
+        The archive and the live log are one stream, not two segments.
+        Compaction (#239) moves a run's prefix into ``events_archive`` while
+        other runs keep appending, so "everything archived is older than
+        everything live" holds only within a single run. Across runs the
+        archive-first merge inverted write order and the projection read
+        dirty after routine log maintenance. Merging on
+        ``(timestamp, run_id, sequence)`` fixes both at once: the timestamp
+        is assigned at append time and copied into the archive verbatim, so
+        it is global write order in every state of the store.
+        """
+        with self._read():
+            rows = self._connection.execute(
+                "SELECT timestamp, run_id, sequence, type, payload FROM ("
+                "SELECT timestamp, run_id, sequence, type, payload FROM events_archive "
+                "UNION ALL "
+                "SELECT timestamp, run_id, sequence, type, payload FROM events) "
+                "ORDER BY timestamp, run_id, sequence"
+            ).fetchall()
+        canonical: dict[str, tuple[tuple[str, str, str, str, str], int]] = {}
+        for row in rows:
+            raw = row["payload"]
+            if not isinstance(raw, dict):
+                try:
+                    raw = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            payload = raw
+            if is_offload_descriptor(payload):
+                with suppress(Exception):
+                    payload = load_blob_payload(self.storage_dir, payload)
+            entry = index_entry_from_payload(EventType(row["type"]), payload)
+            if entry is None:
+                continue  # not an action event, so it stores no index row
+            canonical[entry[0]] = (entry, index_order_for(row["timestamp"]))
+        return canonical
+
+    @staticmethod
+    def _require_run(conn: Any, run_id: str) -> None:
+        row = conn.execute("SELECT 1 FROM runs WHERE run_id = %s", (run_id,)).fetchone()
+        if row is None:
+            raise RunNotFound(run_id)
+
+    def read_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int = 0,
+        upto: int | None = None,
+        rehydrate: bool = True,
+    ) -> Sequence[Event]:
+        """Live events in sequence order, windowed by ``after_sequence``/``upto``."""
+        query = "SELECT * FROM events WHERE run_id = %s AND sequence > %s"
+        params: list[Any] = [run_id, after_sequence]
+        if upto is not None:
+            query += " AND sequence <= %s"
+            params.append(upto)
+        query += " ORDER BY sequence ASC"
+        with self._read():
+            rows = self._connection.execute(query, params).fetchall()
+        return [self._row_to_event(row, rehydrate=rehydrate) for row in rows]
+
+    def last_sequence(self, run_id: str) -> int:
+        """Highest live sequence number; 0 when the run has no events yet."""
+        with self._read():
+            row = self._connection.execute(
+                "SELECT MAX(sequence) AS seq FROM events WHERE run_id = %s", (run_id,)
+            ).fetchone()
+        return int(row["seq"]) if row and row["seq"] is not None else 0
+
+    def _row_to_event(self, row: Any, *, rehydrate: bool = True) -> Event:
+        try:
+            raw_payload = (
+                row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
+            )
+        except (ValueError, json.JSONDecodeError, TypeError) as exc:
+            raise CorruptedRecord(
+                f"event {row['event_id']!r} (run {row['run_id']!r}, seq {row['sequence']}) "
+                f"failed to load: {exc}"
+            ) from exc
+
+        if rehydrate and is_offload_descriptor(raw_payload):
+            sha256_hex = raw_payload.get("__offloaded")
+            seq = int(row["sequence"])
+            try:
+                effective_payload = load_blob_payload(self.storage_dir, raw_payload)
+            except CorruptedRecord as exc:
+                raise CorruptedRecord(
+                    f"event sequence {seq} (run {row['run_id']!r}) missing or corrupt blob {sha256_hex!r}: {exc}"
+                ) from exc
+        else:
+            effective_payload = raw_payload
+
+        try:
+            return Event(
+                event_id=row["event_id"],
+                run_id=row["run_id"],
+                sequence=int(row["sequence"]),
+                type=row["type"],
+                timestamp=row["timestamp"],
+                payload=effective_payload,
+                causer_event_id=row["causer_event_id"],
+                source=row["source"],
+                prev_hash=row["prev_hash"],
+                hash=row["hash"],
+            )
+        except (ValueError, ValidationError, TypeError) as exc:
+            raise CorruptedRecord(
+                f"event {row['event_id']!r} (run {row['run_id']!r}, seq {row['sequence']}) "
+                f"failed to load: {exc}"
+            ) from exc
+
+    def verify_events(self, run_id: str, *, deep: bool = False) -> IntegrityReport:
+        """Re-audit a persisted chain without loading it into an EventLog.
+
+        For a compacted run (#239) the walk resumes at the archive boundary:
+        the newest ``events_archive`` row supplies the expected ``prev_hash``
+        and sequence of the first live event, and every archived row itself
+        is re-digested and chain-linked. An anchored log therefore verifies
+        only while its archived prefix is intact; removing the boundary
+        events or editing history in the archive fails here instead of
+        minting a fresh genesis out of whatever live rows survive.
+
+        ``checked`` covers every row audited, archived and live alike, and
+        ``trusted_through`` keeps a fully verified archived prefix even when a
+        live event further down the chain fails (#1814).
+
+        When deep=True, also audits all referenced out-of-band blobs across
+        both live and archived events.
+        """
+        violations: list[IntegrityViolation] = []
+        checked = 0
+        last_good = 0
+        intact = True
+        prev_digest: str | None = None
+        expected_sequence = 1
+        archive_edge: tuple[int, str] | None = None
+
+        with self._read():
+            rows = self._connection.execute(
+                "SELECT * FROM events WHERE run_id = %s ORDER BY sequence ASC", (run_id,)
+            ).fetchall()
+            # Gate on either signal: a surviving anchor marks a compacted run,
+            # but if that row itself was deleted the archive must still be
+            # audited rather than silently escaping the walk.
+            has_archive = (
+                self._connection.execute(
+                    "SELECT 1 FROM events_archive WHERE run_id = %s LIMIT 1", (run_id,)
+                ).fetchone()
+                is not None
+            )
+            if has_archive or any(r["type"] == "EVENT_LOG_ANCHORED" for r in rows):
+                archive_violations, archive_edge, archive_checked = self._audit_archive(
+                    run_id, deep=deep
+                )
+                violations.extend(archive_violations)
+                checked += archive_checked
+                if archive_violations:
+                    intact = False
+                elif archive_edge is not None:
+                    # The archived prefix verified in full, so it stays the
+                    # trusted prefix even when a live event later fails: the
+                    # report must describe the last verified sequence, not the
+                    # last verified live row (#1814).
+                    last_good = archive_edge[0]
+
+        if archive_edge is not None:
+            # The live chain must pick up exactly where the archive ends.
+            prev_digest = archive_edge[1]
+            expected_sequence = archive_edge[0] + 1
+
+        for row in rows:
+            checked += 1
+            healthy = True
+            try:
+                event = self._row_to_event(row, rehydrate=False)
+            except CorruptedRecord as exc:
+                violations.append(
+                    IntegrityViolation(
+                        kind="UNREADABLE_RECORD",
+                        run_id=run_id,
+                        sequence=int(row["sequence"]),
+                        event_id=row["event_id"],
+                        detail=str(exc),
+                    )
+                )
+                intact = False
+                prev_digest = None
+                expected_sequence = int(row["sequence"]) + 1
+                continue
+
+            digest = event.digest()
+            if event.sequence != expected_sequence:
+                healthy = False
+                violations.append(
+                    IntegrityViolation(
+                        kind="SEQUENCE_GAP",
+                        run_id=run_id,
+                        sequence=event.sequence,
+                        event_id=event.event_id,
+                        detail=f"expected sequence {expected_sequence}",
+                    )
+                )
+            if event.hash != digest:
+                healthy = False
+                violations.append(
+                    IntegrityViolation(
+                        kind="TAMPERED_CONTENT",
+                        run_id=run_id,
+                        sequence=event.sequence,
+                        event_id=event.event_id,
+                        detail="stored hash does not match recomputed digest",
+                    )
+                )
+            if event.prev_hash != prev_digest:
+                healthy = False
+                violations.append(
+                    IntegrityViolation(
+                        kind="BROKEN_CHAIN",
+                        run_id=run_id,
+                        sequence=event.sequence,
+                        event_id=event.event_id,
+                        detail=(
+                            f"prev_hash {event.prev_hash!r} does not match "
+                            f"predecessor digest {prev_digest!r}"
+                        ),
+                    )
+                )
+
+            if deep:
+                blob_violation = audit_blob_descriptor(
+                    self.storage_dir,
+                    event.payload,
+                    run_id=run_id,
+                    sequence=event.sequence,
+                    event_id=event.event_id,
+                )
+                if blob_violation is not None:
+                    healthy = False
+                    violations.append(blob_violation)
+
+            if healthy and intact:
+                last_good = event.sequence
+            else:
+                intact = False
+            prev_digest = digest
+            expected_sequence = event.sequence + 1
+
+        return IntegrityReport(
+            ok=not violations,
+            checked=checked,
+            violations=violations,
+            trusted_through={run_id: last_good},
+        )
+
+    def _audit_archive(
+        self, run_id: str, *, deep: bool = False
+    ) -> tuple[list[IntegrityViolation], tuple[int, str] | None, int]:
+        """Deep-audit one run's archived prefix (issue #239).
+
+        The archive holds the run's verbatim beginning, so it can be held to
+        the full genesis standard: sequence 1 with no predecessor, unbroken
+        sequencing and hash linkage throughout, and every stored hash equal
+        to the recomputed digest. Returns the violations found, the
+        ``(sequence, hash)`` edge the live chain must continue from (``None``
+        when nothing is archived), and how many archived rows were audited
+        so the caller can account for them in its own tally (#1814).
+        """
+        violations: list[IntegrityViolation] = []
+        edge: tuple[int, str] | None = None
+        checked = 0
+        prev_hash: str | None = None
+        expected_sequence = 1
+
+        rows = self._connection.execute(
+            "SELECT * FROM events_archive WHERE run_id = %s ORDER BY sequence ASC", (run_id,)
+        ).fetchall()
+        for row in rows:
+            checked += 1
+            try:
+                event = self._row_to_event(row, rehydrate=False)
+            except CorruptedRecord as exc:
+                violations.append(
+                    IntegrityViolation(
+                        kind="UNREADABLE_RECORD",
+                        run_id=run_id,
+                        sequence=int(row["sequence"]),
+                        event_id=row["event_id"],
+                        detail=f"archived row unreadable: {exc}",
+                    )
+                )
+                prev_hash = None
+                expected_sequence = int(row["sequence"]) + 1
+                edge = None
+                continue
+
+            if event.sequence != expected_sequence:
+                violations.append(
+                    IntegrityViolation(
+                        kind="SEQUENCE_GAP",
+                        run_id=run_id,
+                        sequence=event.sequence,
+                        event_id=event.event_id,
+                        detail=f"archived: expected sequence {expected_sequence}",
+                    )
+                )
+            if event.hash != event.digest():
+                violations.append(
+                    IntegrityViolation(
+                        kind="TAMPERED_CONTENT",
+                        run_id=run_id,
+                        sequence=event.sequence,
+                        event_id=event.event_id,
+                        detail="archived: stored hash does not match recomputed digest",
+                    )
+                )
+            if event.prev_hash != prev_hash:
+                violations.append(
+                    IntegrityViolation(
+                        kind="BROKEN_CHAIN",
+                        run_id=run_id,
+                        sequence=event.sequence,
+                        event_id=event.event_id,
+                        detail=(
+                            f"archived: prev_hash {event.prev_hash!r} does not match "
+                            f"predecessor digest {prev_hash!r}"
+                        ),
+                    )
+                )
+
+            if deep:
+                blob_violation = audit_blob_descriptor(
+                    self.storage_dir,
+                    event.payload,
+                    run_id=run_id,
+                    sequence=event.sequence,
+                    event_id=event.event_id,
+                    prefix="archived",
+                )
+                if blob_violation is not None:
+                    violations.append(blob_violation)
+
+            prev_hash = event.hash
+            expected_sequence = event.sequence + 1
+            edge = (event.sequence, event.hash) if event.hash is not None else None
+
+        return violations, edge, checked
+
+    # -- state versions --------------------------------------------------- #
+
+    def put_version(self, state: SemanticState, *, reason: str = "", force: bool = False) -> int:
+        """Persist a state version, reusing the head when the fingerprint is unchanged."""
+        fingerprint = state_fingerprint(state)
+        with self._write():
+            self._require_run(self._connection, state.run_id)
+            head = self._connection.execute(
+                "SELECT version, fingerprint FROM versions WHERE run_id = %s "
+                "ORDER BY version DESC LIMIT 1",
+                (state.run_id,),
+            ).fetchone()
+
+            if head is not None and head["fingerprint"] == fingerprint and not force:
+                return int(head["version"])  # unchanged: no new version
+
+            version = (int(head["version"]) + 1) if head else 0
+            stored = state.model_copy(update={"version": version})
+            self._connection.execute(
+                "INSERT INTO versions(run_id, version, fingerprint, prev_fingerprint, reason, "
+                "created_at, state) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (
+                    state.run_id,
+                    version,
+                    fingerprint,
+                    head["fingerprint"] if head else None,
+                    reason,
+                    utcnow().isoformat(),
+                    canonical_state_json(stored),
+                ),
+            )
+        return version
+
+    def get_version(self, run_id: str, version: int) -> SemanticState:
+        """Return one state version. Raises CheckpointNotFound for an unknown version."""
+        with self._read():
+            row = self._connection.execute(
+                "SELECT state, fingerprint FROM versions WHERE run_id = %s AND version = %s",
+                (run_id, version),
+            ).fetchone()
+        if row is None:
+            raise CheckpointNotFound(f"run {run_id!r} has no version {version}")
+        return self._row_to_state(row, run_id, version)
+
+    def latest_version(self, run_id: str) -> SemanticState | None:
+        """Newest state version, or None when nothing was stored yet."""
+        with self._read():
+            row = self._connection.execute(
+                "SELECT state, fingerprint, version FROM versions WHERE run_id = %s "
+                "ORDER BY version DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_state(row, run_id, int(row["version"]))
+
+    @staticmethod
+    def _row_to_state(row: Any, run_id: str, version: int) -> SemanticState:
+        try:
+            state = SemanticState.model_validate_json(row["state"])
+        except ValueError as exc:
+            raise CorruptedRecord(
+                f"run {run_id!r} version {version} failed to load: {exc}"
+            ) from exc
+        if state_fingerprint(state) != row["fingerprint"]:
+            raise CorruptedRecord(
+                f"run {run_id!r} version {version}: stored fingerprint does not match content"
+            )
+        return state
+
+    def list_versions(self, run_id: str) -> Sequence[int]:
+        """Stored state version numbers in ascending order."""
+        with self._read():
+            rows = self._connection.execute(
+                "SELECT version FROM versions WHERE run_id = %s ORDER BY version ASC", (run_id,)
+            ).fetchall()
+        return [int(row["version"]) for row in rows]
+
+    # -- checkpoints ------------------------------------------------------ #
+
+    def put_checkpoint(self, checkpoint: StateCheckpoint) -> StateCheckpoint:
+        """Persist a checkpoint. Raises ConcurrentWriteError when the id exists."""
+        sealed = checkpoint if checkpoint.verify() else checkpoint.sealed()
+        with self._write():
+            self._require_run(self._connection, sealed.run_id)
+            try:
+                self._connection.execute(
+                    "INSERT INTO checkpoints(checkpoint_id, run_id, version, trigger, "
+                    "created_at, integrity_hash, body) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        sealed.checkpoint_id,
+                        sealed.run_id,
+                        sealed.version,
+                        sealed.trigger,
+                        sealed.created_at.isoformat(),
+                        sealed.integrity_hash,
+                        sealed.canonical_json(),
+                    ),
+                )
+            except self._psycopg.IntegrityError as exc:
+                raise ConcurrentWriteError(
+                    f"checkpoint {sealed.checkpoint_id!r} already exists"
+                ) from exc
+        return sealed
+
+    def get_checkpoint(self, checkpoint_id: str) -> StateCheckpoint:
+        """Return one checkpoint. Raises CheckpointNotFound for an unknown id."""
+        with self._read():
+            row = self._connection.execute(
+                "SELECT body FROM checkpoints WHERE checkpoint_id = %s", (checkpoint_id,)
+            ).fetchone()
+        if row is None:
+            raise CheckpointNotFound(f"no such checkpoint: {checkpoint_id!r}")
+        return self._row_to_checkpoint(row)
+
+    def latest_checkpoint(self, run_id: str) -> StateCheckpoint | None:
+        """Newest checkpoint for the run, or None when there is none."""
+        with self._read():
+            row = self._connection.execute(
+                "SELECT body FROM checkpoints WHERE run_id = %s "
+                "ORDER BY version DESC, created_at DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        return self._row_to_checkpoint(row) if row else None
+
+    def list_checkpoints(self, run_id: str) -> Sequence[StateCheckpoint]:
+        """Every checkpoint for the run in version order."""
+        with self._read():
+            rows = self._connection.execute(
+                "SELECT body FROM checkpoints WHERE run_id = %s ORDER BY version ASC", (run_id,)
+            ).fetchall()
+        return [self._row_to_checkpoint(row) for row in rows]
+
+    def delete_checkpoint(self, checkpoint_id: str) -> None:
+        """Remove a checkpoint by id. Callers must not delete one a decision still depends on."""
+        with self._write():
+            self._connection.execute(
+                "DELETE FROM checkpoints WHERE checkpoint_id = %s", (checkpoint_id,)
+            )
+
+    @staticmethod
+    def _row_to_checkpoint(row: Any) -> StateCheckpoint:
+        try:
+            checkpoint = StateCheckpoint.model_validate_json(row["body"])
+        except ValueError as exc:
+            raise CorruptedRecord(f"checkpoint failed to load: {exc}") from exc
+        if not checkpoint.verify():
+            raise CorruptedRecord(
+                f"checkpoint {checkpoint.checkpoint_id!r}: integrity hash does not match content"
+            )
+        return checkpoint

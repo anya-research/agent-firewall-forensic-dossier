@@ -1,0 +1,233 @@
+"""Autogen adapter (optional extra: ``pip install snagline[autogen]``).
+
+Turns Autogen agent events into ``StepEvent``s and feeds them to a ``Monitor``.
+Autogen is async-first; the most stable integration point is the event stream
+emitted by ``agent.run_stream(task)``. This adapter provides a handler you can
+feed events to manually, plus ``run_and_monitor`` which wraps ``run_stream``
+and streams every event through the handler.
+
+The adapter is duck-typed: it reads Autogen event objects via ``model_dump()``
+with fallbacks, so it imports fine without Autogen installed (safe in CI) and
+never hard-couples to a specific Autogen release. No raw prompt/response content
+is retained -- only the one-way ``action_signature`` hash, tool name, latency
+(when available), and error flag.
+
+Autogen event objects are pydantic models; we read them via ``model_dump()``
+when present and fall back to attribute access / ``__dict__`` so the adapter
+works across Autogen versions without hard coupling.
+
+The optional ``clock=`` defaults to :func:`time.perf_counter`: monotonic and
+high-resolution on every platform. ``time.time`` advances in ~15.6 ms ticks on
+Windows and quantized sub-tick latencies to zero (issue #155). Note that
+``perf_counter`` has no meaningful epoch: event timestamps produced with it
+are only comparable within one process; detectors consume them solely as
+in-process latency differences.
+"""
+
+from __future__ import annotations
+
+import inspect
+import itertools
+import time
+from collections.abc import Callable
+from typing import Any
+
+from snagline.events import StepEvent, make_signature
+
+
+def _to_dict(event: Any) -> dict[str, Any]:
+    if isinstance(event, dict):
+        return event
+    model_dump = getattr(event, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return model_dump()
+        except Exception:
+            pass
+    if hasattr(event, "__dict__"):
+        return dict(vars(event))
+    return {}
+
+
+class SnaglineAutogenHandler:
+    """Observer that maps Autogen events to ``StepEvent``s and ingests them.
+
+    Usage (manual wiring into an event stream)::
+
+        handler = SnaglineAutogenHandler(monitor, "ep-1")
+        async for event in agent.run_stream(task):
+            handler.observe(event)
+        handler.close()
+
+    Or, more simply, use :func:`run_and_monitor`::
+
+        result = await run_and_monitor(agent, task, monitor=monitor, episode_id="ep-1")
+    """
+
+    def __init__(
+        self,
+        monitor: Any,
+        episode_id: str,
+        agent_name: str | None = None,
+        clock: Callable[[], float] | None = None,
+        side_effect_tools: set[str] | list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        """Create the handler.
+
+        ``side_effect_tools`` is the host-declared allowlist for
+        ``SideEffectGuardDetector`` (issue #150): tool names the host knows are
+        non-idempotent. Matching ``tool_call`` steps get ``side_effect=True``;
+        nothing is inferred from payloads and ``_emit(side_effect=False)``
+        stays the default otherwise.
+        """
+        self._monitor = monitor
+        self._episode_id = episode_id
+        self._agent_name = agent_name
+        # perf_counter, not time.time: time.time ticks at ~15.6 ms on Windows,
+        # quantizing sub-tick latencies to zero (issue #155). perf_counter has
+        # no meaningful epoch; detectors only consume in-process differences.
+        self._clock = clock or time.perf_counter
+        self._counter = itertools.count()
+        self._side_effect_tools: set[str] = set(side_effect_tools or [])
+
+    def observe(self, event: Any) -> list[StepEvent]:
+        d = _to_dict(event)
+        kind = str(d.get("type") or d.get("event_type") or "")
+        emitted: list[StepEvent] = []
+
+        # Tool call requests: content is a list of FunctionCall(name, arguments).
+        if "ToolCallRequest" in kind or "tool_call" in kind.lower():
+            calls = d.get("content") or []
+            if not isinstance(calls, list):
+                calls = [calls]
+            for call in calls:
+                cd = _to_dict(call)
+                name = cd.get("name") or cd.get("tool") or "tool"
+                args = cd.get("arguments") if "arguments" in cd else str(call)
+                emitted.append(
+                    self._emit("tool_call", name, args=str(args), error=False)
+                )
+            return emitted
+
+        # Tool call execution results: content is a list of FunctionExecutionResult.
+        if "ToolCallExecution" in kind or "tool_result" in kind.lower():
+            results = d.get("content") or []
+            if not isinstance(results, list):
+                results = [results]
+            for res in results:
+                rd = _to_dict(res)
+                name = rd.get("name") or rd.get("tool") or "tool"
+                is_error = bool(rd.get("is_error") or rd.get("error"))
+                emitted.append(
+                    self._emit("tool_call", name, args=str(rd), error=is_error)
+                )
+            return emitted
+
+        # Anything else (TextMessage, Response, TaskResult, ...) is an agent step.
+        content = d.get("content") or d.get("text") or d.get("thought") or ""
+        emitted.append(self._emit("agent_step", None, args=str(content), error=False))
+        return emitted
+
+    def _emit(
+        self,
+        action_type: str,
+        tool_name: str | None,
+        *,
+        args: str,
+        error: bool,
+        latency_ms: float | None = None,
+        side_effect: bool = False,
+    ) -> StepEvent:
+        if (
+            not side_effect
+            and action_type == "tool_call"
+            and tool_name is not None
+            and tool_name in self._side_effect_tools
+        ):
+            side_effect = True
+        sig = make_signature(action_type, tool_name, args)
+        event = StepEvent(
+            step_id=str(next(self._counter)),
+            episode_id=self._episode_id,
+            timestamp=self._clock(),
+            action_type=action_type,
+            action_signature=sig,
+            tool_name=tool_name,
+            latency_ms=latency_ms,
+            error=error,
+            metadata={"agent_name": self._agent_name, "adapter": "autogen"},
+            side_effect=side_effect,
+        )
+        self._monitor.ingest(event)
+        return event
+
+    def close(self) -> None:
+        """Optional: clears per-episode detector state."""
+        self._monitor.end_episode(self._episode_id)
+
+
+async def run_and_monitor(
+    agent: Any,
+    task: Any,
+    *,
+    monitor: Any,
+    episode_id: str,
+    agent_name: str | None = None,
+    clock: Callable[[], float] | None = None,
+    side_effect_tools: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> Any:
+    """Run an Autogen agent while streaming its events through a handler.
+
+    Wraps ``agent.run_stream(task=task)`` (falling back to ``agent.run``) and
+    feeds every emitted event to a :class:`SnaglineAutogenHandler`. Returns the
+    agent's final result. The agent must expose an async ``run_stream`` (or
+    ``run``) method; if it exposes neither, raise a clear error at call time.
+
+    Real Autogen (``autogen-agentchat``) defines ``run_stream`` as an async
+    *generator* function taking a keyword-only ``task`` -- calling it returns an
+    async iterator directly, so it must be iterated, never ``await``ed. We still
+    tolerate a duck-typed ``run_stream`` that is a coroutine returning an
+    iterator by awaiting the result only when it is actually awaitable.
+    """
+    handler = SnaglineAutogenHandler(
+        monitor,
+        episode_id,
+        agent_name=agent_name,
+        clock=clock,
+        side_effect_tools=side_effect_tools,
+    )
+    if not hasattr(agent, "run_stream"):
+        if not hasattr(agent, "run"):  # pragma: no cover - caller bug
+            raise TypeError(
+                "agent must expose an async 'run_stream' (or 'run') method, "
+                f"got {type(agent).__name__!r}"
+            )
+        try:
+            # ``task`` is keyword-only on the real ``run``; pass it by keyword.
+            result = agent.run(task=task)  # type: ignore[attr-defined]
+            if inspect.isawaitable(result):
+                result = await result
+            handler.observe(result)
+            return result
+        finally:
+            handler.close()
+
+    try:
+        # Do NOT await: the real ``run_stream`` is an async generator function,
+        # so the call yields an async iterator directly. Await only a coroutine
+        # that returns the iterator (duck-typed agents / older shapes).
+        stream = agent.run_stream(task=task)
+        if inspect.isawaitable(stream):
+            stream = await stream
+        if stream is None:
+            raise TypeError(
+                f"agent.run_stream(task={task!r}) returned None; "
+                "expected an async iterator"
+            )
+        final = None
+        async for event in stream:
+            handler.observe(event)
+            final = event
+        return final
+    finally:
+        handler.close()

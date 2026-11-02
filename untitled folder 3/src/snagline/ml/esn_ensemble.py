@@ -1,0 +1,622 @@
+"""Optional echo-state-network + CUSUM ensemble detector (the ``ml`` extra).
+
+Part of the optional ``ml`` extra: ``pip install snagline[ml]`` (numpy
+and scikit-learn). Core code never imports this module unconditionally:
+``import snagline`` works with nothing but the standard library, and
+``Monitor.default()`` only attempts the guarded import when
+``Config.ml_ensemble_enabled`` is set. If numpy is missing or broken, the
+zero-dependency noisy-OR ``MLOrchestrator`` runs exactly as before
+(fail-open; project.md section 1.2, issue #80).
+
+Signals combined per step (structure only: hashes, counts, timings,
+booleans; never prompt or response content):
+
+* Mahalanobis distance with a diagonal covariance approximation between the
+  current step's latency/error pair and the matching per-tool statistics of
+  a healthy-run ``BaselineProfile``, when one is configured via
+  ``Config.goal_drift_baseline``. The diagonal form is used because the
+  persisted profile stores marginal per-tool statistics only.
+* A one-class echo-state-network residual: the reservoir predicts the next
+  feature vector from the previous reservoir state, and large prediction
+  error means the step looks unlike what the readout was trained on.
+  Training data comes from ``fit()`` (a healthy trajectory), or, as a
+  fallback, from the first ``warmup_steps`` steps of each live episode
+  (assumed healthy; nothing emits during that warm-up).
+* A CUSUM accumulator over the combined anomaly signal so that only
+  sustained drift alarms; it fires once, then re-arms.
+
+The detector is designed to run inside ``MLOrchestrator`` (its score feeds
+the noisy-OR combination and the emitted trigger is ``ml_ensemble``), so its
+standalone emissions carry the same ``ml_ensemble`` trigger owned by the ML
+signal namespace.
+
+Performance: fixed O(reservoir_size^2) floating point work per step, O(1)
+amortized bookkeeping, bounded per-episode memory (the warm-up buffers hold
+at most ``warmup_steps`` vectors). One small feature vector is allocated per
+step; this path is opt-in and never runs in the zero-dependency preset.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from collections.abc import Iterable
+from typing import Any
+
+try:
+    import numpy as np
+except ImportError as _exc:  # pragma: no cover - exercised via guard tests
+    raise ImportError(
+        "snagline.ml.esn_ensemble requires the optional 'ml' extra: "
+        "pip install snagline[ml]"
+    ) from _exc
+
+from snagline.baseline import BaselineProfile
+from snagline.events import StepEvent
+from snagline.risk import FailureRisk
+
+logger = logging.getLogger("snagline")
+
+# Feature layout (all values clamped to [0, 1], structure only):
+# [error flag, scaled latency_ms, scaled tokens_in, scaled tokens_out]
+# Repetition patterns are deliberately excluded here: the zero-dependency
+# loop detector owns them, and a one-class model cannot predict a free-
+# running novelty channel without false alarms.
+_FEATURE_DIM = 4
+_LATENCY_SCALE_MS = 10_000.0
+_TOKEN_SCALE = math.log1p(50_000.0)
+# Sigma floors so a perfectly stable baseline cannot make every deviation
+# infinite (mirrors the zero-dep latency detector's floors).
+_SIGMA_FLOOR_ABS_MS = 1.0
+_SIGMA_FLOOR_REL = 0.05
+_ERROR_SIGMA_FLOOR = 0.05
+# Score contribution for a tool absent from the healthy profile (mirrors the
+# goal_drift detector's convention for unseen tools).
+_UNKNOWN_TOOL_SCORE = 0.6
+# The readout's own training residuals underestimate future residuals
+# (in-sample optimism), so widen the band before calling a residual odd.
+_RESIDUAL_SIGMA_INFLATION = 3.0
+_ESN_ANOMALY_FLOOR = 0.05
+_RIDGE_ALPHA = 1e-3
+# Defensive floor on the CUSUM threshold (issue #386). __init__ rejects
+# cusum_h <= 0, so this only matters if a future path mutates _h after
+# construction; it keeps the score denominator non-zero so a bad value
+# degrades to a saturated score instead of a ZeroDivisionError that
+# fail-open would swallow -- and log -- on every step.
+_CUSUM_H_FLOOR = 1e-12
+
+
+class _EpisodeState:
+    """Per-episode reservoir state, warm-up buffers, and CUSUM accumulator."""
+
+    __slots__ = (
+        "beta",
+        "context_prev",
+        "cusum",
+        "gram",
+        "res_m2",
+        "res_mu",
+        "res_n",
+        "rhs",
+        "state",
+        "unseen_tools",
+        "warm_ctx",
+        "warm_n",
+        "warm_tgt",
+    )
+
+    def __init__(self, feature_dim: int, reservoir_size: int) -> None:
+        self.state = np.zeros(reservoir_size)
+        self.context_prev: np.ndarray | None = None
+        size = reservoir_size + 1  # augmented with a bias term
+        self.gram = np.zeros((size, size))
+        self.rhs = np.zeros((size, feature_dim))
+        self.warm_n = 0
+        self.beta: np.ndarray | None = None
+        self.res_mu = 0.0
+        self.res_m2 = 0.0
+        self.res_n = 0
+        self.cusum = 0.0
+        # Warm-up pair buffers, bounded by warmup_steps, used to seed the
+        # residual statistics the moment the readout is solved.
+        self.warm_ctx: list[np.ndarray] = []
+        self.warm_tgt: list[np.ndarray] = []
+        # Tools absent from the baseline that have already contributed their
+        # one-shot unseen-tool signal this episode (issue #593).
+        self.unseen_tools: set[str] = set()
+
+
+class EsnCusumDetector:
+    """One-class ESN + CUSUM ensemble emitting through ``MLOrchestrator``.
+
+    Deterministic: reservoir weights come from a fixed-seed generator, so two
+    instances built with the same arguments produce identical outputs on the
+    same stream. Any exception inside :meth:`observe` is logged and swallowed
+    (fail-open); it must never reach the host agent.
+
+    Knob contract (issue #386): ``reservoir_size``, ``cusum_k`` and
+    ``cusum_h`` are range-checked at construction. Unlike the Config-backed
+    detectors these knobs have no ``Config`` field, so there is no upstream
+    check to duplicate -- this constructor is the only gate. An out-of-range
+    value is a configuration error, not a run-time hazard.
+    """
+
+    name = "esn_cusum"
+
+    def __init__(
+        self,
+        baseline: BaselineProfile | None = None,
+        reservoir_size: int = 32,
+        spectral_radius: float = 0.9,
+        input_scaling: float = 0.5,
+        leak_rate: float = 0.3,
+        seed: int = 1337,
+        warmup_steps: int = 20,
+        cusum_k: float = 0.25,
+        cusum_h: float = 3.0,
+    ) -> None:
+        # The ESN knobs are not exposed through Config -- Monitor.default
+        # builds this detector with defaults only -- so __init__ is the sole
+        # gate, unlike the Config-backed detectors whose duplicate guard here
+        # mirrors an upstream check. Bad values fail loudly at construction
+        # rather than silently at run time: cusum_h <= 0 divides by zero in
+        # the score formula (or, when negative, makes the fire condition
+        # unreachable and permanently disables the detector), a negative
+        # cusum_k inflates the accumulator with every step, and
+        # reservoir_size < 1 builds an empty reservoir.
+        if reservoir_size < 1:
+            raise ValueError("reservoir_size must be >= 1")
+        if cusum_k < 0.0:
+            raise ValueError("cusum_k must be >= 0.0")
+        if cusum_h <= 0.0:
+            raise ValueError(
+                "cusum_h must be > 0.0; 0.0 divides by zero in the score "
+                "formula and a negative value makes the fire condition "
+                "unreachable, silently disabling the detector"
+            )
+        self._baseline = baseline
+        self._warmup_steps = max(1, warmup_steps)
+        self._k = cusum_k
+        self._h = cusum_h
+        # A persistent internal fault is reported once, not per step (issue
+        # #386); see _log_fault_once.
+        self._fault_logged: set[str] = set()
+        rng = np.random.Generator(np.random.PCG64(seed))
+        w = rng.uniform(-1.0, 1.0, (reservoir_size, reservoir_size))
+        radius = float(np.max(np.abs(np.linalg.eigvals(w))))
+        self._w: np.ndarray = w * (spectral_radius / radius)
+        self._w_in: np.ndarray = rng.uniform(
+            -input_scaling, input_scaling, (reservoir_size, _FEATURE_DIM)
+        )
+        self._leak = leak_rate
+        # Readout fitted on healthy data via fit(); new episodes copy it.
+        self._fitted_beta: np.ndarray | None = None
+        self._fitted_res_mu = 0.0
+        self._fitted_res_sigma = 0.0
+        self._fitted_res_n = 0
+        self._episodes: dict[str, _EpisodeState] = {}
+
+    def observe(self, event: StepEvent) -> FailureRisk | None:
+        """Score one step; fail-open wrapper around the numeric path.
+
+        Never raises: an internal error is logged once per distinct fault and
+        ignored (project.md section 1.2). Before issue #386 a persistent fault
+        logged a traceback on every step -- 50 ERROR records for 50 steps --
+        and :meth:`MLOrchestrator._log_fault_once` could not dedupe it, because
+        the exception never propagated out of this method to reach its own
+        handler.
+        """
+        try:
+            return self._observe(event)
+        except Exception as exc:
+            self._log_fault_once("observe", exc)
+            return None
+
+    def _log_fault_once(self, phase: str, exc: BaseException) -> None:
+        """Log an internal fault exactly once, mirroring MLOrchestrator.
+
+        The key carries the exception class so a *different* fault surfacing
+        later still gets reported: the goal is to stop the flood from one
+        persistent fault, not to silence every fault after the first.
+        """
+        key = f"{self.name}:{phase}:{type(exc).__name__}"
+        if key in self._fault_logged:
+            return
+        self._fault_logged.add(key)
+        logger.exception(
+            "snagline: esn_cusum raised during %s; ignoring (fail-open)", phase
+        )
+
+    def fit(self, events: Iterable[StepEvent]) -> None:
+        """Fit the readout and residual statistics on a healthy trajectory.
+
+        Call this with a known-healthy run (for example replayed from JSONL)
+        before monitoring. Afterwards new episodes start scoring immediately
+        against the healthy model instead of learning their own dynamics
+        during warm-up. Raises ``ValueError`` on too few steps; this is an
+        explicit setup-time call, not a hot-path one.
+        """
+        contexts: list[np.ndarray] = []
+        targets: list[np.ndarray] = []
+        state = np.zeros(self._w.shape[0])
+        prev_context: np.ndarray | None = None
+        for event in events:
+            x = self._features(event)
+            if prev_context is not None:
+                contexts.append(prev_context)
+                targets.append(x)
+            state = self._advance(state, x)
+            prev_context = np.concatenate((np.ones(1), state))
+        if len(contexts) < 3:
+            raise ValueError("need at least 3 healthy steps to fit the ESN")
+        x_mat = np.vstack(contexts)
+        y_mat = np.vstack(targets)
+        beta = self._solve_ridge(x_mat.T @ x_mat, x_mat.T @ y_mat)
+        residuals = np.linalg.norm(x_mat @ beta - y_mat, axis=1) / math.sqrt(
+            _FEATURE_DIM
+        )
+        n = int(residuals.shape[0])
+        mu = float(np.mean(residuals))
+        sigma = float(np.std(residuals, ddof=1)) if n > 1 else 0.0
+        self._fitted_beta = beta
+        self._fitted_res_mu = mu
+        self._fitted_res_sigma = sigma
+        self._fitted_res_n = n
+
+    def reset(self, episode_id: str) -> None:
+        """Drop all per-episode state (reservoir, warm-up, CUSUM)."""
+        self._episodes.pop(episode_id, None)
+
+    # --- restart survivability (issue #581) --------------------------------
+    #
+    # The readout fitted by fit() is the whole point of that setup-time call:
+    # it takes a known-healthy trajectory and is the alternative to learning
+    # the live stream's dynamics during warm-up. Without these two methods
+    # MLOrchestrator.dump_state silently skipped this detector (it guards with
+    # getattr), so a snapshot/restore lost both the fitted readout and every
+    # live episode's reservoir + CUSUM. The restored detector re-warmed from
+    # the live stream -- assuming it healthy -- and an anomaly shorter than
+    # warmup_steps was swallowed whole instead of alarming.
+
+    def dump_state(self) -> dict[str, Any] | None:
+        """Serialize the fitted readout and every live episode's reservoir."""
+        from snagline.detectors.base import snapshot_items
+
+        payload: dict[str, Any] = {
+            "reservoir_size": self._w.shape[0],
+            "episodes": [
+                (ep, self._state_to_dict(st))
+                for ep, st in snapshot_items(self._episodes)
+            ],
+        }
+        if self._fitted_beta is not None:
+            payload["fitted"] = {
+                "beta": self._fitted_beta.tolist(),
+                "res_mu": self._fitted_res_mu,
+                "res_sigma": self._fitted_res_sigma,
+                "res_n": self._fitted_res_n,
+            }
+        return payload
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        """Restore state previously produced by :meth:`dump_state`.
+
+        The live configuration owns the reservoir shape (``reservoir_size`` is
+        a constructor knob, not per-episode state): a mismatch is tolerated by
+        dropping the episode reservoirs rather than rebuilding them at the
+        wrong dimensionality, while the fitted readout is dropped for the same
+        reason -- :meth:`_new_state` copies it into new episodes verbatim, so
+        a beta sized for a different reservoir would raise on the next
+        ``observe``. Falling back to warm-up is the documented cold-start
+        behavior, not a silent misconfiguration.
+        """
+        if state.get("reservoir_size") == self._w.shape[0]:
+            for ep, raw in state.get("episodes", []):
+                st = self._new_state()
+                self._state_from_dict(st, raw)
+                self._episodes[ep] = st
+        fitted = state.get("fitted")
+        if fitted is not None and fitted.get("beta") is not None:
+            beta = np.array(fitted["beta"], dtype=float)
+            if beta.shape == self._rhs_shape():
+                self._fitted_beta = beta
+                self._fitted_res_mu = float(fitted.get("res_mu", 0.0))
+                self._fitted_res_sigma = float(fitted.get("res_sigma", 0.0))
+                self._fitted_res_n = int(fitted.get("res_n", 0))
+
+    def _rhs_shape(self) -> tuple[int, ...]:
+        return self._w.shape[0] + 1, _FEATURE_DIM
+
+    def _state_to_dict(self, st: _EpisodeState) -> dict[str, Any]:
+        """One episode's reservoir/CUSUM as JSON-compatible data."""
+        return {
+            "state": np.asarray(st.state, dtype=float).tolist(),
+            "context_prev": (
+                np.asarray(st.context_prev, dtype=float).tolist()
+                if st.context_prev is not None
+                else None
+            ),
+            "beta": np.asarray(st.beta, dtype=float).tolist()
+            if st.beta is not None
+            else None,
+            "cusum": st.cusum,
+            "res_mu": st.res_mu,
+            "res_m2": st.res_m2,
+            "res_n": st.res_n,
+            "warm_n": st.warm_n,
+            # gram/rhs are the accumulating least-squares system behind the
+            # warm-up solve; carrying them keeps a half-warmed episode from
+            # restarting its warm-up, and the warm buffers are the same data
+            # in pair form.
+            "gram": np.asarray(st.gram, dtype=float).tolist(),
+            "rhs": np.asarray(st.rhs, dtype=float).tolist(),
+            # The pair buffers feed _seed_residual_stats at the end of warm-up
+            # (np.vstack over an empty list raises), so they travel too. They
+            # are bounded by warmup_steps and dropped once warm-up completes.
+            "warm_ctx": [np.asarray(c, dtype=float).tolist() for c in st.warm_ctx],
+            "warm_tgt": [np.asarray(t, dtype=float).tolist() for t in st.warm_tgt],
+            # The unseen-tool latch is per episode, so it has to survive a
+            # restart or a restored episode re-credits the signal and can
+            # re-alarm on the same traffic (issue #593).
+            "unseen_tools": sorted(st.unseen_tools),
+        }
+
+    def _state_from_dict(self, st: _EpisodeState, raw: dict[str, Any]) -> None:
+        def _arr(key: str) -> np.ndarray | None:
+            val = raw.get(key)
+            return None if val is None else np.array(val, dtype=float)
+
+        state = _arr("state")
+        if state is not None and state.shape == st.state.shape:
+            st.state = state
+        ctx = _arr("context_prev")
+        # Validated against the expected shape, not against ``st.context_prev``:
+        # _new_state() leaves it None, so the old ``st.context_prev is not None``
+        # guard was never true and the pairing was always dropped. Losing it
+        # blinds the first post-restore step -- _esn_anomaly scores from the
+        # pre-advance context, and without it returns 0.0 and re-seeds
+        # context_prev, so a restart costs one scored step per episode.
+        if ctx is not None and ctx.shape == (self._w.shape[0] + 1,):
+            st.context_prev = ctx
+        beta = _arr("beta")
+        # Same for beta. An episode that finished warm-up solved its own
+        # readout; _new_state() copies it only from a fit(), so on an unfitted
+        # detector (the production path -- Monitor.default never calls fit)
+        # st.beta is None and the old guard dropped the solved readout. The
+        # episode then re-warmed: warm_n was restored past warmup_steps while
+        # warm_ctx/warm_tgt were still empty (they are cleared at the end of a
+        # completed warm-up), so the next observe re-solved from a single pair
+        # and re-seeded the residual statistics from that one sample,
+        # collapsing res_n to 1 and recalibrating the anomaly band.
+        if beta is not None and beta.shape == self._rhs_shape():
+            st.beta = beta
+        gram = _arr("gram")
+        rhs = _arr("rhs")
+        if gram is not None and gram.shape == st.gram.shape:
+            st.gram = gram
+        if rhs is not None and rhs.shape == st.rhs.shape:
+            st.rhs = rhs
+        st.cusum = float(raw.get("cusum", 0.0))
+        st.res_mu = float(raw.get("res_mu", 0.0))
+        st.res_m2 = float(raw.get("res_m2", 0.0))
+        st.res_n = int(raw.get("res_n", 0))
+        st.warm_n = int(raw.get("warm_n", 0))
+        st.warm_ctx = [np.array(c, dtype=float) for c in raw.get("warm_ctx", [])]
+        st.warm_tgt = [np.array(t, dtype=float) for t in raw.get("warm_tgt", [])]
+        # Internal consistency of a live state: warm_n counts the buffered
+        # pairs, and a completed warm-up always leaves a solved beta with the
+        # buffers cleared. A snapshot that breaks either invariant (beta absent
+        # but warm_n past the threshold, or a count that outruns its buffers)
+        # would, on the next observe, solve from the restored gram/rhs and call
+        # _seed_residual_stats over warm_ctx -- re-seeding the residual band
+        # from one sample and discarding the restored statistics. Clamp the
+        # count to the pairs actually carried, validate paired buffer lengths,
+        # and clear stale accumulators on cold re-warm so a foreign payload
+        # re-warms honestly instead of recalibrating silently.
+        if st.beta is None:
+            max_warm = min(len(st.warm_ctx), len(st.warm_tgt))
+            if len(st.warm_ctx) != len(st.warm_tgt) or st.warm_n > max_warm:
+                st.warm_n = max_warm
+            if st.warm_n == 0:
+                st.gram = np.zeros_like(st.gram)
+                st.rhs = np.zeros_like(st.rhs)
+                st.warm_ctx = []
+                st.warm_tgt = []
+        # Absent on snapshots written before the latch, which is exactly the
+        # case that must not re-credit an already-seen unseen tool (#593).
+        st.unseen_tools = {
+            str(name) for name in raw.get("unseen_tools", []) if isinstance(name, str)
+        }
+
+    # --- internals ---------------------------------------------------------
+
+    def _observe(self, event: StepEvent) -> FailureRisk | None:
+        st = self._episodes.get(event.episode_id)
+        if st is None:
+            st = self._new_state()
+            self._episodes[event.episode_id] = st
+        x = self._features(event)
+        anomaly = self._esn_anomaly(st, x)
+        signal = max(anomaly, self._mahalanobis_score(st, event))
+        st.cusum = max(0.0, st.cusum + signal - self._k)
+        if st.cusum >= self._h:
+            # __init__ rejects cusum_h <= 0; the floor guards only a future
+            # path that mutates _h after construction (issue #386). It floors
+            # the denominator alone: with the true _h in the numerator a
+            # degenerate h still saturates the score, instead of dividing by
+            # zero and being swallowed -- and logged -- on every step.
+            h = max(self._h, _CUSUM_H_FLOOR)
+            score = min(1.0, 0.5 + 0.5 * (st.cusum - self._h) / h)
+            st.cusum = 0.0  # re-arm so a persistent fault re-alarms later
+            return FailureRisk(
+                event.episode_id,
+                event.step_id,
+                score,
+                "ml_ensemble",
+                "sustained ensemble anomaly crossed the CUSUM threshold",
+                event.timestamp,
+            )
+        return None
+
+    def _new_state(self) -> _EpisodeState:
+        st = _EpisodeState(_FEATURE_DIM, self._w.shape[0])
+        if self._fitted_beta is not None:
+            st.beta = self._fitted_beta
+            st.res_mu = self._fitted_res_mu
+            variance = self._fitted_res_sigma**2 * max(0, self._fitted_res_n - 1)
+            st.res_m2 = max(0.0, variance)
+            st.res_n = self._fitted_res_n
+        return st
+
+    def _features(self, event: StepEvent) -> np.ndarray:
+        """Build the structural feature vector (no content, no novelty)."""
+        f_lat = 0.0
+        if event.latency_ms is not None and event.latency_ms > 0.0:
+            f_lat = min(1.0, event.latency_ms / _LATENCY_SCALE_MS)
+        tin = 0.0
+        if event.tokens_in is not None and event.tokens_in > 0:
+            tin = min(1.0, math.log1p(event.tokens_in) / _TOKEN_SCALE)
+        tout = 0.0
+        if event.tokens_out is not None and event.tokens_out > 0:
+            tout = min(1.0, math.log1p(event.tokens_out) / _TOKEN_SCALE)
+        err = 1.0 if event.error else 0.0
+        return np.array([err, f_lat, tin, tout])
+
+    def _advance(self, state: np.ndarray, x: np.ndarray) -> np.ndarray:
+        pre = self._w_in @ x + self._w @ state
+        return (1.0 - self._leak) * state + self._leak * np.tanh(pre)
+
+    def _esn_anomaly(self, st: _EpisodeState, x: np.ndarray) -> float:
+        """Next-step prediction anomaly of the ESN, in [0, 1]."""
+        # Score x from the *pre-advance* context (state after x_{t-1}) -- the
+        # exact pairing both fit() and the warm-up learner solved beta for.
+        # The step being judged must not leak into the context judging it:
+        # scoring from the post-advance state made the prediction partially
+        # self-fulfilling, shrinking residuals for exactly the anomalies the
+        # detector should amplify (issue #243).
+        context_prev = st.context_prev
+        st.state = self._advance(st.state, x)
+        context = np.concatenate((np.ones(1), st.state))
+        if st.beta is None:
+            # Warm-up: learn this episode's own (assumed healthy) dynamics
+            # from previous-step context to current features. Silent phase.
+            if context_prev is not None:
+                st.gram += np.outer(context_prev, context_prev)
+                st.rhs += np.outer(context_prev, x)
+                st.warm_ctx.append(context_prev)
+                st.warm_tgt.append(x)
+                st.warm_n += 1
+                if st.warm_n >= self._warmup_steps:
+                    st.beta = self._solve_ridge(st.gram, st.rhs)
+                    self._seed_residual_stats(st)
+            st.context_prev = context
+            return 0.0
+        # Fitted path: remember the pre-advance context for the *next* step's
+        # score, so live scoring keeps the fit-consistent pairing.
+        st.context_prev = context
+        if context_prev is None:
+            # First scored step of the episode has no pre-advance context to
+            # predict from (fit() skips the same step); stay silent once.
+            return 0.0
+        predicted = context_prev @ st.beta
+        residual = float(np.linalg.norm(predicted - x)) / math.sqrt(_FEATURE_DIM)
+        excess = max(0.0, residual - st.res_mu) / (
+            _RESIDUAL_SIGMA_INFLATION
+            * math.sqrt(max(0.0, st.res_m2 / max(1, st.res_n - 1)))
+            + _ESN_ANOMALY_FLOOR
+        )
+        anomaly = min(1.0, excess)
+        if anomaly < 1.0:
+            # Update running residual statistics only with healthy-ish
+            # residuals so sustained faults cannot normalize themselves.
+            st.res_n += 1
+            delta = residual - st.res_mu
+            st.res_mu += delta / st.res_n
+            st.res_m2 += delta * (residual - st.res_mu)
+        return anomaly
+
+    def _mahalanobis_score(self, st: _EpisodeState, event: StepEvent) -> float:
+        """Diagonal-covariance Mahalanobis score vs BaselineProfile, [0, 1).
+
+        Computed over the standardized latency and error terms of the
+        event's tool; mapped through d^2 / (d^2 + dof) so the value stays in
+        range and grows monotonically with distance. The latency term is
+        gated on ``latency_count`` -- the moments it reads are computed from
+        timed steps only -- so a profile fitted from a stream whose adapter
+        reported no ``latency_ms`` contributes its error rate and nothing
+        else, rather than scoring every live latency as a ~100-sigma
+        deviation from a mean of zero (issue #348).
+
+        A tool absent from the profile contributes ``_UNKNOWN_TOOL_SCORE``
+        exactly once per episode (issue #593): the module promises a CUSUM
+        over the combined signal so *only sustained* drift alarms, but a
+        per-step 0.6 floor made the debt grow by ``0.6 - k`` on every step
+        regardless of what the step was, so the alarm became a function of
+        step count alone and fired every ~9 steps for the whole episode on
+        perfectly healthy unseen-tool traffic. ``goal_drift`` emits its 0.6
+        once behind an episode-level latch; the equivalent here is to credit
+        the signal once and let the CUSUM decay on the healthy steps that
+        follow, while the ESN residual anomaly still contributes per step.
+        """
+        if self._baseline is None:
+            return 0.0
+        key = event.tool_name or "default"
+        tb = self._baseline.tools.get(key)
+        if tb is None:
+            if key in st.unseen_tools:
+                # Already credited this episode; the CUSUM must be able to
+                # decay on the healthy steps that follow the first one.
+                return 0.0
+            st.unseen_tools.add(key)
+            return _UNKNOWN_TOOL_SCORE
+        if tb.count < 2:
+            return 0.0
+        terms = 0.0
+        dof = 0
+        p = tb.error_rate
+        sigma_e = max(math.sqrt(max(0.0, p * (1.0 - p))), _ERROR_SIGMA_FLOOR)
+        z_e = ((1.0 if event.error else 0.0) - p) / sigma_e
+        terms += z_e * z_e
+        dof += 1
+        lat = event.latency_ms
+        # The latency term needs real timed moments. std_latency is 0 below
+        # two timed samples and mean_latency is 0 when none were timed, so the
+        # floors alone would make one ordinary call a near-saturated z
+        # (issue #539). Goal_drift guards the same way; drop the latency term
+        # and score the error term alone when the profile has no timing.
+        if lat is not None and lat > 0.0 and tb.latency_count >= 2:
+            sigma_l = max(
+                tb.std_latency,
+                _SIGMA_FLOOR_ABS_MS,
+                _SIGMA_FLOOR_REL * tb.mean_latency,
+            )
+            z_l = (lat - tb.mean_latency) / sigma_l
+            terms += z_l * z_l
+            dof += 1
+        if dof == 0:
+            return 0.0
+        return terms / (terms + dof)
+
+    def _seed_residual_stats(self, st: _EpisodeState) -> None:
+        """Seed running residual statistics from the warm-up pairs."""
+        ctx = np.vstack(st.warm_ctx)
+        tgt = np.vstack(st.warm_tgt)
+        assert st.beta is not None
+        residuals = np.linalg.norm(ctx @ st.beta - tgt, axis=1) / math.sqrt(
+            _FEATURE_DIM
+        )
+        n = int(residuals.shape[0])
+        st.res_mu = float(np.mean(residuals))
+        var = float(np.var(residuals, ddof=1)) if n > 1 else 0.0
+        st.res_m2 = max(0.0, var * (n - 1))
+        st.res_n = n
+        # The buffers have served their purpose; drop them.
+        st.warm_ctx = []
+        st.warm_tgt = []
+
+    @staticmethod
+    def _solve_ridge(gram: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+        reg = gram.copy()
+        size = reg.shape[0]
+        reg.flat[:: size + 1] += _RIDGE_ALPHA
+        return np.linalg.solve(reg, rhs)

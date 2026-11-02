@@ -1,0 +1,263 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # Windows legs (issue #116): the two newest interpreters only, so
+          # Windows-only regressions surface in CI without an 8-way matrix.
+          # Coverage policy: each job checks its own threshold independently;
+          # the Linux legs enforce the single canonical 80% gate from
+          # pyproject.toml while the Windows legs run report-only
+          # (--cov-fail-under=0 below), so per-OS numbers stay visible
+          # without becoming extra gates that must be moved in lockstep.
+          - os: windows-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.13"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (zero core deps + dev tooling)
+        shell: bash
+        run: |
+          python -m venv .venv
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            . .venv/Scripts/activate
+          else
+            . .venv/bin/activate
+          fi
+          python -m pip install --upgrade pip
+          pip install -e . --no-deps
+          # optional extra: without langchain-core the integration test silently
+          # skips, so CI would never run it; install it explicitly
+          pip install "langchain-core>=0.2"
+          pip install "pytest" "pytest-cov==7.1.0" "ruff==0.17.1" "mypy"
+
+      - name: Lint (ruff)
+        if: runner.os == 'Linux'
+        run: |
+          . .venv/bin/activate
+          ruff check src tests
+          ruff format --check src tests
+
+      - name: Type-check (mypy)
+        if: runner.os == 'Linux'
+        run: |
+          . .venv/bin/activate
+          mypy src tests
+
+      - name: Run tests with coverage gate (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          . .venv/bin/activate
+          python -m pytest tests/ -q
+
+      - name: Run tests, coverage reported but not gated (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          . .venv/Scripts/activate
+          python -m pytest tests/ -q --cov-fail-under=0
+
+  test-ml:
+    # Exercises the optional ml extra so its tests always run somewhere;
+    # they skip gracefully in the zero-dependency legs above (issue #80).
+    name: Test (py3.12, ml extra)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install (core + ml extra + dev tooling)
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -e ".[ml]"
+          pip install "pytest" "pytest-cov==7.1.0"
+
+      - name: Run tests with coverage
+        run: |
+          . .venv/bin/activate
+          python -m pytest tests/ -q
+
+  test-continuum:
+    # The CONTINUUM sink's only live test (test_real_actionledger_flags_review)
+    # skips unless continuum is importable, and no other leg installs it, so the
+    # sink's hand-rolled MiniStorage double could rot in silence -- exactly how
+    # the real ActionLedger's ``source=`` kwarg reached SNAGLINE as an
+    # in-the-wild TypeError in issue #296. This leg installs CONTINUUM from
+    # source so that test actually runs on every PR instead of skipping.
+    #
+    # It tracks CONTINUUM's default branch deliberately: upstream signature
+    # drift is meant to land as a loud red job here, not slip past a pinned ref.
+    # Coverage is reported but not gated, mirroring the Windows legs: a
+    # single-file run cannot meet the suite-wide 80% gate the Linux legs
+    # enforce over the whole tree.
+    name: Test (py3.12, continuum extra)
+    runs-on: ubuntu-latest
+    steps:
+      # persist-credentials is off on both checkouts: the job pip-installs from
+      # two repositories, and leaving the SNAGLINE token in the local git
+      # config would let the other repo's build hooks spend it (issue noted in
+      # PR review).
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check out CONTINUUM alongside SNAGLINE
+        uses: actions/checkout@v7
+        with:
+          repository: Cyrax321/CONTINUUM
+          path: continuum-src
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install (SNAGLINE + CONTINUUM from source + dev tooling)
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -e . --no-deps
+          # Install CONTINUUM from the checked-out source rather than PyPI: the
+          # published wheel lags the branch SNAGLINE integrates against, so a
+          # pinned/PyPI install would defeat the point of the leg.
+          pip install -e ./continuum-src --no-deps
+          # CONTINUUM's only runtime surface is pydantic, which SNAGLINE does
+          # not depend on, so pull it in explicitly for this leg.
+          pip install "pydantic>=2.7"
+          pip install "pytest" "pytest-cov==7.1.0" "mypy"
+
+      - name: Run CONTINUUM sink tests against the real package
+        run: |
+          . .venv/bin/activate
+          python -m pytest tests/sinks/test_continuum_sink.py -q --cov-fail-under=0
+
+  benchmark-accuracy:
+    # False-positive gate (issue #148): replays the committed deterministic
+    # 109-episode corpus through benchmarks/detection_accuracy.py on every
+    # push/PR. The harness exits 1 when any healthy control fires, so its
+    # exit code is consumed directly as the gate -- a red job here means a
+    # detector regressed onto healthy traffic and must not merge. Stdlib-only
+    # (imports snagline + stdlib), runs in well under a second.
+    name: Accuracy gate (healthy-control false positives)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install (stdlib-only core, zero extras)
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Accuracy false-positive gate (table format)
+        run: |
+          . .venv/bin/activate
+          python benchmarks/detection_accuracy.py --fixtures benchmarks/fixtures --format table
+
+      - name: Accuracy report JSON (for audit, even when the gate is red)
+        if: always()
+        run: |
+          . .venv/bin/activate
+          python benchmarks/detection_accuracy.py --fixtures benchmarks/fixtures --format json > accuracy-report.json || true
+
+      - name: Upload accuracy report artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: accuracy-report
+          path: accuracy-report.json
+          if-no-files-found: ignore
+
+  smoke:
+    # End-to-end wiring: examples, the sidecar, both bridges, and the hook CLI (issue #621).
+    # A hook must never break the host, so this never blocks on an API key.
+    # Framework sections (LangChain, LangGraph) skip under zero extras;
+    # see the unit test matrix for framework integration coverage.
+    name: Real-world smoke (tests/real_world_test.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install (stdlib-only core, zero extras)
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Smoke
+        run: |
+          . .venv/bin/activate
+          bash tests/real_world_test.sh
+
+  version-tag-check:
+    # Guard for #105: ensure the version in pyproject.toml has a matching
+    # annotated tag. Runs only on pushes to master/main; PRs are not expected
+    # to carry a tag yet, so they skip. Failure is loud: missing tag means
+    # the release is untraceable.
+    name: Version tag check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Check that pyproject version has a matching tag
+        run: |
+          set -euo pipefail
+          ver=$(python -c "import re, pathlib; t=pathlib.Path('pyproject.toml').read_text(); m=re.search(r'^version\s*=\s*\"([^\"]+)\"', t, re.M); print(m.group(1) if m else '')")
+          echo "pyproject version: $ver"
+          if [ -z "$ver" ]; then echo "could not parse version from pyproject.toml"; exit 1; fi
+          if [[ "$ver" == *".dev"* ]]; then
+            echo "dev version $ver, skipping tag check"
+            exit 0
+          fi
+          if ! git rev-parse "v$ver" >/dev/null 2>&1; then
+            echo "missing tag v$ver for pyproject version $ver"
+            echo "create it with: git tag -a v$ver -m \"SNAGLINE $ver -- see CHANGELOG.md\" && git push origin v$ver"
+            exit 1
+          fi
+          echo "tag v$ver exists at $(git rev-parse --short v$ver)"

@@ -1,0 +1,744 @@
+"""Which MCP callers may change a run.
+
+The problem this solves is coexistence, not intrusion. Several agents can be
+configured against the same database at once (Kilo, Gemini CLI and Claude Code
+have all pointed at this project's ``continuum.db`` simultaneously), and until
+now any of them could overwrite another's progress, checkpoint over its state,
+or claim its actions. This layer keeps honestly-named agents out of each other's
+runs.
+
+It is a security boundary only when authentication is turned on. By default
+``clientInfo`` is asserted by the client during the initialize handshake and
+never verified, so a caller that wants to be called ``claude-code`` simply says
+so. What the transport does guarantee is that the name is fixed at connection
+time and injected server-side: a caller cannot elevate itself mid-session by
+passing a forged ``clientInfo`` in tool arguments. That is enough to separate
+cooperating agents, and not enough to stop a hostile one on its own.
+
+When ``CONTINUUM_MCP_TOKEN`` is set, the server verifies one shared secret the
+client presents in the handshake's ``_meta.authToken``. Per-client credentials
+are available via ``CONTINUUM_MCP_CLIENT_TOKENS`` (``name:secret`` pairs): each
+caller's secret is bound to the identity it claims, so a token issued to one
+client cannot be replayed by another. A caller that cannot prove possession of
+the expected secret (for its own name, under per-client mode) is refused every
+mutating tool regardless of the name it claims, which is what turns "cooperating
+agents kept apart" into "hostile caller stopped". The check is fail-closed: a
+missing, empty, or mismatched secret always refuses, and an unset secret leaves
+authentication disabled so the default local, single-user, no-account behavior
+is unchanged. A hostile process with direct filesystem access to the database
+can still edit it without the server, which is outside this layer's scope.
+
+Read-only tools stay open
+-------------------------
+
+Only mutating tools are gated. ``validate``, ``resume`` and ``list_actions``
+cannot alter a run, and their whole value is that anyone can ask "is this safe
+to continue?" without first being granted permission. Gating them would also
+leave an unlisted caller unable to discover *why* its writes are failing.
+
+The split is driven by the ``read_only_hint`` annotation each tool already
+declares, rather than a second hand-maintained list that could drift out of
+step with it.
+
+Names hosts actually send
+-------------------------
+
+The allowlist is keyed on the ``clientInfo.name`` the host puts in its
+handshake, which is a fact about the host's build rather than something this
+project chooses. ``continuum mcp install --host cursor`` bakes
+``CONTINUUM_MCP_MUTATING_CLIENTS=cursor``, and a live probe found the same
+host presenting ``cursor``, ``cursor-vscode`` or ``visual-studio-code``
+depending on the build. On an exact string match every one of those but the
+first connected successfully with 3 of the 13 tools and said nothing, so the
+loss surfaced at the first write the agent attempted.
+
+Three rules close that without turning the allowlist into a shape an attacker
+can walk through:
+
+- Comparison is **case-insensitive** and whitespace-trimmed. ``Cursor`` is the
+  client that ``cursor`` names, not a stranger to it.
+- A host that sends **more than one name** declares the others with
+  ``CONTINUUM_MCP_CLIENT_ALIASES`` (``canonical:alias1,alias2``, or the
+  policy file's ``aliases`` key). An alias is a second spelling of an identity
+  that is already allowed, so a host nobody has observed sending a second name
+  still gets exactly one, and an alias declared for an unlisted client grants
+  nothing.
+- Everything else is compared **exactly**, folded. There is no prefix, suffix
+  or substring rule, and adding one would be the exact failure this layer
+  exists to prevent: a rule accepting ``cur*`` accepts ``cursorpwned``, and one
+  accepting ``*-vscode`` accepts ``attacker-vscode``. A second name is a
+  declared alias or it is a refusal, never an inference.
+
+Aliases are declared in their own variable rather than inline. The allowlist is
+split on commas and whitespace, so ``cursor=cursor-vscode`` written into it
+would be read as two standalone entries: a client literally named
+``cursor=cursor-vscode``, plus a grant to ``cursor-vscode`` that the
+declaration beside it never referred to. That is the operator's intent applied,
+misread, with nothing to say so, so an inline ``=`` is refused outright.
+
+``CONTINUUM_MCP_ALLOW_ANY_CLIENT`` waives the comparison entirely, for an
+operator who genuinely runs many MCP clients against one database. It is
+opt-in, never inferred, never a default, and it is visible in ``policy.source``
+and in every refusal this module writes, because a caller whose host profile
+was never written down is exactly the caller that must be visible.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from collections.abc import Iterable, Mapping
+from pathlib import Path
+from typing import Any
+
+__all__ = [
+    "AuthorizationPolicy",
+    "AuthPolicy",
+    "ConfirmPolicy",
+    "NotAuthorized",
+    "UnknownCaller",
+    "NotAuthenticated",
+    "POLICY_ENV_VAR",
+    "POLICY_ENV_VAR_ALIAS",
+    "POLICY_FILENAME",
+    "ALIASES_ENV_VAR",
+    "ALLOW_ANY_CLIENT",
+    "ALLOW_ANY_CLIENT_ENV_VAR",
+    "AUTH_ENV_VAR",
+    "CONFIRM_ENV_VAR",
+    "load_policy",
+    "load_auth",
+    "load_confirm",
+    "caller_name",
+    "fold_client_name",
+    "token_from",
+    "CLIENT_TOKENS_ENV_VAR",
+]
+
+POLICY_ENV_VAR = "CONTINUUM_MCP_ALLOW"
+
+#: Alias for ``POLICY_ENV_VAR``, preserved from the closed PR #3. The longer
+#: name states what is being allowed rather than leaving it to be inferred, so
+#: it wins when both are set: a reader who followed that PR's history will
+#: reach for it first, and silently preferring the vaguer name would surprise
+#: them. Same precedence position: an alias, not an extra config source.
+POLICY_ENV_VAR_ALIAS = "CONTINUUM_MCP_MUTATING_CLIENTS"
+
+POLICY_FILENAME = ".continuum/mcp-policy.json"
+
+#: Alias declarations: ``canonical:alias1,alias2`` groups, separated by commas
+#: or whitespace, spelled the way ``CONTINUUM_MCP_CLIENT_TOKENS`` is. An alias
+#: says "this identity also answers to this name", so a host that sends a
+#: second spelling of itself gets one grant rather than two policies to keep in
+#: step. See "Names hosts actually send" in the module docstring.
+ALIASES_ENV_VAR = "CONTINUUM_MCP_CLIENT_ALIASES"
+
+#: The wildcard token, recognised only as a whole allowlist entry. It grants
+#: every *named* client, which is to say every client that asserts any name at
+#: all, so the isolation this layer exists to provide is deliberately switched
+#: off. It is honoured when an operator writes it and is never inferred.
+ALLOW_ANY_CLIENT = "*"
+
+#: The opt-in that turns the wildcard on. Named for what it does rather than
+#: for the token it contains, so that finding it in an environment dump or a
+#: committed registration is itself the warning.
+ALLOW_ANY_CLIENT_ENV_VAR = "CONTINUUM_MCP_ALLOW_ANY_CLIENT"
+
+#: Spellings that switch the wildcard on. Everything else is read as not set,
+#: so ``0`` and ``false`` mean what they say. See :func:`_opted_in`.
+_OPT_IN_VALUES = frozenset({"*", "1", "true", "yes", "on"})
+
+#: Used when the handshake supplied no client name at all.
+UNKNOWN_CALLER = "<unidentified>"
+
+
+class NotAuthorized(PermissionError):
+    """A caller attempted a mutating tool it is not permitted to use."""
+
+
+class UnknownCaller(NotAuthorized):
+    """The connection never identified itself, so nothing can be authorized."""
+
+
+class NotAuthenticated(PermissionError):
+    """The caller did not prove possession of the expected shared secret."""
+
+
+def fold_client_name(name: str) -> str:
+    """Normalise a client name so one spelling is one identity (#1598).
+
+    Both halves of the handshake key off the same ``clientInfo.name`` string,
+    and clients do not agree with each other -- or with themselves across
+    releases -- on capitalisation: the same editor reports ``Cursor`` in one
+    version and ``cursor`` in the next. Every comparison in this module goes
+    through here, so the allowlist and the per-client token map can never
+    disagree about what a name is. Before the fold they did: the allowlist
+    accepted a caller the token map then refused, and the message blamed the
+    name as unregistered rather than naming the mismatch.
+
+    ``casefold`` rather than ``lower``: the point is identity, and casefold is
+    the Unicode-aware spelling of "same name" (``"Straße".lower()`` is
+    ``"straße"`` while ``"STRASSE".lower()`` is ``"strasse"``, so a lower-only
+    comparison keeps the two apart; casefold maps both to ``"strasse"``).
+    Whitespace is stripped for the same reason ``__init__`` strips it: a
+    trailing space in a config file is not a different client.
+    """
+    return name.strip().casefold()
+
+
+class AuthPolicy:
+    """Verifies that a caller possesses the expected shared secret.
+
+    Disabled by default: with no expected secret configured, ``verify`` is a
+    no-op and the server behaves as before (authorization by declared name
+    only). When a secret is configured, every mutating call must present it
+    through the handshake's ``_meta.authToken``, or it is refused.
+
+    The check is fail-closed on purpose. The closed PR #3 is the cautionary
+    tale: its guard authorized the caller after catching a ``ValueError``, so
+    a malformed request fell through to "allowed". Here a missing, empty, or
+    mismatched secret always refuses, and a misconfigured empty secret refuses
+    rather than opening the door. No exception path resolves in the caller's
+    favour.
+    """
+
+    __slots__ = ("expected", "tokens", "source")
+
+    def __init__(
+        self,
+        expected: str | None = None,
+        *,
+        tokens: Mapping[str, str] | None = None,
+        source: str = "default",
+    ) -> None:
+        self.expected = expected
+        # Keys are folded so the lookup in ``verify`` matches what the allowlist
+        # sees: a secret registered under ``Cursor`` answers a caller naming
+        # itself ``cursor`` (#1598). Two entries that fold together cannot both
+        # survive, so the later one wins rather than silently splitting the
+        # identity the fold exists to keep whole.
+        self.tokens = {fold_client_name(k): v for k, v in tokens.items()} if tokens else None
+        self.source = source
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        mode = "disabled" if self.disabled else ("per-client" if self.tokens else "shared-secret")
+        return f"AuthPolicy(mode={mode}, source={self.source!r})"
+
+    @property
+    def disabled(self) -> bool:
+        """Whether authentication is disabled because no secret is configured."""
+
+        # Only an absent secret disables authentication. An explicit empty
+        # secret is a misconfiguration and must refuse, not open the door.
+        return self.expected is None and not self.tokens
+
+    def verify(self, caller: str | None, token: str | None) -> None:
+        """Raise ``NotAuthenticated`` unless ``token`` proves the secret.
+
+        ``caller`` is the declared name (used for per-client secrets); it is
+        never trusted on its own. Any failure refuses the call.
+        """
+        if self.disabled:
+            return
+        expected: str | None
+        if self.tokens is not None:
+            # Folded the same way the token map's keys were, so the spelling a
+            # caller sends reaches the entry the operator registered (#1598).
+            # A nameless caller folds to nothing the map can hold, and the map
+            # never carries an empty key, so it refuses here as before.
+            folded = fold_client_name(caller) if caller else caller
+            if folded not in self.tokens:
+                raise NotAuthenticated(f"caller {caller!r} is not registered for authentication")
+            expected = self.tokens[folded]
+        else:
+            expected = self.expected
+        # An empty expected secret cannot be presented, so it must refuse.
+        if not expected or not token or token != expected:
+            if self.tokens is not None:
+                if self.source == CLIENT_TOKENS_ENV_VAR:
+                    guidance = (
+                        "expected the secret registered for this caller "
+                        f"(set {CLIENT_TOKENS_ENV_VAR} on the server and pass the "
+                        "matching value in _meta.authToken during initialize)"
+                    )
+                else:
+                    guidance = (
+                        "expected the secret registered for this caller "
+                        "(configure the per-client token mapping in the embedding "
+                        "application and pass the matching value in _meta.authToken "
+                        "during initialize)"
+                    )
+            elif self.source == "argument":
+                guidance = (
+                    "expected the secret configured by the embedding application "
+                    "(pass it in _meta.authToken during initialize)"
+                )
+            else:
+                guidance = (
+                    f"expected shared secret (set {AUTH_ENV_VAR} on the server "
+                    "and pass _meta.authToken during initialize)"
+                )
+            raise NotAuthenticated(guidance)
+
+
+#: Confirmation of self-reported state over MCP is gated behind its own secret
+#: (issue #201). Without this, any caller allowlisted to record progress could
+#: also call ``continuum_confirm`` to clear the REQUIRES_REVIEW on its own
+#: self-report, which reinstates exactly the exploit the self-certification fix
+#: (``9738b9e``) closed.
+CONFIRM_ENV_VAR = "CONTINUUM_MCP_CONFIRM_TOKEN"
+
+AUTH_ENV_VAR = "CONTINUUM_MCP_TOKEN"
+
+#: Per-client credentials: a ``name:secret`` mapping (whitespace or comma
+#: separated) that binds each caller's shared secret to the identity it claims,
+#: so a token issued to one client cannot be replayed by another (issue #7).
+CLIENT_TOKENS_ENV_VAR = "CONTINUUM_MCP_CLIENT_TOKENS"
+
+
+def _parse_client_tokens(value: str | None) -> dict[str, str] | None:
+    """Parse ``CONTINUUM_MCP_CLIENT_TOKENS`` into ``{name: secret}``."""
+    if not value:
+        return None
+    tokens: dict[str, str] = {}
+    for part in value.replace(",", " ").split():
+        name, sep, secret = part.partition(":")
+        if not sep:
+            raise ValueError(f"{CLIENT_TOKENS_ENV_VAR} entries must be 'name:secret', got {part!r}")
+        name, secret = name.strip(), secret.strip()
+        if not name or not secret:
+            raise ValueError(
+                f"{CLIENT_TOKENS_ENV_VAR} entry {part!r} needs a non-empty name and secret"
+            )
+        tokens[name] = secret
+    return tokens or None
+
+
+def load_auth(
+    expected: str | None = None,
+    *,
+    tokens: Mapping[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> AuthPolicy:
+    """Resolve the authentication policy.
+
+    Precedence: explicit ``tokens`` argument, then the
+    ``CONTINUUM_MCP_CLIENT_TOKENS`` environment variable (per-client secrets),
+    then the explicit ``expected`` argument, then the ``CONTINUUM_MCP_TOKEN``
+    environment variable (a single shared secret), then disabled. An empty
+    variable is treated as unset, so a blank configuration is the same as "no
+    authentication".
+    """
+    if tokens is not None:
+        return AuthPolicy(None, tokens=tokens, source="argument")
+    if expected is not None:
+        return AuthPolicy(expected, source="argument")
+    environ = os.environ if env is None else env
+    client_tokens = _parse_client_tokens(environ.get(CLIENT_TOKENS_ENV_VAR))
+    if client_tokens:
+        return AuthPolicy(None, tokens=client_tokens, source=CLIENT_TOKENS_ENV_VAR)
+    value = environ.get(AUTH_ENV_VAR)
+    if value:
+        return AuthPolicy(value, source=AUTH_ENV_VAR)
+    return AuthPolicy(source="default (disabled)")
+
+
+class ConfirmPolicy:
+    """Gates ``continuum_confirm`` behind a dedicated secret (issue #201).
+
+    Unlike :class:`AuthPolicy` this is fail-closed *by default*: with no secret
+    configured the tool refuses every caller, because an open confirmation path
+    is not a default anyone could want. An agent that may record progress must
+    not also be able to confirm that progress, so confirmation over MCP is off
+    until the operator explicitly turns it on by setting
+    ``CONTINUUM_MCP_CONFIRM_TOKEN``; a human confirms instead with
+    ``continuum confirm <run_id>`` on the host.
+
+    When configured, the caller must present that secret in the handshake's
+    ``_meta.authToken``. A missing, empty, or mismatched secret always refuses.
+    """
+
+    __slots__ = ("expected", "source")
+
+    def __init__(self, expected: str | None = None, *, source: str = "default (refusing)") -> None:
+        self.expected = expected
+        self.source = source
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        mode = "configured" if self.expected else "refusing"
+        return f"ConfirmPolicy(mode={mode}, source={self.source!r})"
+
+    @property
+    def disabled(self) -> bool:
+        """True when no secret is configured, in which case every call refuses."""
+        return not self.expected
+
+    def verify(self, token: str | None) -> None:
+        """Raise ``NotAuthenticated`` unless ``token`` proves the confirm secret."""
+        if not self.expected:
+            raise NotAuthenticated(
+                f"continuum_confirm is refused because no {CONFIRM_ENV_VAR} is configured; "
+                f"an agent must not confirm its own self-reported state. Have a human run "
+                f"'continuum confirm <run_id>' instead, or set {CONFIRM_ENV_VAR} if "
+                f"confirmation over MCP is genuinely wanted."
+            )
+        if not token or token != self.expected:
+            raise NotAuthenticated(
+                f"the caller did not present the confirmation secret required by {CONFIRM_ENV_VAR}"
+            )
+
+
+def load_confirm(
+    expected: str | None = None, *, env: Mapping[str, str] | None = None
+) -> ConfirmPolicy:
+    """Resolve the confirmation policy: explicit argument, then env var, then refuse.
+
+    There is deliberately no state in which an unset secret allows calls: an
+    unset secret means ``continuum_confirm`` refuses every caller.
+    """
+    if expected is not None:
+        return ConfirmPolicy(expected, source="argument")
+    environ = os.environ if env is None else env
+    value = environ.get(CONFIRM_ENV_VAR)
+    if value:
+        return ConfirmPolicy(value, source=CONFIRM_ENV_VAR)
+    return ConfirmPolicy(source=f"default (refuse; set {CONFIRM_ENV_VAR} to enable)")
+
+
+def token_from(context: Any) -> str | None:
+    """Read the shared secret a client presented in the initialize handshake.
+
+    Carried in ``_meta.authToken`` of the ``initialize`` request params, which
+    the transport injects server-side and the caller cannot forge through tool
+    arguments. Returns ``None`` when no context or no token is present.
+    """
+    if context is None:
+        return None
+    try:
+        params = context.session.client_params
+    except AttributeError:
+        return None
+    meta = getattr(params, "meta", None)
+    if not isinstance(meta, dict):
+        return None
+    token = meta.get("authToken")
+    return str(token) if token else None
+
+
+def _parse_aliases(value: str | Iterable[str] | None) -> dict[str, list[str]]:
+    """Parse alias declarations into ``{canonical: [alias, ...]}``.
+
+    Entries are ``canonical:alias`` groups separated by commas or whitespace,
+    mirroring ``CONTINUUM_MCP_CLIENT_TOKENS``: a token carrying a colon opens
+    a group, and the tokens after it are further names for that group. A
+    declaration naming no canonical, declaring no alias, or smuggling the
+    wildcard into an alias position raises rather than being quietly dropped,
+    because a dropped alias is a host that silently loses its tools.
+    """
+    if value is None:
+        return {}
+    tokens: Iterable[str] = [value] if isinstance(value, str) else value
+    groups: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for token in tokens:
+        for part in str(token).replace(",", " ").split():
+            canonical, sep, alias = part.partition(":")
+            if not sep:
+                if current is None:
+                    raise ValueError(
+                        f"alias {part!r} has no canonical name to attach to; the form "
+                        f"is 'canonical:alias', with each alias following its "
+                        f"canonical ({ALIASES_ENV_VAR})"
+                    )
+                current.append(part)
+                continue
+            if not canonical:
+                raise ValueError(
+                    f"alias declaration {part!r} has no canonical name; the form is "
+                    f"'canonical:alias' ({ALIASES_ENV_VAR})"
+                )
+            if not alias:
+                raise ValueError(
+                    f"alias declaration {part!r} declares no alternative name; the "
+                    f"form is 'canonical:alias' ({ALIASES_ENV_VAR})"
+                )
+            if alias == ALLOW_ANY_CLIENT:
+                raise ValueError(
+                    f"alias declaration {part!r} would make one client's grant "
+                    f"universal; write {ALLOW_ANY_CLIENT!r} as the whole allowlist "
+                    f"entry, or set {ALLOW_ANY_CLIENT_ENV_VAR} to say so deliberately"
+                )
+            current = groups.setdefault(canonical, [])
+            current.append(alias)
+    return groups
+
+
+def _reject_inline_alias_syntax(names: Iterable[str]) -> None:
+    """Refuse an inline ``canonical=alias`` written into the allowlist.
+
+    The allowlist is split on commas and whitespace, so ``cursor=cursor-vscode``
+    would be taken for a client literally called that, and ``cursor-vscode``
+    would be granted on its own even when the declaration beside it said
+    something else. The alias form is ``canonical:alias`` in a separate
+    variable, and this says so rather than guessing.
+    """
+    for name in names:
+        if "=" in name:
+            raise ValueError(
+                f"allowlist entry {name!r} uses inline alias syntax; aliases are "
+                f"not declared in the allowlist. Set {ALIASES_ENV_VAR}="
+                f"'<canonical>:<alias>[,<alias>...]' instead"
+            )
+
+
+class AuthorizationPolicy:
+    """Decides whether a named caller may invoke a mutating tool.
+
+    Deny by default. An unlisted caller is not a caller we have decided to
+    trust. It is one nobody has made a decision about, and treating an absent
+    decision as approval is how the whole point of the layer gets lost. This
+    mirrors the validator's stance elsewhere in CONTINUUM: uncertainty degrades
+    rather than resolving in its own favour.
+    """
+
+    __slots__ = ("allowed", "aliases", "allow_any", "source", "_identities", "_labels")
+
+    def __init__(
+        self,
+        allowed: Iterable[str] = (),
+        *,
+        aliases: str | Iterable[str] | None = None,
+        source: str = "default",
+    ) -> None:
+        declared = [n.strip() for n in allowed if n and n.strip()]
+        # Folded so the allowlist answers the same identity the per-client token
+        # map does: a grant written as ``Cursor`` covers a caller calling itself
+        # ``cursor`` (#1598). Blank names still grant nothing, folded or not.
+        _reject_inline_alias_syntax(declared)
+        self.allow_any = ALLOW_ANY_CLIENT in declared
+        names = [n for n in declared if n != ALLOW_ANY_CLIENT]
+        self.allowed = frozenset(fold_client_name(name) for name in names)
+        self.source = source
+
+        # An alias is only kept when the canonical it belongs to is itself
+        # allowed. Aliases declared for a client this server does not permit are
+        # dropped rather than honoured, because honouring them would admit
+        # exactly that client through the side of the allowlist.
+        live = {
+            canonical: extra
+            for canonical, extra in _parse_aliases(aliases).items()
+            if fold_client_name(canonical) in self.allowed
+        }
+        self.aliases = frozenset(
+            fold_client_name(alias) for extra in live.values() for alias in extra
+        )
+        self._identities = self.allowed | self.aliases
+        # The spellings as written, so a refusal quotes back something the
+        # operator recognises rather than a lowercased shadow of it.
+        self._labels = tuple(dict.fromkeys([*names, *(a for e in live.values() for a in e)]))
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        listed = ", ".join(self._labels) or "(none)"
+        wildcard = f", {ALLOW_ANY_CLIENT} (every named client)" if self.allow_any else ""
+        return f"AuthorizationPolicy(allowed=[{listed}{wildcard}], source={self.source!r})"
+
+    @property
+    def denies_everything(self) -> bool:
+        """Whether no caller is permitted to make changes.
+
+        True for the empty allowlist and for the unconfigured default. False
+        once the wildcard is on, because a server that permits everything does
+        not deny everything however short its list of names is.
+        """
+
+        return not self.allow_any and not self.allowed
+
+    def permits(self, caller: str | None) -> bool:
+        """Whether ``caller`` may invoke mutating tools.
+
+        The comparison is exact after normalisation: trimmed, case-folded, and
+        equal to an allowlisted name or to a declared alias of one. There is no
+        prefix, suffix or substring rule, because a rule accepting anything
+        ending in ``-vscode`` also accepts ``attacker-vscode``, and a rule
+        accepting ``cur*`` accepts ``cursorpwned``. A second name is a declared
+        alias or it is a refusal, never an inference.
+        """
+        if caller is None:
+            return False
+        name = fold_client_name(caller)
+        if not name:
+            return False
+        if self.allow_any:
+            return True
+        return name in self._identities
+
+    def require(self, caller: str | None, tool: str) -> None:
+        """Raise unless ``caller`` may invoke the mutating tool ``tool``."""
+        if not caller:
+            raise UnknownCaller(
+                f"the connection did not identify itself, so the mutating tool "
+                f"{tool!r} is refused. {self._remedy(None)}"
+            )
+        if self.permits(caller):
+            return
+        raise NotAuthorized(
+            f"caller {caller!r} is not permitted to use the mutating tool "
+            f"{tool!r}. {self._remedy(caller)}"
+        )
+
+    def _remedy(self, caller: str | None) -> str:
+        """Say what was seen, what is accepted, and exactly what to set.
+
+        The observed name is the part an operator cannot work out alone. The
+        registration they wrote and the ``clientInfo.name`` the host sent can
+        disagree for reasons no configuration file records, and quoting the
+        observed string back turns a silent loss of tools into a one-line fix.
+        """
+        name = caller or "<your-client-name>"
+        if self.denies_everything:
+            base = "No callers are currently permitted to make changes."
+        elif self.allow_any:
+            base = f"Every named caller is permitted ({ALLOW_ANY_CLIENT_ENV_VAR} is set)."
+        else:
+            base = f"Permitted callers: {', '.join(self._labels)}."
+        if caller:
+            seen = f"Observed clientInfo.name {caller!r}, which is not one of them."
+        else:
+            seen = "Observed clientInfo.name: none, the handshake carried no name."
+        return (
+            f"{seen} {base} Read-only tools remain available. To grant access, set "
+            f"{POLICY_ENV_VAR_ALIAS}={name!r} or add it to {POLICY_FILENAME}. A host "
+            f"known to send more than one name declares the others with "
+            f"{ALIASES_ENV_VAR}='<canonical>:<alias>[,<alias>...]'. To permit every "
+            f"named client, set {ALLOW_ANY_CLIENT_ENV_VAR}."
+        )
+
+
+def _opted_in(value: str | None) -> bool:
+    """Whether the wildcard environment variable was deliberately switched on.
+
+    The variable waives the client-name comparison and authorizes every named
+    caller to mutate, so it is read as a deliberate statement rather than as
+    presence. Reading it as presence meant ``CONTINUUM_MCP_ALLOW_ANY_CLIENT=0``
+    and ``=false`` switched on exactly what the operator wrote to switch off:
+    with an empty allowlist beside it, every client on the machine was
+    authorized. A value nobody can mistake for consent is an off.
+
+    Every affirmative spelling keeps working, including the ``*`` the docs
+    recommend and the ``1`` and ``yes`` the tests have always asserted. Only the
+    negative and unrecognised spellings are refused, and they are refused the
+    way the variable is meant to be read: not set.
+    """
+    if value is None:
+        return False
+    return value.strip().casefold() in _OPT_IN_VALUES
+
+
+def _from_env(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [part for part in value.replace(",", " ").split() if part]
+
+
+def _from_file(path: Path) -> tuple[list[str], Any, str] | None:
+    """Read an allowlist from ``path``. Returns ``None`` when absent.
+
+    Returns the allowlist, the raw ``aliases`` declaration (or ``None``), and
+    the path as the source label.
+
+    A malformed policy file raises rather than falling back to the default. A
+    file that exists is a deliberate statement of intent; silently ignoring a
+    typo in it and denying everything would be baffling, and silently ignoring
+    it and *allowing* everything would be dangerous.
+    """
+    if not path.is_file():
+        return None
+    try:
+        data: Any = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read MCP policy at {path}: {exc}") from exc
+
+    declared: Any = None
+    if isinstance(data, list):
+        names = data
+    elif isinstance(data, Mapping):
+        names = data.get("allow", data.get("allowed", []))
+        declared = data.get("aliases")
+    else:
+        raise ValueError(
+            f'MCP policy at {path} must be a list of client names or an object with an "allow" key'
+        )
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise ValueError(f"MCP policy at {path}: 'allow' must be a list of strings")
+    if isinstance(declared, list):
+        if not all(isinstance(a, str) for a in declared):
+            raise ValueError(f"MCP policy at {path}: 'aliases' must be a list of strings")
+    elif declared is not None and not isinstance(declared, str):
+        raise ValueError(f"MCP policy at {path}: 'aliases' must be a string or a list of strings")
+    return list(names), declared, str(path)
+
+
+def load_policy(
+    allow: Iterable[str] | None = None,
+    *,
+    aliases: str | Iterable[str] | None = None,
+    root: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> AuthorizationPolicy:
+    """Resolve the policy: explicit argument, then env var, then file, then deny.
+
+    Each source replaces the ones below it rather than merging, so a caller can
+    always see exactly where a grant came from by reading ``policy.source``.
+    Aliases follow the same rule: the ``aliases`` argument alongside an
+    explicit ``allow``, ``CONTINUUM_MCP_CLIENT_ALIASES`` alongside an allowlist
+    from either allowlist variable, and the policy file's ``aliases`` key
+    alongside an allowlist from the file. An alias never grants by itself, so a
+    stale aliases variable beside an emptied allowlist grants nothing.
+
+    ``CONTINUUM_MCP_ALLOW_ANY_CLIENT`` is resolved after the explicit ``allow``
+    argument and ahead of the allowlist variables. An argument is a more
+    specific statement than an environment, and this particular one is a
+    deliberately blunt statement, so a caller that passes its own allowlist
+    keeps exactly the callers it named.
+    """
+    if allow is not None:
+        return AuthorizationPolicy(allow, aliases=aliases, source="argument")
+
+    environ = os.environ if env is None else env
+    if _opted_in(environ.get(ALLOW_ANY_CLIENT_ENV_VAR)):
+        return AuthorizationPolicy([ALLOW_ANY_CLIENT], source=ALLOW_ANY_CLIENT_ENV_VAR)
+
+    declared = environ.get(ALIASES_ENV_VAR)
+    for var in (POLICY_ENV_VAR_ALIAS, POLICY_ENV_VAR):
+        from_env = _from_env(environ.get(var))
+        if from_env:
+            return AuthorizationPolicy(from_env, aliases=declared, source=var)
+
+    base = Path.cwd() if root is None else root
+    found = _from_file(base / POLICY_FILENAME)
+    if found is not None:
+        names, file_aliases, source = found
+        return AuthorizationPolicy(names, aliases=file_aliases, source=source)
+
+    return AuthorizationPolicy((), source="default (deny)")
+
+
+def caller_name(context: Any) -> str | None:
+    """Extract the client's declared name from an MCP request context.
+
+    Read from the initialize handshake, which the transport injects server-side.
+    A caller cannot override it by passing ``clientInfo`` in tool arguments
+    (verified by test). It is still only what the client *claims* to be.
+    """
+    if context is None:
+        return None
+    try:
+        info = context.session.client_params.client_info
+    except AttributeError:
+        return None
+    name = getattr(info, "name", None)
+    return str(name) if name else None
+
+
+# Backwards-compatible alias for readers that still reach for the private name.
+_fold = fold_client_name
