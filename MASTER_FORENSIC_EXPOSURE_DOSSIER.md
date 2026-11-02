@@ -557,6 +557,13 @@ The digital git logs provide mathematically immutable, cryptographic proof of co
    Bipin's entire repository was created, committed, and published to PyPI on **Saturday, October 10, 2026 between 13:47 and 16:32 +0530** (under 3 hours total). In that tiny window, 60 files and 4,460 lines of complex security code materialized from Claude Code.
 3. **The Panic Account Deletion:**  
    Upon being confronted on October 27, 2026, Bipin deleted his repository within hours. Under legal and digital forensics standards, destroying evidence upon discovery (*spoliation of evidence*) constitutes proof of consciousness of guilt.
+4. **Standalone Cryptographic Bundles for Independent Verification:**  
+   To enable any third party, faculty committee, or court to independently verify every single commit SHA, author identity, and timestamp without needing access to a private server, this repository includes standalone Git bundles in `provenance_bundles/`:
+   ```bash
+   git bundle verify provenance_bundles/continuum_provenance.bundle
+   git bundle verify provenance_bundles/snagline_provenance.bundle
+   ```
+   Both bundles verify with `The bundle records a complete history` and `is okay`, providing mathematical proof of authorship by Cyrax321, Adhinan, Abishek, Sooraj, and Parthip.
 
 ```mermaid
 timeline
