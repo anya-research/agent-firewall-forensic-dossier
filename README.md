@@ -43,6 +43,29 @@ The AI generated fresh variable names and syntax, creating an illusion of 0% str
 
 ---
 
+## ⏱️ IMMUTABLE GIT COMMIT PROVENANCE TIMELINE
+
+Every architectural concept, security algorithm, and benchmark harness existed in Anandhu's team's Git commits **months prior** to Bipin's repository:
+
+| Exact Date & Time (ISO) | Repository | Git Commit | Author | Description / Provenance Fact |
+|---|---|---|---|---|
+| **2026-08-14 05:32:00 +0530** | **SNAGLINE** | `73133dd` | Cyrax321 | Initial commit - core Event, Risk, and Monitor abstractions |
+| **2026-08-15 11:45:09 +0530** | **SNAGLINE** | `c7a157b` | Cyrax321 | **Claude Code adapter, hook bridge, and framework docs** |
+| **2026-08-24 10:12:00 +0530** | **CONTINUUM** | `9a12b4f` | Cyrax321 | **`GENESIS_HASH = "0" * 64` root anchor and canonical JSON hashing** |
+| **2026-08-25 14:30:00 +0530** | **CONTINUUM** | `b18c39e` | Cyrax321 | **Deny-by-default MCP server gateway (`build_server`)** |
+| **2026-08-26 16:59:00 +0530** | **CONTINUUM** | `c419e02` | Cyrax321 | **Append-only SHA-256 hash-chained `ActionLedger`** |
+| **2026-09-02 01:53:41 +0530** | **CONTINUUM** | `e33bcbd3` | abishek | `docs(mcp): document continuum_record_plan (#573)` |
+| **2026-09-11 21:05:00 +0530** | **SNAGLINE** | `fc956bf` | Cyrax321 | `fix(adapter): serialize HookTracker state shared by sidecar` |
+| **2026-09-18 00:15:21 +0530** | **CONTINUUM** | `840b6c0c` | Parthipashok04 | **Synthetic `invoice:INV-001` idempotency benchmark harness** |
+| **2026-09-29 14:12:00 +0530** | **SNAGLINE** | `18a200e` | Adhi1-2 | `fix(adapters): unify StepEvent.timestamp on monotonic clock (#532)` |
+| **2026-10-10 13:47:12 +0530** | **AGENT-FIREWALL** | `449c1c8` | Bipin583 | **Initial commit dumping entire AI-generated codebase (60 files, 4,460 lines)** |
+| **2026-10-10 14:50:11 +0530** | **AGENT-FIREWALL** | `29c4e12` | Bipin583 | Add stdio server entry point for MCP |
+| **2026-10-10 16:29:00 +0530** | **AGENT-FIREWALL** | PyPI Pub | Bipin583 | **Upload `agent-firewall1 0.1.0` to PyPI (165 minutes after repo creation)** |
+| **2026-10-16 00:00:00 UTC** | **INVESTIGATION** | Audit | Anandhu's Team | Team discovers infringing repository on GitHub |
+| **2026-10-27 16:00:32 UTC** | **AGENT-FIREWALL** | Panic Deletion | Bipin583 | **Bipin wipes GitHub account to `public_repos: 0` (HTTP 404)** |
+
+---
+
 ## 📂 REPOSITORY STRUCTURE
 
 ```
